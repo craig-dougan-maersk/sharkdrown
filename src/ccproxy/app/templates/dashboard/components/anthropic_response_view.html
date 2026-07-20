@@ -1,0 +1,56 @@
+{# Renders a non-streaming ``AnthropicResponse`` as: an assistant role-card
+   with the text/tool_use content blocks, followed by a metadata block
+   (model, stop_reason, id, usage). Mirrors the conversation style used
+   by ``components/message.html`` for consistency. #}
+
+
+{% macro anthropic_response_view(resp) -%}
+  <div class="space-y-3 text-sm">
+    <div class="bg-emerald-50 border-l-4 border-emerald-400 px-3 py-2 rounded">
+      <div class="text-xs text-emerald-700 font-medium mb-1 font-sans">assistant</div>
+      {%- if resp.content %}
+        {%- for block in resp.content %}
+          {%- if block.type == "text" %}
+            <p class="whitespace-pre-wrap break-words">{{ block.text }}</p>
+          {%- elif block.type == "tool_use" %}
+            <div class="border-l-2 border-purple-300 pl-2 my-1 text-xs">
+              <div class="font-mono font-semibold text-purple-700">{{ block.name }}<span class="text-neutral-400 font-normal"> ({{ block.id }})</span></div>
+              <pre class="font-mono whitespace-pre-wrap break-all bg-white px-2 py-1 mt-1">{{ block.input | tojson(indent=2) }}</pre>
+            </div>
+          {%- elif block.type == "thinking" %}
+            <details class="bg-amber-50 border-l-2 border-amber-300 px-2 py-1 my-1">
+              <summary class="text-xs text-amber-700 cursor-pointer font-sans">thinking</summary>
+              <p class="mt-1 text-xs whitespace-pre-wrap break-words text-amber-900">{{ block.thinking }}</p>
+            </details>
+          {%- endif %}
+        {%- endfor %}
+      {%- else %}
+        <p class="italic text-neutral-500 font-sans">[empty assistant content]</p>
+      {%- endif %}
+    </div>
+
+    <dl class="grid grid-cols-[8rem_1fr] gap-x-3 gap-y-1 text-xs">
+      <dt class="text-neutral-500 font-sans">model</dt>
+      <dd><code class="text-xs">{{ resp.model }}</code></dd>
+      {% if resp.stop_reason %}
+        <dt class="text-neutral-500 font-sans">stop_reason</dt>
+        <dd>{{ resp.stop_reason }}</dd>
+      {% endif %}
+      <dt class="text-neutral-500 font-sans">id</dt>
+      <dd class="font-mono break-all">{{ resp.id }}</dd>
+      {%- if resp.usage %}
+        <dt class="text-neutral-500 font-sans">usage</dt>
+        <dd>
+          {{ resp.usage.input_tokens }} input
+          {%- if resp.usage.cache_creation_input_tokens %}
+            · {{ resp.usage.cache_creation_input_tokens }} cache_write
+          {%- endif %}
+          {%- if resp.usage.cache_read_input_tokens %}
+            · {{ resp.usage.cache_read_input_tokens }} cache_read
+          {%- endif %}
+          · {{ resp.usage.output_tokens }} output
+        </dd>
+      {%- endif %}
+    </dl>
+  </div>
+{%- endmacro %}

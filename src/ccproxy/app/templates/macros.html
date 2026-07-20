@@ -1,0 +1,64 @@
+{# Reusable Jinja macros for the dashboard.
+
+Color/label mapping helpers — kept inline so the templates stay self-contained. #}
+
+{% macro model_badge(model) -%}
+  {% set m = (model or "").lower() -%}
+  {% if "opus" in m -%}
+    <span class="bg-purple-100 text-purple-800 text-xs font-medium px-2 py-0.5 rounded">{{ model or "—" }}</span>
+  {%- elif "sonnet" in m -%}
+    <span class="bg-indigo-100 text-indigo-800 text-xs font-medium px-2 py-0.5 rounded">{{ model or "—" }}</span>
+  {%- elif "haiku" in m -%}
+    <span class="bg-teal-100 text-teal-800 text-xs font-medium px-2 py-0.5 rounded">{{ model or "—" }}</span>
+  {%- elif "gpt" in m or m.startswith("o1") or m.startswith("o3") -%}
+    <span class="bg-emerald-100 text-emerald-800 text-xs font-medium px-2 py-0.5 rounded">{{ model or "—" }}</span>
+  {%- else -%}
+    <span class="bg-neutral-100 text-neutral-800 text-xs font-medium px-2 py-0.5 rounded">{{ model or "—" }}</span>
+  {%- endif %}
+{%- endmacro %}
+
+{% macro status_badge(code) -%}
+  {% if code is none -%}
+    <span class="bg-neutral-100 text-neutral-500 text-xs px-2 py-0.5 rounded">—</span>
+  {%- elif code >= 500 -%}
+    <span class="bg-red-100 text-red-800 text-xs font-medium px-2 py-0.5 rounded">{{ code }}</span>
+  {%- elif code >= 400 -%}
+    <span class="bg-amber-100 text-amber-800 text-xs font-medium px-2 py-0.5 rounded">{{ code }}</span>
+  {%- elif code >= 300 -%}
+    <span class="bg-blue-100 text-blue-800 text-xs font-medium px-2 py-0.5 rounded">{{ code }}</span>
+  {%- else -%}
+    <span class="bg-green-100 text-green-800 text-xs font-medium px-2 py-0.5 rounded">{{ code }}</span>
+  {%- endif %}
+{%- endmacro %}
+
+{% macro method_badge(method) -%}
+  {% set m = (method or "").upper() -%}
+  {% if m == "GET" -%}
+    <span class="text-green-700 font-mono text-xs">{{ m }}</span>
+  {%- elif m == "POST" -%}
+    <span class="text-blue-700 font-mono text-xs">{{ m }}</span>
+  {%- elif m == "PUT" -%}
+    <span class="text-amber-700 font-mono text-xs">{{ m }}</span>
+  {%- elif m == "DELETE" -%}
+    <span class="text-red-700 font-mono text-xs">{{ m }}</span>
+  {%- else -%}
+    <span class="text-neutral-700 font-mono text-xs">{{ m }}</span>
+  {%- endif %}
+{%- endmacro %}
+
+{% macro relative_time(ts) -%}
+  {% if ts -%}
+    <time datetime="{{ ts }}" title="{{ ts }}">{{ ts }}</time>
+  {%- else -%}
+    —
+  {%- endif %}
+{%- endmacro %}
+
+{% macro format_json(value) -%}
+  {% set s = value | tojson(indent=2) -%}
+  <pre class="text-xs font-mono whitespace-pre-wrap break-all overflow-auto max-h-[600px]">{{ s }}</pre>
+{%- endmacro %}
+
+{% macro format_text(value) -%}
+  <pre class="text-sm whitespace-pre-wrap break-words">{{ value }}</pre>
+{%- endmacro %}

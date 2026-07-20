@@ -1,0 +1,31 @@
+/* Minimal local styles.
+ *
+ * Tailwind is loaded via the Play CDN in production for simplicity.
+ * Vendored rules below are for cases where CDN is unavailable.
+ */
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+pre, code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+dialog::backdrop {
+  background: rgba(0, 0, 0, 0.4);
+}
+
+/* Smooth open for htmx-swapped content. */
+.htmx-swapping {
+  opacity: 0;
+  transition: opacity 200ms ease-out;
+}
+.htmx-settling {
+  opacity: 1;
+}
+
+/* Cursor for clickable list rows. */
+.row {
+  cursor: pointer;
+}

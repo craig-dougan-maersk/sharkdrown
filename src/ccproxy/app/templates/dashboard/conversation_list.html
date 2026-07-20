@@ -1,0 +1,39 @@
+{% import "macros.html" as ui %}
+
+{% if rows %}
+  <ul class="divide-y divide-neutral-200 bg-white rounded border border-neutral-200">
+    {% for c in rows %}
+      <li class="px-4 py-3 hover:bg-neutral-50 cursor-pointer"
+          hx-get="/partials/conversation/{{ c.session_id }}?project={{ c.project_path }}"
+          hx-target="#modal-root"
+          hx-swap="innerHTML"
+          hx-on::after-request="document.getElementById('modal-root').showModal()">
+        <div class="flex items-center justify-between gap-4">
+          <div class="flex items-center gap-3 min-w-0">
+            <span class="bg-neutral-100 text-neutral-700 text-xs px-1.5 py-0.5 rounded font-mono">{{ c.project_name }}</span>
+            <span class="text-xs text-neutral-500 font-mono truncate">{{ c.session_id }}</span>
+          </div>
+          <div class="flex items-center gap-3 shrink-0 text-xs text-neutral-500">
+            <span>{{ c.message_count }} messages</span>
+            <span>{{ ui.relative_time(c.start_time.isoformat() if c.start_time else "") }}</span>
+          </div>
+        </div>
+      </li>
+    {% endfor %}
+  </ul>
+
+  {% if has_more %}
+    <div class="text-center mt-4">
+      <button hx-get="/partials/conversations?page={{ next_page }}"
+              hx-target="#list"
+              hx-swap="beforeend"
+              class="px-4 py-2 text-sm border border-neutral-300 rounded hover:bg-neutral-100">
+        Load more
+      </button>
+    </div>
+  {% endif %}
+{% else %}
+  <div class="bg-white border border-neutral-200 rounded p-8 text-center text-neutral-500">
+    No conversations found in <code class="bg-neutral-100 px-1 rounded">~/.claude/projects/</code>.
+  </div>
+{% endif %}

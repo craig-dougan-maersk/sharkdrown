@@ -1,0 +1,121 @@
+{# Renders an Anthropic-format ``messages`` array as a UI conversation.
+
+This is the single source of truth for displaying captured Claude Code
+turns. ``request_detail.html`` and ``components/anthropic_request_view.html``
+both import these macros — the conversation-rendering code lives here so a
+fix to e.g. system-reminder detection automatically applies to every caller.
+
+Macros
+------
+- ``conversation(messages)``
+    Top-level entry point. Loops over each message and delegates to
+    ``request_message``.
+- ``request_message(m)``
+    Renders one message bubble; chooses blue (user), green (assistant),
+    or gray (other role) styling.
+- ``render_content(c)``
+    Dispatches by content shape: a plain string, a list of content
+    blocks, or a single content block.
+- ``render_block(b)``
+    Dispatches by content-block ``type`` (text, thinking,
+    redacted_thinking, tool_use, tool_result, image, unknown).
+    ``system-reminder`` text blocks are detected inside ``render_text_block``
+    and collapsed by default to keep conversations scannable.
+#}
+
+
+{% macro conversation(messages) -%}
+  <div class="space-y-2">
+    {%- for msg in messages %}
+      {{ request_message(msg) }}
+    {%- endfor %}
+  </div>
+{%- endmacro %}
+
+
+{% macro request_message(m) -%}
+  {% if m.role == "user" -%}
+    <div class="bg-blue-50 border-l-4 border-blue-400 px-3 py-2 rounded">
+      <div class="text-xs text-blue-700 font-medium mb-1 font-sans">user</div>
+      {{ render_content(m.content) }}
+    </div>
+  {%- elif m.role == "assistant" -%}
+    <div class="bg-emerald-50 border-l-4 border-emerald-400 px-3 py-2 rounded">
+      <div class="text-xs text-emerald-700 font-medium mb-1 font-sans">assistant</div>
+      {{ render_content(m.content) }}
+    </div>
+  {%- else -%}
+    <div class="bg-neutral-50 border-l-4 border-neutral-300 px-3 py-2 rounded">
+      <div class="text-xs text-neutral-700 font-medium mb-1 font-sans">{{ m.role }}</div>
+      {{ render_content(m.content) }}
+    </div>
+  {%- endif %}
+{%- endmacro %}
+
+
+{# Render a message's ``content`` field. It can be a string, a single
+   content block, or a list of content blocks. String content takes the
+   ``render_text_block`` path so system-reminders in plain string content
+   (rare but possible) also collapse. #}
+{% macro render_content(c) -%}
+  {%- if c is string -%}
+    {{ render_text_block(c) }}
+  {%- elif c is iterable and c is not mapping -%}
+    {%- for block in c %}
+      {{ render_block(block) }}
+    {%- endfor %}
+  {%- else -%}
+    {{ render_block(c) }}
+  {%- endif %}
+{%- endmacro %}
+
+
+{# Render one content block by ``type``. ``text`` blocks flow through
+   ``render_text_block`` so the system-reminder collapse logic is shared
+   with the string-content path in ``render_content``. #}
+{% macro render_block(b) -%}
+  {%- if b.type == "text" %}
+    {{ render_text_block(b.text) }}
+  {%- elif b.type == "thinking" %}
+    <details class="bg-amber-50 border-l-2 border-amber-300 px-2 py-1 my-1">
+      <summary class="text-xs text-amber-700 cursor-pointer font-sans">thinking</summary>
+      <p class="mt-1 text-xs whitespace-pre-wrap break-words text-amber-900">{{ b.thinking }}</p>
+    </details>
+  {%- elif b.type == "redacted_thinking" %}
+    <div class="text-xs italic text-neutral-500 font-sans">[redacted thinking]</div>
+  {%- elif b.type == "tool_use" %}
+    <div class="border-l-2 border-purple-300 pl-2 my-1 text-xs">
+      <div class="font-mono font-semibold text-purple-700">{{ b.name }}<span class="text-neutral-400 font-normal"> ({{ b.id }})</span></div>
+      <pre class="font-mono whitespace-pre-wrap break-all bg-neutral-50 px-2 py-1 mt-1">{{ b.input | tojson(indent=2) }}</pre>
+    </div>
+  {%- elif b.type == "tool_result" %}
+    <div class="border-l-2 border-sky-300 pl-2 my-1 text-xs">
+      <div class="font-mono text-sky-700">tool result <span class="text-neutral-400">({{ b.tool_use_id }}){% if b.is_error %} · error{% endif %}</span></div>
+      <pre class="font-mono whitespace-pre-wrap break-all bg-neutral-50 px-2 py-1 mt-1">{% if b.content is string %}{{ b.content }}{% else %}{{ b.content | tojson(indent=2) }}{% endif %}</pre>
+    </div>
+  {%- elif b.type == "image" %}
+    <div class="text-xs italic text-neutral-500 font-sans">[image]</div>
+  {%- else %}
+    <pre class="font-mono text-xs whitespace-pre-wrap break-all bg-neutral-50 px-2 py-1 mt-1">{{ b.model_dump() | tojson(indent=2) }}</pre>
+  {%- endif %}
+{%- endmacro %}
+
+
+{# Render plain text as either a normal paragraph or a collapsible
+   ``<system-reminder>`` block. The trigger is the literal opening tag
+   at the very start of the (whitespace-stripped) text — that is how
+   Claude Code emits them and it avoids false positives on user text
+   that happens to mention the tag inline. #}
+{% macro render_text_block(text) -%}
+  {%- if text and text.strip().startswith('<system-reminder>') %}
+    <details class="bg-amber-50 border border-amber-200 px-2 py-1 my-1 rounded">
+      <summary class="text-xs text-amber-700 cursor-pointer font-sans select-none">
+        <span class="font-semibold">system-reminder</span>
+        <span class="text-amber-600/70 ml-1">(click to expand)</span>
+      </summary>
+      <pre class="mt-2 text-xs whitespace-pre-wrap break-words font-sans text-amber-900">{{ text }}</pre>
+    </details>
+  {%- else %}
+    <p class="text-sm whitespace-pre-wrap break-words">{{ text }}</p>
+  {%- endif %}
+{%- endmacro %}

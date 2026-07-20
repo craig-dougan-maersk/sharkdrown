@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% import "macros.html" as ui %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto p-6"
+     x-data="{
+       hide_failed: {{ 'true' if hide_failed else 'false' }},
+       hide_no_tokens: {{ 'true' if hide_no_tokens else 'false' }},
+       model: '{{ model_filter or '' }}',
+       buildQuery() {
+         const p = new URLSearchParams();
+         p.set('page', '1');
+         p.set('limit', '10');
+         p.set('hide_failed', this.hide_failed ? '1' : '0');
+         p.set('hide_no_tokens', this.hide_no_tokens ? '1' : '0');
+         if (this.model) p.set('model', this.model);
+         return p;
+       },
+       refreshList() {
+         const q = this.buildQuery();
+         htmx.ajax('GET', '/partials/requests?' + q.toString(),
+                   {target: '#list', swap: 'innerHTML'});
+       },
+       refreshUrl() {
+         const q = this.buildQuery();
+         q.set('view', 'requests');
+         history.replaceState({}, '', '?' + q.toString());
+       },
+       refresh() { this.refreshList(); this.refreshUrl(); }
+     }">
+  <header class="flex items-center justify-between mb-6">
+    <h1 class="text-2xl font-semibold">Claude Code Proxy</h1>
+    <div class="flex items-center gap-2">
+      <span hx-ext="sse" sse-connect="/stream" sse-swap="new_request"
+            class="text-xs text-neutral-500">live</span>
+    </div>
+  </header>
+
+  <nav class="flex items-center gap-4 mb-4 border-b border-neutral-200 pb-2">
+    <a href="?view=requests&model={{ model_filter }}&hide_failed={{ '1' if hide_failed else '0' }}&hide_no_tokens={{ '1' if hide_no_tokens else '0' }}"
+       class="px-3 py-1 rounded text-sm {{ 'bg-blue-100 text-blue-900 font-medium' if view == 'requests' else 'text-neutral-600 hover:bg-neutral-100' }}">
+      Requests
+    </a>
+    <a href="?view=conversations"
+       class="px-3 py-1 rounded text-sm {{ 'bg-blue-100 text-blue-900 font-medium' if view == 'conversations' else 'text-neutral-600 hover:bg-neutral-100' }}">
+      Conversations
+    </a>
+  </nav>
+
+  {% if view == 'conversations' %}
+    <div id="list"
+         hx-get="/partials/conversations?page=1"
+         hx-trigger="load"
+         hx-swap="innerHTML">
+      Loading conversations…
+    </div>
+  {% else %}
+    <div class="flex items-center gap-4 mb-3 text-sm flex-wrap">
+      <span class="text-neutral-500">Filter:</span>
+      <label class="flex items-center gap-1.5 cursor-pointer text-neutral-700 select-none">
+        <input type="checkbox" x-model="hide_failed" @change="refresh()"
+               class="rounded border-neutral-300 text-blue-600 focus:ring-blue-500">
+        Hide failed
+      </label>
+      <label class="flex items-center gap-1.5 cursor-pointer text-neutral-700 select-none">
+        <input type="checkbox" x-model="hide_no_tokens" @change="refresh()"
+               class="rounded border-neutral-300 text-blue-600 focus:ring-blue-500">
+        Hide 0-token
+      </label>
+    </div>
+    <div class="flex items-center gap-2 mb-3">
+      <span class="text-sm text-neutral-500">Model:</span>
+      <button @click="model = ''; refresh()"
+              :class="model === '' && 'ring-2 ring-blue-500'"
+              class="px-2.5 py-1 rounded text-sm border border-neutral-200 hover:bg-neutral-50">All</button>
+      <button @click="model = 'opus'; refresh()"
+              :class="model === 'opus' && 'ring-2 ring-blue-500'"
+              class="px-2.5 py-1 rounded text-sm border border-neutral-200 hover:bg-neutral-50">Opus</button>
+      <button @click="model = 'sonnet'; refresh()"
+              :class="model === 'sonnet' && 'ring-2 ring-blue-500'"
+              class="px-2.5 py-1 rounded text-sm border border-neutral-200 hover:bg-neutral-50">Sonnet</button>
+      <button @click="model = 'haiku'; refresh()"
+              :class="model === 'haiku' && 'ring-2 ring-blue-500'"
+              class="px-2.5 py-1 rounded text-sm border border-neutral-200 hover:bg-neutral-50">Haiku</button>
+      <button @click="model = 'minimax-m3'; refresh()"
+              :class="model === 'minimax-m3' && 'ring-2 ring-blue-500'"
+              class="px-2.5 py-1 rounded text-sm border border-neutral-200 hover:bg-neutral-50">MiniMax-M3</button>
+      <button @click="model = 'minimax-m27'; refresh()"
+              :class="model === 'minimax-m27' && 'ring-2 ring-blue-500'"
+              class="px-2.5 py-1 rounded text-sm border border-neutral-200 hover:bg-neutral-50">MiniMax-M2.7</button>
+    </div>
+    <div id="list"
+         hx-get="/partials/requests?page=1{% if hide_failed %}&hide_failed=1{% else %}&hide_failed=0{% endif %}{% if hide_no_tokens %}&hide_no_tokens=1{% else %}&hide_no_tokens=0{% endif %}{% if model_filter %}&model={{ model_filter }}{% endif %}"
+         hx-trigger="load"
+         hx-swap="innerHTML">
+      Loading requests…
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

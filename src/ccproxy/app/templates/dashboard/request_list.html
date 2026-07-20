@@ -1,0 +1,63 @@
+{% import "macros.html" as ui %}
+
+{% if rows %}
+  <ul class="divide-y divide-neutral-200 bg-white rounded border border-neutral-200">
+    {% for r in rows %}
+      <li class="px-4 py-3 hover:bg-neutral-50 cursor-pointer"
+          hx-get="/partials/request/{{ r.id }}"
+          hx-target="#modal-root"
+          hx-swap="innerHTML"
+          hx-on::after-request="document.getElementById('modal-root').showModal()">
+        <div class="flex items-center justify-between gap-4">
+          <div class="flex items-center gap-3 min-w-0">
+            {{ ui.method_badge(r.method) }}
+            {{ ui.model_badge(r.original_model) }}
+            {% if r.routed_model and r.routed_model != r.original_model %}
+              <span class="text-neutral-400 text-xs">→</span>
+              {{ ui.model_badge(r.routed_model) }}
+            {% endif %}
+            <span class="text-xs text-neutral-500 truncate">{{ r.id }}</span>
+          </div>
+          <div class="flex items-center gap-3 shrink-0 text-xs text-neutral-500">
+            {% if r.total_tokens is not none %}
+              <span class="bg-emerald-50 text-emerald-800 border border-emerald-200 px-1.5 py-0.5 rounded font-mono"
+                    title="input: {{ r.input_tokens or 0 }} · output: {{ r.output_tokens or 0 }}">
+                {{ "{:,}".format(r.total_tokens) }} tok
+                {%- if r.input_tokens is not none and r.output_tokens is not none %}
+                  <span class="text-emerald-600/70">({{ "{:,}".format(r.input_tokens) }}↓/{{ "{:,}".format(r.output_tokens) }}↑)</span>
+                {%- endif %}
+              </span>
+            {% endif %}
+            {% if r.request_path == "passthrough" %}
+              <span class="bg-neutral-100 px-1.5 py-0.5 rounded">passthrough</span>
+            {% elif r.request_path == "converted" %}
+              <span class="bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded">converted</span>
+            {% elif r.request_path == "subagent" %}
+              <span class="bg-purple-100 text-purple-800 px-1.5 py-0.5 rounded">subagent</span>
+            {% endif %}
+            {{ ui.status_badge(r.status_code) }}
+            <span>{{ ui.relative_time(r.timestamp.isoformat() if r.timestamp else "") }}</span>
+          </div>
+        </div>
+      </li>
+    {% endfor %}
+  </ul>
+
+  {% if has_more %}
+    <div class="text-center mt-4">
+      <button hx-get="/partials/requests?page={{ next_page }}{% if model_filter %}&model={{ model_filter }}{% endif %}"
+              hx-target="#list"
+              hx-swap="beforeend"
+              class="px-4 py-2 text-sm border border-neutral-300 rounded hover:bg-neutral-100">
+        Load more
+      </button>
+    </div>
+  {% endif %}
+{% else %}
+  <div class="bg-white border border-neutral-200 rounded p-8 text-center text-neutral-500">
+    No requests yet.
+    <div class="mt-2 text-sm">
+      Make sure you have set <code class="bg-neutral-100 px-1 rounded">ANTHROPIC_BASE_URL=http://localhost:3001</code> in your environment.
+    </div>
+  </div>
+{% endif %}

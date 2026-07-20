@@ -1,0 +1,24 @@
+{% import "macros.html" as ui %}
+{% import "dashboard/components/message.html" as msg %}
+
+<div class="flex items-center justify-between mb-4">
+  <h2 class="text-lg font-semibold">Conversation: <code class="text-sm font-mono text-neutral-600">{{ conv.session_id[:8] }}…</code></h2>
+  <button onclick="document.getElementById('modal-root').close()"
+          class="text-neutral-500 hover:text-neutral-900 text-xl leading-none">×</button>
+</div>
+
+<div class="space-y-3 max-h-[80vh] overflow-y-auto">
+  <div class="text-xs text-neutral-500">
+    Project <span class="font-mono">{{ conv.project_name }}</span> · {{ conv.message_count }} messages ·
+    {{ ui.relative_time(conv.start_time.isoformat() if conv.start_time else "") }}
+    – {{ ui.relative_time(conv.end_time.isoformat() if conv.end_time else "") }}
+  </div>
+
+  {% for m in conv.messages %}
+    {{ msg.message(m) }}
+  {% endfor %}
+</div>
+
+<form method="dialog" class="mt-4 text-right">
+  <button class="px-4 py-2 text-sm border border-neutral-300 rounded hover:bg-neutral-100">Close</button>
+</form>

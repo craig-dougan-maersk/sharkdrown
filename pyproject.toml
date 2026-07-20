@@ -1,0 +1,74 @@
+[project]
+name = "pandas-markdown-editor"
+version = "0.1.0"
+description = "A desktop editor for Markdown, JSON, and YAML files with pandas table support"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [
+    {name = "Developer", email = "dev@example.com"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Desktop Environment",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Editors",
+]
+dependencies = [
+    # Editor
+    "PySide6>=6.5.0",
+    "markdown>=3.5",
+    "pygments>=2.16",
+    "pandas>=2.0",
+    "tabulate>=0.9",
+    "pyyaml>=6.0",
+    "jsonschema>=4.20",
+    # Embedded proxy
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.4",
+    "httpx>=0.27",
+    "aiosqlite>=0.20",
+    "Jinja2>=3.1",
+    "python-dotenv>=1.0",
+    "humanize>=4.9",
+    "pyte>=0.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+]
+
+[project.scripts]
+markdown-editor = "src.main:main"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true

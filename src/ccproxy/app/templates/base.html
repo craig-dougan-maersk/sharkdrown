@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude Code Proxy</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+  <script defer src="https://unpkg.com/alpinejs@3.13.5/dist/cdn.min.js"></script>
+  <script src="/static/js/copy.js" defer></script>
+  <script src="/static/js/modal.js" defer></script>
+  <script src="/static/js/live.js" defer></script>
+  <link rel="stylesheet" href="/static/css/app.css">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    dialog::backdrop { background: rgba(0,0,0,0.4); }
+  </style>
+</head>
+<body class="bg-neutral-50 text-neutral-900">
+  {% block content %}{% endblock %}
+
+  <dialog id="modal-root" class="rounded-lg shadow-xl max-w-3xl w-full p-6 backdrop:bg-black/40">
+    {# htmx targets this dialog's innerHTML. Modal JS handles showModal()/close(). #}
+  </dialog>
+</body>
+</html>

@@ -1,0 +1,190 @@
+{# Request detail modal.
+
+Layout is priority-driven: the conversation between user and Claude Code
+sits at the top of the pane so it is the first thing the user sees.
+Everything else (headers, model/system/tools metadata, raw JSON) is
+collapsed under details/summary toggles so they are reachable but never
+in the way.
+
+Section order:
+  1. Overview — small metadata bar (ID, timestamp, model, status, route).
+  2. Conversation — user/assistant bubbles, with system-reminders folded.
+  3. Response — assistant's reply (non-streaming) or assembled text + SSE chunks.
+  4. Headers — collapsed by default.
+  5. Request details — collapsed; model, max_tokens, temperature, system prompt, tools.
+  6. Raw request body — collapsed JSON.
+  7. Raw response body — collapsed JSON (skipped when the response is already
+     shown structured via ``response_view.anthropic``). #}
+
+{% import "macros.html" as ui %}
+{% import "dashboard/components/headers_view.html" as headers_table %}
+{% import "dashboard/components/conversation_view.html" as convo %}
+{% import "dashboard/components/anthropic_response_view.html" as resp_view %}
+
+<div class="flex items-center justify-between mb-4">
+  <h2 class="text-lg font-semibold">Request detail</h2>
+  <button onclick="document.getElementById('modal-root').close()"
+          class="text-neutral-500 hover:text-neutral-900 text-xl leading-none">×</button>
+</div>
+
+<div class="space-y-5 max-h-[80vh] overflow-y-auto">
+
+  {# 1. Overview — minimal metadata, always visible. #}
+  <section>
+    <h3 class="text-xs uppercase tracking-wide text-neutral-500 mb-1 font-sans">Overview</h3>
+    <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+      <dt class="text-neutral-500 font-sans">ID</dt>
+      <dd class="font-mono text-xs truncate">{{ request.id }}</dd>
+      <dt class="text-neutral-500 font-sans">Timestamp</dt>
+      <dd>{{ ui.relative_time(request.timestamp.isoformat() if request.timestamp else "") }}</dd>
+      <dt class="text-neutral-500 font-sans">Method / endpoint</dt>
+      <dd><code>{{ request.method }} {{ request.endpoint }}</code></dd>
+      <dt class="text-neutral-500 font-sans">Model</dt>
+      <dd>{{ ui.model_badge(request.original_model) }}{% if request.routed_model != request.original_model %} → {{ ui.model_badge(request.routed_model) }}{% endif %}</dd>
+      <dt class="text-neutral-500 font-sans">Route</dt>
+      <dd><code>{{ request.request_path }}</code></dd>
+      <dt class="text-neutral-500 font-sans">Status</dt>
+      <dd>{{ ui.status_badge(request.status_code) }}</dd>
+    </dl>
+  </section>
+
+  {# 2. Conversation — user/Claude dialogue. Always visible. #}
+  {%- if request_view.shape == "anthropic" %}
+    <section>
+      <h3 class="text-xs uppercase tracking-wide text-neutral-500 mb-2 font-sans">
+        Conversation
+        ({{ request_view.anthropic.messages | length }} message{{ "" if request_view.anthropic.messages | length == 1 else "s" }})
+      </h3>
+      {{ convo.conversation(request_view.anthropic.messages) }}
+    </section>
+  {%- endif %}
+
+  {# 3. Response — the assistant's reply. Always visible when present. #}
+  {% if request.response %}
+    <section>
+      <h3 class="text-xs uppercase tracking-wide text-neutral-500 mb-2 font-sans">
+        Response ({{ request.response.status_code }})
+      </h3>
+      {%- if response_view.shape == "anthropic" %}
+        {{ resp_view.anthropic_response_view(response_view.anthropic) }}
+      {%- elif response_view.shape == "streaming" %}
+        {%- if response_view.assembled_text %}
+          <p class="text-xs uppercase tracking-wide text-neutral-500 mb-1 font-sans">Assembled text</p>
+          {{ ui.format_text(response_view.assembled_text) }}
+        {%- endif %}
+        <details class="mt-2">
+          <summary class="cursor-pointer text-xs uppercase tracking-wide text-neutral-500 font-sans">
+            Raw SSE chunks ({{ response_view.chunks | length }})
+          </summary>
+          <ol class="space-y-1 text-xs font-mono whitespace-pre-wrap break-all">
+            {%- for chunk in response_view.chunks %}
+              <li class="border-l-2 border-neutral-200 pl-2">{{ chunk }}</li>
+            {%- endfor %}
+          </ol>
+        </details>
+      {%- elif response_view.shape == "empty" %}
+        <p class="text-neutral-500 text-sm italic font-sans">No response body captured.</p>
+      {%- elif response_view.shape == "unknown" %}
+        {{ ui.format_json(response_view.raw) }}
+      {%- endif %}
+    </section>
+  {% endif %}
+
+  {# 4. Headers — collapsed by default. #}
+  <details>
+    <summary class="cursor-pointer text-xs uppercase tracking-wide text-neutral-500 font-sans">
+      Headers ({{ headers_view | length }})
+    </summary>
+    <div class="mt-2">
+      {{ headers_table.headers_view(headers_view) }}
+    </div>
+    <details class="mt-2">
+      <summary class="cursor-pointer text-xs text-neutral-500 font-sans">Show raw JSON</summary>
+      {{ ui.format_json(request.headers) }}
+    </details>
+  </details>
+
+  {# 5. Request details (model/system/temperature/tools) — collapsed. #}
+  {%- if request_view.shape == "anthropic" %}
+    <details>
+      <summary class="cursor-pointer text-xs uppercase tracking-wide text-neutral-500 font-sans">
+        Request details
+      </summary>
+      <div class="mt-2 space-y-3 text-xs">
+        <dl class="grid grid-cols-[8rem_1fr] gap-x-3 gap-y-1">
+          <dt class="text-neutral-500 font-sans">model</dt>
+          <dd><code>{{ request_view.anthropic.model }}</code></dd>
+          {% if request_view.anthropic.max_tokens is not none %}
+            <dt class="text-neutral-500 font-sans">max_tokens</dt>
+            <dd>{{ request_view.anthropic.max_tokens }}</dd>
+          {% endif %}
+          {% if request_view.anthropic.stream %}
+            <dt class="text-neutral-500 font-sans">stream</dt>
+            <dd>true</dd>
+          {% endif %}
+          {% if request_view.anthropic.temperature is not none %}
+            <dt class="text-neutral-500 font-sans">temperature</dt>
+            <dd>{{ request_view.anthropic.temperature }}</dd>
+          {% endif %}
+          {% if request_view.anthropic.system %}
+            <dt class="text-neutral-500 font-sans">system</dt>
+            <dd class="whitespace-pre-wrap break-words">
+              {%- if request_view.anthropic.system is string -%}
+                {{ request_view.anthropic.system }}
+              {%- else -%}
+                {%- for s in request_view.anthropic.system -%}
+                  {{- s.text -}}
+                  {%- if not loop.last %}
+&nbsp;—&nbsp;
+                  {%- endif -%}
+                {%- endfor -%}
+              {%- endif -%}
+            </dd>
+          {% endif %}
+        </dl>
+        {%- if request_view.anthropic.tools %}
+          <div>
+            <p class="uppercase tracking-wide text-neutral-500 mb-1 font-sans">
+              Tools ({{ request_view.anthropic.tools | length }})
+            </p>
+            <ul class="space-y-1">
+              {%- for tool in request_view.anthropic.tools %}
+                <li class="border-l-2 border-neutral-200 pl-2 font-mono">
+                  <span class="font-semibold not-italic font-sans">{{ tool.name }}</span>
+                  {%- if tool.description %} — <span class="font-sans not-italic text-neutral-700">{{ tool.description }}</span>{% endif %}
+                </li>
+              {%- endfor %}
+            </ul>
+          </div>
+        {%- endif %}
+      </div>
+    </details>
+  {%- endif %}
+
+  {# 6. Raw request body — collapsed JSON for debugging. #}
+  <details>
+    <summary class="cursor-pointer text-xs uppercase tracking-wide text-neutral-500 font-sans">
+      Raw request body
+    </summary>
+    <div class="mt-2">
+      {{ ui.format_json(request.body) }}
+    </div>
+  </details>
+
+  {# 7. Raw response body — collapsed JSON for debugging (skipped when
+     the response was already rendered structurally above). #}
+  {%- if request.response and request.response.body_text and response_view.shape != "anthropic" %}
+    <details>
+      <summary class="cursor-pointer text-xs uppercase tracking-wide text-neutral-500 font-sans">
+        Raw response body
+      </summary>
+      <div class="mt-2">
+        {{ ui.format_json(request.response.body_text) }}
+      </div>
+    </details>
+  {%- endif %}
+</div>
+
+<form method="dialog" class="mt-4 text-right">
+  <button class="px-4 py-2 text-sm border border-neutral-300 rounded hover:bg-neutral-100">Close</button>
+</form>

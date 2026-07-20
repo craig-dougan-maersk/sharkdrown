@@ -1,0 +1,26 @@
+{# Renders a flat list of header rows produced by ``_build_headers_view``.
+   Each row is ``{"name": str, "value": str, "is_hashed": bool}``. The
+   ``[hashed]`` tag is shown next to any value whose plaintext was replaced
+   with a ``sha256:…`` digest before persistence (see
+   ``app/utils/headers.py``). #}
+{% macro headers_view(rows) -%}
+  {% if rows -%}
+    <table class="w-full text-xs">
+      <tbody>
+        {%- for h in rows %}
+          <tr class="align-top">
+            <td class="text-neutral-500 pr-3 py-1 w-1/3 font-sans break-words">{{ h.name }}</td>
+            <td class="font-mono break-all py-1">
+              <span>{{ h.value }}</span>
+              {%- if h.is_hashed %}
+                <span class="ml-2 text-neutral-400 italic font-sans">[hashed]</span>
+              {%- endif %}
+            </td>
+          </tr>
+        {%- endfor %}
+      </tbody>
+    </table>
+  {%- else -%}
+    <p class="text-xs text-neutral-500 italic">No headers captured.</p>
+  {%- endif %}
+{%- endmacro %}
