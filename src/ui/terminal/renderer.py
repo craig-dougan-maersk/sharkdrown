@@ -200,9 +200,52 @@ def _style_attrs(cell, *, force_reverse: bool = False) -> str:
         parts.append("font-weight:bold")
     if getattr(cell, "italics", False):
         parts.append("font-style:italic")
-    if getattr(cell, "underscore", False):
+    if getattr(cell, "underscore", False) and not _glyph_is_self_underlining(
+        cell.data
+    ):
+        # SGR-4 ("underline") on cells whose glyph already extends below
+        # the baseline would render as a *second* horizontal line under
+        # the existing character. Box-drawing characters (U+2500–U+259F,
+        # which Claude Code v2.x uses for its welcome-screen borders) are
+        # the main offender; see :func:`_glyph_is_self_underlining` for
+        # the full set. In a real xterm the SGR-4 attribute is a no-op
+        # on those characters, so skipping it here brings the renderer
+        # in line with how a native terminal would draw them.
         parts.append("text-decoration:underline")
     return ";".join(parts)
+
+
+def _glyph_is_self_underlining(ch: str) -> bool:
+    """True when ``ch``'s glyph already has a visible horizontal stroke
+    below the baseline.
+
+    Rendering such a glyph with CSS ``text-decoration:underline`` would
+    draw a *second* line under the existing character — visually the
+    cell becomes a "doubled-up" / over-thick horizontal rule compared
+    to what a real xterm would show. The main offenders are Claude
+    Code v2.x's box-drawing separator lines (``─``, ``═``, …) which
+    it emits with the SGR-4 underline attribute set; without this
+    filter the renderer paints a phantom underline beneath every one
+    of those glyphs.
+
+    Matched ranges:
+
+    - ``U+2500–U+257F``: Box Drawing block — every code point is some
+      kind of line / corner.
+    - ``U+2580–U+259F``: Block Elements — half- and full-block cells
+      sit on/below the baseline; a CSS underline would double-stroke
+      them too.
+    - ``U+FE4D–U+FE4F``: CJK Compatibility horizontal lines
+      (PRESENTATION FORM FOR VERTICAL / HORIZONTAL ELLIPSIS / STROKE).
+    """
+    if not ch:
+        return False
+    cp = ord(ch[0])
+    return (
+        0x2500 <= cp <= 0x257F
+        or 0x2580 <= cp <= 0x259F
+        or 0xFE4D <= cp <= 0xFE4F
+    )
 
 
 def screen_to_html(

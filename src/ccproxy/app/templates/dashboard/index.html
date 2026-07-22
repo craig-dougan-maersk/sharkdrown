@@ -6,6 +6,7 @@
      x-data="{
        hide_failed: {{ 'true' if hide_failed else 'false' }},
        hide_no_tokens: {{ 'true' if hide_no_tokens else 'false' }},
+       hide_empty: {{ 'true' if hide_empty else 'false' }},
        model: '{{ model_filter or '' }}',
        buildQuery() {
          const p = new URLSearchParams();
@@ -13,6 +14,7 @@
          p.set('limit', '10');
          p.set('hide_failed', this.hide_failed ? '1' : '0');
          p.set('hide_no_tokens', this.hide_no_tokens ? '1' : '0');
+         p.set('hide_empty', this.hide_empty ? '1' : '0');
          if (this.model) p.set('model', this.model);
          return p;
        },
@@ -48,11 +50,30 @@
   </nav>
 
   {% if view == 'conversations' %}
-    <div id="list"
-         hx-get="/partials/conversations?page=1"
-         hx-trigger="load"
-         hx-swap="innerHTML">
-      Loading conversations…
+    {# Local Alpine x-data so we keep the filter state when the user
+       toggles the checkbox *and* persists it into "Load more" requests
+       via htmx's ``config-request`` hook. #}
+    <div x-data="{ hide_empty: {{ 'true' if hide_empty else 'false' }} }">
+      <div class="flex items-center gap-4 mb-3 text-sm flex-wrap">
+        <span class="text-neutral-500">Filter:</span>
+        <label class="flex items-center gap-1.5 cursor-pointer text-neutral-700 select-none">
+          <input type="checkbox" x-model="hide_empty"
+                 hx-get="/partials/conversations?page=1"
+                 hx-target="#list"
+                 hx-swap="innerHTML"
+                 hx-trigger="change"
+                 hx-on::config-request="event.detail.parameters.hide_empty = hide_empty ? '1' : '0'"
+                 class="rounded border-neutral-300 text-blue-600 focus:ring-blue-500">
+          Hide 0-message
+        </label>
+      </div>
+      <div id="list"
+           hx-get="/partials/conversations?page=1&hide_empty={{ '1' if hide_empty else '0' }}"
+           hx-trigger="load"
+           hx-swap="innerHTML"
+           hx-on::config-request="event.detail.parameters.hide_empty = hide_empty ? '1' : '0'">
+        Loading conversations…
+      </div>
     </div>
   {% else %}
     <div class="flex items-center gap-4 mb-3 text-sm flex-wrap">

@@ -29,6 +29,7 @@ def _render(request: Request, name: str, context: dict[str, Any]) -> HTMLRespons
 _FILTER_DEFAULTS = {
     "hide_failed": True,      # hide 4xx/5xx by default
     "hide_no_tokens": True,   # hide rows with no token accounting
+    "hide_empty": True,       # hide conversations with 0 messages (e.g. subagent spawns)
 }
 
 
@@ -190,11 +191,20 @@ async def partials_conversations(
     request: Request,
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=100),
+    hide_empty: str | None = Query(None),
 ) -> HTMLResponse:
-    """List fragment for the Conversations view."""
+    """List fragment for the Conversations view.
+
+    ``hide_empty`` defaults to True — subagent spawns produce many
+    JSONL files with zero messages, which would otherwise dominate the
+    list. Toggling the checkbox in the UI round-trips a 0/1 string.
+    """
     base_path = _conversations_base(request)
     reader = ConversationReader(base_path=base_path)
-    rows, total = reader.list_conversations(page=page, limit=limit)
+    hide_empty_b = _filter_bool("hide_empty", hide_empty)
+    rows, total = reader.list_conversations(
+        page=page, limit=limit, hide_empty=hide_empty_b
+    )
     has_more = page * limit < total
     return _render(
         request,
@@ -203,6 +213,7 @@ async def partials_conversations(
             "rows": rows,
             "has_more": has_more,
             "next_page": page + 1,
+            "hide_empty": hide_empty_b,
         },
     )
 

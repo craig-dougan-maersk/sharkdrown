@@ -58,13 +58,23 @@ class ConversationReader:
     # ---- listing ----------------------------------------------------------
 
     def list_conversations(
-        self, *, page: int = 1, limit: int = 10
+        self,
+        *,
+        page: int = 1,
+        limit: int = 10,
+        hide_empty: bool = False,
     ) -> tuple[list[Conversation], int]:
         """All sessions across all projects, sorted by ``start_time`` DESC.
 
         Returns ``(rows, total)`` — pagination is applied in Python after
         the full scan; for tens of thousands of sessions this should be
         revisited (e.g. cache a manifest sorted by file mtime).
+
+        ``hide_empty=True`` drops any session whose ``message_count`` is
+        zero *before* pagination. Empty sessions are Claude Code subagent
+        spawns that wrote a header line but no actual messages — they
+        flood the list under heavy subagent use, so the dashboard's
+        "Conversations" view hides them by default.
         """
         all_conversations: list[Conversation] = []
         if not self.base.is_dir():
@@ -72,8 +82,11 @@ class ConversationReader:
 
         for jsonl in self.base.rglob("*.jsonl"):
             conv = self._build_metadata(jsonl)
-            if conv is not None:
-                all_conversations.append(conv)
+            if conv is None:
+                continue
+            if hide_empty and conv.message_count == 0:
+                continue
+            all_conversations.append(conv)
 
         all_conversations.sort(
             key=lambda c: c.start_time or datetime.min.replace(tzinfo=UTC),
@@ -86,7 +99,12 @@ class ConversationReader:
         end = start + limit
         return all_conversations[start:end], total
 
-    def get_conversations_by_project(self, project_path: str) -> list[Conversation]:
+    def get_conversations_by_project(
+        self,
+        project_path: str,
+        *,
+        hide_empty: bool = False,
+    ) -> list[Conversation]:
         """All sessions under ``base/<project_path>/``."""
         proj_dir = self.base / project_path
         if not proj_dir.is_dir():
@@ -94,8 +112,11 @@ class ConversationReader:
         out: list[Conversation] = []
         for jsonl in proj_dir.glob("*.jsonl"):
             conv = self._build_metadata(jsonl)
-            if conv is not None:
-                out.append(conv)
+            if conv is None:
+                continue
+            if hide_empty and conv.message_count == 0:
+                continue
+            out.append(conv)
         out.sort(
             key=lambda c: c.start_time or datetime.min.replace(tzinfo=UTC),
             reverse=True,
@@ -112,17 +133,25 @@ class ConversationReader:
     # ---- internals --------------------------------------------------------
 
     def _build_metadata(self, path: Path) -> Conversation | None:
-        """Build a Conversation from the first/last records of a session.
+        """Build a Conversation from a session file.
 
-        Reads only the first and last lines to compute start_time/end_time
-        cheaply — full message bodies aren't loaded until ``get_conversation``
-        is called.
+        Reads the first and last lines to compute ``start_time`` /
+        ``end_time`` cheaply and counts parseable lines for
+        ``message_count``. The full message bodies aren't loaded —
+        that's deferred to :meth:`_build_full` / :meth:`get_conversation`.
+
+        Note: we already iterate the whole file to seek the last non-empty
+        line (existing behaviour), so counting during the same pass adds
+        no extra I/O. Returning a real ``message_count`` here is what
+        makes the dashboard's "Hide 0-message" filter meaningful — without
+        it every row shows "0 messages" and the filter would have nothing
+        to discriminate.
         """
         try:
             with path.open(encoding="utf-8") as f:
                 first_line = f.readline()
-                # Seek to last non-empty line.
                 lines = f.readlines()
+                # Seek to last non-empty line.
                 last_line = lines[-1] if lines else first_line
         except OSError as e:
             logger.warning("could not read %s: %s", path, e)
@@ -130,6 +159,14 @@ class ConversationReader:
 
         first = _parse_line(first_line)
         last = _parse_line(last_line)
+        # Count parseable records. ``_parse_line`` already returns
+        # ``None`` for blank / non-dict lines, so we just count lines
+        # with a non-None result rather than duplicating the JSON parse.
+        # first_line + lines covers the whole file (readlines returns
+        # the remainder; we never re-read the first line here).
+        message_count = sum(
+            1 for ln in (first_line, *lines) if _parse_line(ln) is not None
+        )
 
         return Conversation(
             session_id=path.stem,
@@ -138,7 +175,7 @@ class ConversationReader:
             messages=[],
             start_time=(first.timestamp if first else None),
             end_time=(last.timestamp if last else None),
-            message_count=0,  # populated only by _build_full
+            message_count=message_count,
             file_path=path,
         )
 

@@ -30,6 +30,7 @@ import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -270,9 +271,11 @@ class ProfileEditorDialog(QDialog):
         layout.addWidget(settings_help)
 
         self.settings_edit = QPlainTextEdit()
-        mono = QPlainTextEdit.font()
-        from PySide6.QtGui import QFontDatabase
-
+        # Instance-method call: ``QPlainTextEdit.font()`` inherited from
+        # QWidget isn't bound to the class in PySide6; calling it on the
+        # class directly raises ``TypeError: unbound method needs an
+        # argument``. Use the widget we just instantiated.
+        mono = self.settings_edit.font()
         mono.setFamily(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont).family())
         self.settings_edit.setFont(mono)
         self.settings_edit.setPlaceholderText('{\n  "permissions": {}\n}')
@@ -336,7 +339,7 @@ class ProfileEditorDialog(QDialog):
         self.cred_ref_edit.setText(self._profile.api_key_ref or "default-key")
         # Don't pre-fill the credential value — leave blank to keep
         # what's already on disk.
-        self._cred_value_edit.setText("")
+        self.cred_value_edit.setText("")
         _populate_pairs(self.env_table, list(self._profile.env_vars.items()))
         try:
             settings_text = json.dumps(
@@ -451,7 +454,7 @@ class ProfileEditorDialog(QDialog):
         cred_ref = self.cred_ref_edit.text().strip() or None
         self._profile.api_key_ref = cred_ref
         if self._cred_edited and cred_ref:
-            new_value = self._cred_value_edit.text()
+            new_value = self.cred_value_edit.text()
             if new_value == "":
                 # Blank edit = "clear the credential". Only honour
                 # this if the credential previously existed.

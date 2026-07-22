@@ -23,10 +23,15 @@
   </ul>
 
   {% if has_more %}
+    {# ``hx-on::config-request`` lets the parent Alpine ``x-data`` push
+       the current ``hide_empty`` choice into the outbound URL when
+       htmx actually fetches, so Load more respects the checkbox
+       without having to template-build the URL string ourselves. #}
     <div class="text-center mt-4">
       <button hx-get="/partials/conversations?page={{ next_page }}"
               hx-target="#list"
               hx-swap="beforeend"
+              hx-on::config-request="const el = document.querySelector('[x-data]'); const st = el && Alpine.$data(el); if (st) event.detail.parameters.hide_empty = st.hide_empty ? '1' : '0';"
               class="px-4 py-2 text-sm border border-neutral-300 rounded hover:bg-neutral-100">
         Load more
       </button>
