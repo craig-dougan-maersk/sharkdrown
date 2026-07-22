@@ -124,9 +124,16 @@ def _in_selection(
     """True if cell ``(x, y)`` is inside the selection rectangle.
 
     Linear: per-row x clamp — row y1 has x≥x1, row y2 has x≤x2, interior
-    rows are full-width. This matches xterm's "drag flows across rows"
-    behaviour.
-    Block: simple rectangle test — same x-range, same y-range.
+    rows are full-width. Matches xterm's "drag flows across rows"
+    behaviour. Currently unused by the terminal UI (block is the
+    default) but kept so a future mode toggle can re-enable it without
+    rewriting the highlight math.
+
+    Block: simple rectangle test — same x-range, same y-range. This is
+    the default selection mode for the terminal because on a uniform
+    character grid every row contains meaningful content, so the
+    "linear flow" interpretation produces confusing results where
+    diagonal drags highlight most of the screen.
     """
     if selection is None:
         return False
@@ -173,8 +180,22 @@ def _style_attrs(cell, *, force_reverse: bool = False) -> str:
     # stands out against the surrounding text. Only do this when the
     # already-computed bg is the inherited (default) variable — colored
     # rows already produce visible reverse contrast.
+    #
+    # NB: we use a solid color, not ``rgba(..., 0.15)`` semi-transparent
+    # white. CSS treats multiple ``background-color`` declarations as
+    # overrides (the *last* one wins), not as a layered fill — so
+    # adding ``background-color:rgba(255,255,255,0.15)`` REPLACES the
+    # dark terminal bg with semi-transparent white, which against light
+    # foreground text produces near-zero contrast (the highlight
+    # effectively disappears). A solid slightly-brighter grey keeps
+    # the original fg visible and gives the selection a clear
+    # difference from the surrounding default-bg cells.
     if force_reverse and bg == "var(--term-bg)":
-        parts.append("background-color:rgba(255,255,255,0.15)")
+        # ``_DARK_BG`` is the terminal's default bg (#1a1a1a). We
+        # lighten it to #3a3a3a for selection — about 20% brighter,
+        # which gives clear contrast with both the unselected cells
+        # and the (lighter) terminal foreground.
+        parts.append("background-color:#3a3a3a")
     if getattr(cell, "bold", False):
         parts.append("font-weight:bold")
     if getattr(cell, "italics", False):
@@ -226,10 +247,19 @@ def screen_to_html(
         'font-family:Menlo,Consolas,monospace;'
         f'--term-fg:{_DARK_FG};'
         f'--term-bg:{_DARK_BG};'
-        'margin:0;padding:4px;'
+        # Padding must be 0 — QTextDocument already adds its own
+        # document-margin on top of anything we put here, so any
+        # extra pixels compound into rows of vertical slack. The
+        # cell grid is exactly the viewport's pixel area.
+        'margin:0;padding:0;'
         'background-color:var(--term-bg);'
         'color:var(--term-fg);'
-        'line-height:1.2;'
+        # Line-height:1.0 makes ``font.lineSpacing()`` (which renders
+        # the row baseline measurement) match the actual rendered row
+        # height — otherwise QTextDocument lays out slightly taller
+        # rows than ``_recompute_size`` measures, and the document
+        # ends up ``rows + 2`` tall, leaving room for vertical scroll.
+        'line-height:1.0;'
         '">'
     ]
 

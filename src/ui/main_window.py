@@ -12,9 +12,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QAction, QClipboard, QIcon, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QClipboard, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMenu,
@@ -28,12 +29,15 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.document import DocumentTab
+from src.profiles.store import ProfileStore
 from src.proxy.activity_tile import ActivityTile
 from src.proxy.dashboard_view import DashboardView
 from src.proxy.paths import default_db_path
 from src.proxy.proxy_config import ProxyConfig
 from src.proxy.server_thread import ProxyServerThread
 from src.proxy.settings_dialog import ProxySettingsDialog
+from src.ui.claude.claude_container_view import ClaudeContainerView
+from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
 from src.ui.recent_activity_view import RecentActivityView
 from src.ui.terminal.terminal_container_view import TerminalContainerView
 
@@ -62,6 +66,8 @@ class MainWindow(QMainWindow):
         self.activity_tile: ActivityTile | None = None
         self.recent_activity_view: RecentActivityView | None = None
         self.terminal_container: TerminalContainerView | None = None
+        self.claude_container: ClaudeContainerView | None = None
+        self.profile_store: ProfileStore | None = None
         self._proxy_autostart_fired = False
         self._restart_after_stop = False
 
@@ -70,6 +76,7 @@ class MainWindow(QMainWindow):
         self._init_menu()
         self._init_server_menu()
         self._init_terminal_menu()
+        self._init_claude_menu()
         self._init_toolbar()
         self._init_status_bar()
 
@@ -130,6 +137,7 @@ class MainWindow(QMainWindow):
         self._TAB_INDEX_DASHBOARD = 1
         self._TAB_INDEX_RECENT_ACTIVITY = 2
         self._TAB_INDEX_TERMINALS = 3
+        self._TAB_INDEX_CLAUDE = 4
 
         # Page 1: Documents (existing editor/preview splitter).
         documents_page = QWidget()
@@ -172,6 +180,18 @@ class MainWindow(QMainWindow):
         # shell is started until the user clicks "+ New Session".
         self.terminal_container = TerminalContainerView()
         self.view_tabs.addTab(self.terminal_container, "Terminals")
+
+        # Page 5: Claude — closable tab strip of Claude Code PTY sessions.
+        # Same UX as Terminals; the container takes care of proxy
+        # auto-start, env construction, and Claude settings dir layout.
+        self.claude_container = ClaudeContainerView()
+        self.claude_container.set_proxy_callbacks(
+            is_proxy_running=self._is_proxy_running,
+            get_proxy_base_url=self._proxy_base_url,
+            request_proxy_start=self._request_proxy_start,
+        )
+        self.claude_container.proxy_requested.connect(self._on_claude_proxy_requested)
+        self.view_tabs.addTab(self.claude_container, "Claude")
 
         self.setCentralWidget(self.view_tabs)
 
@@ -429,6 +449,87 @@ class MainWindow(QMainWindow):
         self.action_kill_all_sessions = QAction("&Kill All Sessions", self)
         self.action_kill_all_sessions.triggered.connect(self._kill_all_terminal_sessions)
         terminal_menu.addAction(self.action_kill_all_sessions)
+
+    def _init_claude_menu(self) -> None:
+        """Add the Claude menu between Terminal and Format.
+
+        Pattern mirrors ``_init_terminal_menu``: actions stored as
+        ``self.action_*``, all always available (no proxy-state
+        gating — Claude sessions auto-start the proxy on demand).
+
+        The profile dropdown is a sub-menu populated dynamically from
+        :class:`ProfileStore`. ``QActionGroup`` enforces single-selection
+        so only one profile can be "active" (drives proxy routing) at
+        a time. Switching the active profile triggers a proxy restart
+        if one is running — see :meth:`_set_active_profile`.
+        """
+        menubar = self.menuBar()
+        claude_menu = menubar.addMenu("C&laude")
+
+        self.action_new_claude_session = QAction("&New Claude Session", self)
+        self.action_new_claude_session.setShortcut("Ctrl+Alt+C")
+        self.action_new_claude_session.triggered.connect(self._new_claude_session)
+        claude_menu.addAction(self.action_new_claude_session)
+
+        self.action_focus_claude = QAction("Focus &Claude Tab", self)
+        self.action_focus_claude.setShortcut("Ctrl+Alt+Shift+C")
+        self.action_focus_claude.triggered.connect(self._focus_claude_tab)
+        claude_menu.addAction(self.action_focus_claude)
+
+        claude_menu.addSeparator()
+
+        # ---- Profile dropdown -----------------------------------------
+        # A QMenu inside the Claude menu; populated by
+        # _refresh_profile_menu() on first access and whenever the
+        # profile list changes.
+        self.profile_menu = QMenu("&Profile", self)
+        self.profile_group = QActionGroup(self)
+        self.profile_group.setExclusive(True)
+        claude_menu.addMenu(self.profile_menu)
+
+        claude_menu.addSeparator()
+
+        self.action_manage_profiles = QAction("&Manage Profiles…", self)
+        self.action_manage_profiles.triggered.connect(self._show_profile_editor)
+        claude_menu.addAction(self.action_manage_profiles)
+
+        # Populate on first show (lazy — avoids spinning up the
+        # ProfileStore during cold start when the user might never
+        # open the Claude tab).
+        self.profile_menu.aboutToShow.connect(self._refresh_profile_menu)
+
+    def _refresh_profile_menu(self) -> None:
+        """Rebuild the profile dropdown from the on-disk store.
+
+        Idempotent — called whenever the menu is about to show and
+        after every edit. The checkable actions live inside
+        ``self.profile_group`` so exactly one is checked (the active
+        profile); switching another triggers ``_set_active_profile``.
+        """
+        # Clear existing actions; tear them out of the group too so
+        # they don't get GC'd while still referenced.
+        for action in list(self.profile_group.actions()):
+            self.profile_group.removeAction(action)
+        self.profile_menu.clear()
+
+        store = self._profile_store()
+        profiles = store.load()
+        active_name = store.get_active_name() or (
+            profiles[0].name if profiles else None
+        )
+
+        for p in profiles:
+            act = QAction(p.name, self)
+            act.setCheckable(True)
+            act.setChecked(p.name == active_name)
+            act.triggered.connect(lambda _checked=False, n=p.name: self._set_active_profile(n))
+            self.profile_group.addAction(act)
+            self.profile_menu.addAction(act)
+
+        if not profiles:
+            placeholder = QAction("(no profiles)", self)
+            placeholder.setEnabled(False)
+            self.profile_menu.addAction(placeholder)
 
     def _create_new_tab(self, content: str = "", file_path: Path | None = None) -> None:
         """Create a new editor tab with optional content."""
@@ -721,6 +822,11 @@ class MainWindow(QMainWindow):
         # the tab yet. This avoids the heavy QWebEngineWidgets import
         # until the server is actually running.
         self._ensure_dashboard_loaded()
+        # Flush any Claude session that was queued while the proxy
+        # was starting. The container holds at most one pending
+        # launch; if nothing was queued this is a no-op.
+        if self.claude_container is not None:
+            self.claude_container.flush_pending_launch()
 
     def _on_proxy_failed(self, msg: str) -> None:
         """Called when the thread or uvicorn fails to start."""
@@ -844,6 +950,12 @@ class MainWindow(QMainWindow):
         if index == getattr(self, "_TAB_INDEX_TERMINALS", -1):
             if self.terminal_container is not None:
                 self.terminal_container.focus_active_session()
+        # Same for Claude — without the focus transfer, keystrokes
+        # after switching tabs would go to the QTabBar (Alt+arrows
+        # become tab-navigation shortcuts, etc.).
+        if index == getattr(self, "_TAB_INDEX_CLAUDE", -1):
+            if self.claude_container is not None:
+                self.claude_container.focus_active_session()
 
     def _open_dashboard_external(self) -> None:
         """Open the dashboard in the user's default web browser."""
@@ -960,6 +1072,188 @@ class MainWindow(QMainWindow):
             self.status.showMessage("Proxy settings saved.", 3000)
 
     # ------------------------------------------------------------------
+    # Claude session control
+    # ------------------------------------------------------------------
+
+    def _profile_store(self) -> ProfileStore:
+        """Lazy-init the :class:`ProfileStore` (requires a QApplication)."""
+        if self.profile_store is None:
+            self.profile_store = ProfileStore(
+                path=default_db_path().parent / "profiles.json",
+            )
+        return self.profile_store
+
+    def _is_proxy_running(self) -> bool:
+        return self.proxy_thread is not None and self.proxy_thread.isRunning()
+
+    def _proxy_base_url(self) -> str:
+        """URL Claude Code sessions should use. Empty if proxy isn't up."""
+        if not self._is_proxy_running() or self.proxy_port == 0:
+            return ""
+        return f"http://{self.proxy_host}:{self.proxy_port}"
+
+    def _request_proxy_start(self) -> None:
+        """Start the proxy if not already running.
+
+        Called from :class:`ClaudeContainerView` when a new session
+        is requested before the proxy is up. Returns immediately —
+        the container queues its launch and picks it up when the
+        proxy's ``started_ok`` signal fires.
+        """
+        if not self._is_proxy_running():
+            self._start_server()
+
+    def _on_claude_proxy_requested(self) -> None:
+        """Slot for :attr:`ClaudeContainerView.proxy_requested`.
+
+        Just calls :meth:`_request_proxy_start` — kept separate so
+        the signal-to-slot wiring has a clear name in the constructor.
+        """
+        self._request_proxy_start()
+
+    def _new_claude_session(self) -> None:
+        """Open a new Claude session in the Claude tab and switch to it."""
+        if self.claude_container is None:
+            return
+        # Use the active profile as the default. If the user wants a
+        # different profile for this specific session, we offer a picker.
+        profiles = self._profile_store().load()
+        if not profiles:
+            QMessageBox.information(
+                self,
+                "No profiles",
+                "No Claude profiles configured. Open "
+                "Claude → Manage Profiles… to create one.",
+            )
+            return
+        active = self._profile_store().get_active()
+        profile = active
+        if len(profiles) > 1:
+            names = [p.name for p in profiles]
+            current = names.index(active.name) if active else 0
+            choice, ok = QInputDialog.getItem(
+                self,
+                "Profile for new session",
+                "Use which profile?",
+                names,
+                current,
+                False,
+            )
+            if not ok:
+                return
+            profile = next(p for p in profiles if p.name == choice)
+        view = self.claude_container.new_session(profile=profile)
+        # Switch to the Claude tab so the user sees the new session.
+        self.view_tabs.setCurrentIndex(self._TAB_INDEX_CLAUDE)
+        # If the launch was queued (proxy not yet up), ``view`` is
+        # None — the proxy start signal will eventually launch it.
+
+    def _focus_claude_tab(self) -> None:
+        """Slot for Claude → Focus Claude Tab."""
+        idx = getattr(self, "_TAB_INDEX_CLAUDE", None)
+        if idx is not None:
+            self.view_tabs.setCurrentIndex(idx)
+
+    def _set_active_profile(self, name: str) -> None:
+        """Switch the active profile; restart the proxy if running.
+
+        Per the user's design decision: profile switching triggers a
+        proxy restart (~1-2 s downtime, drops in-flight requests).
+        We show a status-bar message so the user knows what's
+        happening.
+        """
+        store = self._profile_store()
+        try:
+            store.set_active(name)
+        except KeyError:
+            return
+        # Update the proxy's model_endpoints to match the new profile.
+        # If the proxy is running we have to bounce it; if not, the
+        # next ``_start_server`` reads the active profile's endpoints.
+        if self._is_proxy_running():
+            self.status.showMessage(
+                f"Restarting proxy to apply profile {name!r}…",
+                3000,
+            )
+            self._restart_after_stop = True
+            self._stop_server()
+        else:
+            self._refresh_profile_menu()
+
+    def _show_profile_editor(self) -> None:
+        """Open the Manage Profiles dialog.
+
+        The dialog edits a single profile at a time. To avoid
+        bouncing between dialogs, we use a small "list + edit"
+        pattern: an initial dialog (or a custom sub-dialog)
+        presents a list of profiles plus New / Edit / Delete
+        actions. For v1, we open the editor for the active
+        profile and let the user edit the rest via the dropdown
+        on the way out.
+
+        A more complete multi-profile manager is Phase 4; for now
+        this gives the user a working path to edit / create
+        profiles without disrupting the menu.
+        """
+        store = self._profile_store()
+        profiles = store.load()
+        if not profiles:
+            # No profiles — open editor for a fresh "New Profile"
+            # draft and let the user fill it in.
+            from src.profiles.models import ClaudeProfile, slugify
+
+            draft = ClaudeProfile(
+                name="",
+                slug=slugify(""),
+                model_endpoints={},
+            )
+        else:
+            # Pick which profile to edit. If only one exists, jump
+            # straight into editing it.
+            if len(profiles) == 1:
+                draft = profiles[0]
+            else:
+                names = [p.name for p in profiles]
+                active = store.get_active()
+                current = (
+                    names.index(active.name) if active in profiles else 0
+                )
+                choice, ok = QInputDialog.getItem(
+                    self,
+                    "Manage Profiles",
+                    "Edit which profile?",
+                    names,
+                    current,
+                    False,
+                )
+                if not ok:
+                    return
+                draft = next(p for p in profiles if p.name == choice)
+
+        dlg = ProfileEditorDialog(
+            draft, credential_store=store.credential_store, parent=self
+        )
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+        edited = dlg.to_profile()
+        if not edited.name:
+            return
+        store.upsert(edited)
+        self.status.showMessage(f"Saved profile {edited.name!r}.", 3000)
+        self._refresh_profile_menu()
+        # If the proxy is running and we just changed the active
+        # profile's endpoints, the model_endpoints may have drifted —
+        # restart to pick them up.
+        active_name = store.get_active_name()
+        if self._is_proxy_running() and active_name == edited.name:
+            self._restart_after_stop = True
+            self._stop_server()
+        elif not self._is_proxy_running():
+            # No proxy running — nothing to restart, but the next
+            # session launch will read the updated endpoints.
+            pass
+
+    # ------------------------------------------------------------------
     # Window lifecycle
     # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -977,6 +1271,12 @@ class MainWindow(QMainWindow):
             # disconnect cleanly. Container.shutdown() is idempotent and
             # bounded — same philosophy as the proxy thread teardown.
             self.terminal_container.shutdown()
+        if self.claude_container is not None:
+            # Same pattern — Claude Code sessions are PTY children too,
+            # and they hold connections to the proxy. Shutting them
+            # down before the proxy thread tears down avoids stray
+            # asyncio tasks referencing a closed event loop.
+            self.claude_container.shutdown()
         if thread is not None and thread.isRunning():
             thread.request_stop()
             # Give uvicorn up to 3s to drain; force-terminate otherwise.

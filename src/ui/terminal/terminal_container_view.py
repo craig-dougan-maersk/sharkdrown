@@ -8,6 +8,8 @@ inserted into ``view_tabs`` as the 4th top-level tab in
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -66,6 +68,24 @@ class TerminalContainerView(QWidget):
         self.session_tabs.tabBar().setVisible(False)
         layout.addWidget(self.session_tabs, 1)
 
+        # --- Alt+Left / Alt+Right session cycling -------------------------
+        # Wired as QActions on the container so the shortcut context is
+        # scoped to "this widget's focus chain" — Qt won't fire them when
+        # the user is typing in the Documents tab or the menu bar. The
+        # application-wide scope (``Qt.ApplicationShortcut``) would
+        # steal Alt+arrows from any other widget that uses them.
+        self.action_prev_session = QAction("Previous Session", self)
+        self.action_prev_session.setShortcut(QKeySequence("Alt+Left"))
+        self.action_prev_session.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.action_prev_session.triggered.connect(lambda: self._cycle_session(-1))
+        self.addAction(self.action_prev_session)
+
+        self.action_next_session = QAction("Next Session", self)
+        self.action_next_session.setShortcut(QKeySequence("Alt+Right"))
+        self.action_next_session.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.action_next_session.triggered.connect(lambda: self._cycle_session(+1))
+        self.addAction(self.action_next_session)
+
     # ---- public API --------------------------------------------------------
 
     def new_session(self, cwd: str | None = None) -> TerminalSessionView:
@@ -98,6 +118,33 @@ class TerminalContainerView(QWidget):
         widget = self.session_tabs.currentWidget()
         if isinstance(widget, TerminalSessionView):
             widget.focus_terminal()
+
+    def _cycle_session(self, delta: int) -> None:
+        """Switch to the next/previous session, wrapping at the edges.
+
+        Wired to ``Alt+Left`` (delta=-1) and ``Alt+Right`` (delta=+1)
+        from the QAction shortcuts set up in ``_build_ui``. With <2
+        sessions the math reduces to a no-op (we can't cycle to a
+        different tab), so the keys silently do nothing rather than
+        wrap onto the same tab and steal focus from the user.
+
+        After switching we call ``focus_active_session`` so the newly
+        visible text edit receives keyboard focus — without this the
+        user would have to click into the tab before typing resumes,
+        which is exactly the "Alt+Right switches tabs but keystrokes
+        still go to the previous one" failure mode.
+        """
+        count = self.session_tabs.count()
+        if count <= 1:
+            return
+        current = self.session_tabs.currentIndex()
+        # Modulo arithmetic handles wraparound in both directions —
+        # ``-1 % count`` in Python is the correct positive wrap index,
+        # so we don't need a separate branch for "before the first
+        # tab" vs "after the last tab".
+        new_index = (current + delta) % count
+        self.session_tabs.setCurrentIndex(new_index)
+        self.focus_active_session()
 
     @property
     def session_count(self) -> int:

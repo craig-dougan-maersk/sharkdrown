@@ -1,0 +1,732 @@
+"""Tests for the Claude Code integration in sharkdrownv3.
+
+Headless tests cover:
+  - ``src.profiles`` — slug, credential store, profile store,
+    config-dir writer, env builder
+  - ``src.ui.terminal.terminal_session_view`` — env/cwd forwarding
+  - ``src.ui.claude.claude_container_view`` — proxy deferral,
+    claude-binary guard, session launching
+
+Each test prints a checkmark on success and a traceback on failure.
+The runner at the bottom iterates a fixed list of tests — same style
+as ``test_terminal.py``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import stat
+import sys
+import tempfile
+import warnings
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+_PROJECT_ROOT = Path(__file__).parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+sys.path.insert(0, str(_PROJECT_ROOT / "src"))
+
+
+# ---- helpers --------------------------------------------------------------
+
+
+def _qapp():
+    from PySide6.QtWidgets import QApplication
+
+    return QApplication.instance() or QApplication([])
+
+
+def _spin(ms: int = 200):
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    loop = QEventLoop()
+    qt = QTimer()
+    qt.setSingleShot(True)
+    qt.setInterval(ms)
+    qt.timeout.connect(loop.quit)
+    qt.start()
+    loop.exec()
+
+
+def _tmp_dir() -> Path:
+    """Fresh tmpdir that gets cleaned up on process exit."""
+    return Path(tempfile.mkdtemp(prefix="sharkdrown-claude-test-"))
+
+
+# ---- slug ------------------------------------------------------------------
+
+
+def test_slugify_basic():
+    from src.profiles import slugify
+
+    assert slugify("Default") == "default"
+    assert slugify("My Profile") == "my-profile"
+    assert slugify("Work-Server") == "work-server"
+    assert slugify("work_server") == "work-server"
+    print("✓ slugify handles typical names")
+
+
+def test_slugify_collapses_punctuation():
+    from src.profiles import slugify
+
+    assert slugify("Foo!! @@@ Bar") == "foo-bar"
+    assert slugify("__init__") == "init"
+    print("✓ slugify collapses punctuation")
+
+
+def test_slugify_empty_falls_back():
+    from src.profiles import slugify
+
+    assert slugify("") == "profile"
+    assert slugify("   ") == "profile"
+    assert slugify("---") == "profile"
+    assert slugify("!@#$") == "profile"
+    print("✓ slugify falls back for empty / punctuation-only input")
+
+
+# ---- credential store -----------------------------------------------------
+
+
+def test_credential_store_roundtrip():
+    cs_path = _tmp_dir() / "credentials.json"
+    from src.profiles import CredentialStore
+
+    cs = CredentialStore(cs_path)
+    assert cs.get("default-key") is None
+    cs.set("default-key", "sk-test-1")
+    assert cs.get("default-key") == "sk-test-1"
+    cs.set("alt", "sk-test-2")
+    assert cs.all_refs() == {"default-key": "sk-test-1", "alt": "sk-test-2"}
+    cs.delete("default-key")
+    assert cs.get("default-key") is None
+    assert cs.get("alt") == "sk-test-2"
+    print("✓ CredentialStore set/get/delete roundtrip")
+
+
+def test_credential_store_chmod_600():
+    cs_path = _tmp_dir() / "credentials.json"
+    from src.profiles import CredentialStore
+
+    cs = CredentialStore(cs_path)
+    cs.set("k", "v")
+    mode = stat.S_IMODE(cs_path.stat().st_mode)
+    assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+    print("✓ CredentialStore enforces chmod 600 on save")
+
+
+def test_credential_store_corrupt_file_treated_as_empty():
+    cs_path = _tmp_dir() / "credentials.json"
+    cs_path.write_text("not json", encoding="utf-8")
+    from src.profiles import CredentialStore
+
+    cs = CredentialStore(cs_path)
+    assert cs.get("any") is None
+    # Writing on top repairs it.
+    cs.set("k", "v")
+    assert cs.get("k") == "v"
+    print("✓ CredentialStore recovers from corrupt file")
+
+
+# ---- profile store ---------------------------------------------------------
+
+
+def _make_profile(name: str = "Test") -> "ClaudeProfile":
+    from src.profiles import ClaudeProfile
+
+    return ClaudeProfile(
+        name=name,
+        slug=name.lower(),
+        model_endpoints={"claude-opus-4-8": "https://api.example.com"},
+        default_model="claude-opus-4-8",
+        api_key_ref="default-key",
+        env_vars={"FOO": "bar"},
+    )
+
+
+def test_profile_store_roundtrip():
+    from src.profiles import ProfileStore
+
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    p = _make_profile("Alice")
+    store.upsert(p)
+    loaded = store.load()
+    assert len(loaded) == 1
+    assert loaded[0].name == "Alice"
+    assert loaded[0].model_endpoints == p.model_endpoints
+    assert loaded[0].env_vars == p.env_vars
+    assert store.get_active_name() == "Alice"
+    print("✓ ProfileStore save/load roundtrip preserves fields")
+
+
+def test_profile_store_migration_seeds_default_from_legacy_config():
+    from src.profiles import ProfileStore
+
+    base = _tmp_dir()
+
+    # Legacy config provider — pretend QSettings has these URLs.
+    class _FakeCfg:
+        model_endpoints = {
+            "claude-opus-4-8": "https://api.anthropic.com",
+            "claude-sonnet-4-6": "https://api.example.com",
+        }
+
+    store = ProfileStore(
+        path=base / "profiles.json",
+        legacy_proxy_config_provider=lambda: _FakeCfg(),
+    )
+    profiles = store.load()
+    assert len(profiles) == 1
+    assert profiles[0].name == "Default"
+    assert (
+        profiles[0].model_endpoints
+        == _FakeCfg.model_endpoints
+    )
+    # Active profile should be Default after migration.
+    assert store.get_active_name() == "Default"
+    print("✓ ProfileStore seeds Default from legacy ProxyConfig on first launch")
+
+
+def test_profile_store_migration_idempotent():
+    from src.profiles import ProfileStore
+
+    base = _tmp_dir()
+
+    class _FakeCfg:
+        model_endpoints = {"claude-opus-4-8": "https://api.anthropic.com"}
+
+    store = ProfileStore(
+        path=base / "profiles.json",
+        legacy_proxy_config_provider=lambda: _FakeCfg(),
+    )
+    first = store.load()
+    second = store.load()
+    # Same number, same active name — migration didn't double-seed.
+    assert len(first) == 1
+    assert len(second) == 1
+    assert first[0].name == second[0].name == "Default"
+    print("✓ ProfileStore migration is idempotent (no double-seed)")
+
+
+def test_profile_store_upsert_replaces_existing():
+    from src.profiles import ClaudeProfile, ProfileStore
+
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    store.upsert(_make_profile("Alpha"))
+    # Edit Alpha — same name, different env_vars.
+    edited = _make_profile("Alpha")
+    edited.env_vars = {"FOO": "updated"}
+    store.upsert(edited)
+    profiles = store.load()
+    assert len(profiles) == 1
+    assert profiles[0].env_vars == {"FOO": "updated"}
+    print("✓ ProfileStore.upsert replaces by name")
+
+
+def test_profile_store_delete_promotes_remaining_to_active():
+    from src.profiles import ProfileStore
+
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    store.upsert(_make_profile("First"))
+    store.upsert(_make_profile("Second"))
+    store.set_active("First")
+    assert store.get_active_name() == "First"
+    store.delete("First")
+    # Active should now be Second (the only one left).
+    assert store.get_active_name() == "Second"
+    print("✓ ProfileStore.delete promotes remaining profile to active")
+
+
+def test_profile_store_dedups_duplicate_slugs():
+    from src.profiles import ProfileStore
+
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    store.upsert(_make_profile("My Profile"))
+    store.upsert(_make_profile("My-Profile"))  # same slug after slugify
+    store.upsert(_make_profile("my profile"))  # same slug again
+    profiles = store.load()
+    slugs = [p.slug for p in profiles]
+    assert len(profiles) == 3
+    assert len(set(slugs)) == 3, f"slugs collided: {slugs}"
+    print("✓ ProfileStore dedups duplicate slugs (preserves name, suffixes slug)")
+
+
+def test_profile_store_chmod_600():
+    from src.profiles import ProfileStore
+
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    store.upsert(_make_profile())
+    mode = stat.S_IMODE((base / "profiles.json").stat().st_mode)
+    assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+    print("✓ ProfileStore enforces chmod 600 on profiles.json")
+
+
+# ---- config-dir writer ----------------------------------------------------
+
+
+def test_write_profile_config_writes_settings_json():
+    from src.profiles import ClaudeProfile, write_profile_config
+
+    base = _tmp_dir()
+    p = ClaudeProfile(
+        name="Demo",
+        slug="demo",
+        model_endpoints={
+            "claude-opus-4-8": "https://api.example.com",
+            "claude-sonnet-4-6": "https://api.example.com",
+        },
+        default_model="claude-opus-4-8",
+        claude_settings={"permissions": {"allow": ["Edit"]}},
+    )
+    config_dir = write_profile_config(p, base_dir=base)
+    settings_path = config_dir / "settings.json"
+    assert settings_path.is_file()
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert settings["model"] == "claude-opus-4-8"
+    assert sorted(settings["availableModels"]) == [
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+    ]
+    # Free-form keys preserved (and "model" from default_model overrode
+    # the same key in claude_settings — verify by removing it from the
+    # expected set).
+    assert settings["permissions"] == {"allow": ["Edit"]}
+    print("✓ write_profile_config emits settings.json with model + availableModels")
+
+
+def test_write_profile_config_writes_agent_markdown_with_frontmatter():
+    from src.profiles import ClaudeProfile, Subagent, write_profile_config
+
+    base = _tmp_dir()
+    p = ClaudeProfile(
+        name="Demo",
+        slug="demo",
+        model_endpoints={"claude-opus-4-8": "https://api.example.com"},
+        subagents=[
+            Subagent(
+                name="reviewer",
+                description="Reviews code carefully",
+                system_prompt="You review code carefully.",
+                tools=["Read", "Grep"],
+                model="claude-sonnet-4-6",
+            ),
+        ],
+    )
+    config_dir = write_profile_config(p, base_dir=base)
+    agent_file = config_dir / "agents" / "reviewer.md"
+    assert agent_file.is_file()
+    body = agent_file.read_text(encoding="utf-8")
+    # Frontmatter present and well-formed.
+    assert body.startswith("---\n")
+    assert "\n---\n" in body
+    frontmatter = body.split("\n---\n", 1)[0]
+    assert 'name: "reviewer"' in frontmatter
+    assert 'description: "Reviews code carefully"' in frontmatter
+    assert "tools: [Read, Grep]" in frontmatter
+    assert 'model: "claude-sonnet-4-6"' in frontmatter
+    assert body.endswith("You review code carefully.\n")
+    print("✓ write_profile_config renders agents/<name>.md with YAML frontmatter")
+
+
+def test_write_profile_config_prunes_stale_agents():
+    from src.profiles import ClaudeProfile, Subagent, write_profile_config
+
+    base = _tmp_dir()
+    # First write with two agents.
+    p = ClaudeProfile(
+        name="Demo",
+        slug="demo",
+        model_endpoints={},
+        subagents=[
+            Subagent(name="a", description="", system_prompt="A"),
+            Subagent(name="b", description="", system_prompt="B"),
+        ],
+    )
+    config_dir = write_profile_config(p, base_dir=base)
+    assert (config_dir / "agents" / "a.md").is_file()
+    assert (config_dir / "agents" / "b.md").is_file()
+    # Now remove "b" and re-write — the file should be gone.
+    p.subagents = [p.subagents[0]]
+    write_profile_config(p, base_dir=base)
+    assert (config_dir / "agents" / "a.md").is_file()
+    assert not (config_dir / "agents" / "b.md").exists()
+    print("✓ write_profile_config prunes stale agent files on re-write")
+
+
+# ---- env builder ----------------------------------------------------------
+
+
+def test_env_builder_includes_infra_vars():
+    from src.profiles import ClaudeProfile, build_claude_session_env
+
+    p = ClaudeProfile(
+        name="P",
+        slug="p",
+        model_endpoints={},
+        default_model="claude-opus-4-8",
+    )
+    env = build_claude_session_env(
+        profile=p,
+        proxy_base_url="http://127.0.0.1:3001",
+        config_dir="/tmp/cfg",
+        api_key="sk-real",
+    )
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:3001"
+    assert env["CLAUDE_CONFIG_DIR"] == "/tmp/cfg"
+    assert env["ANTHROPIC_API_KEY"] == "sk-real"
+    assert env["ANTHROPIC_MODEL"] == "claude-opus-4-8"
+    assert env["TERM"] == "xterm-256color"
+    print("✓ env_builder sets all infra vars from profile + proxy URL")
+
+
+def test_env_builder_session_overrides_profile_overrides_base():
+    from src.profiles import ClaudeProfile, build_claude_session_env
+
+    p = ClaudeProfile(
+        name="P",
+        slug="p",
+        model_endpoints={},
+        env_vars={"FOO": "profile", "BAR": "profile"},
+    )
+    env = build_claude_session_env(
+        profile=p,
+        proxy_base_url="http://127.0.0.1:3001",
+        config_dir="/tmp/cfg",
+        api_key="sk",
+        session_env={"FOO": "session", "BAZ": "session"},
+    )
+    assert env["FOO"] == "session", "session must override profile"
+    assert env["BAR"] == "profile", "profile must remain when session doesn't override"
+    assert env["BAZ"] == "session", "session-only vars must pass through"
+    print("✓ env_builder session > profile precedence holds")
+
+
+def test_env_builder_warns_when_clobbered_and_re_applies():
+    from src.profiles import ClaudeProfile, build_claude_session_env
+
+    p = ClaudeProfile(
+        name="P",
+        slug="p",
+        model_endpoints={},
+        env_vars={"ANTHROPIC_BASE_URL": "http://malicious.example"},
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        env = build_claude_session_env(
+            profile=p,
+            proxy_base_url="http://127.0.0.1:3001",
+            config_dir="/tmp/cfg",
+            api_key="sk",
+        )
+    # The infrastructure var must have been re-applied despite the
+    # profile's attempt to set it.
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:3001"
+    # And a UserWarning was emitted.
+    user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
+    assert any(
+        "ANTHROPIC_BASE_URL" in str(w.message) for w in user_warnings
+    ), f"expected UserWarning about BASE_URL, got {[str(w.message) for w in user_warnings]}"
+    print("✓ env_builder warns + re-applies infra vars when clobbered")
+
+
+def test_env_builder_starts_from_os_environ_copy():
+    """PATH and HOME must survive so the child can find its CLI / dotfiles."""
+    from src.profiles import ClaudeProfile, build_claude_session_env
+
+    p = ClaudeProfile(name="P", slug="p", model_endpoints={})
+    env = build_claude_session_env(
+        profile=p,
+        proxy_base_url="http://127.0.0.1:3001",
+        config_dir="/tmp/cfg",
+        api_key="sk",
+    )
+    # PATH is set in os.environ during pytest's normal startup — it
+    # should round-trip through the builder.
+    assert env.get("PATH") == os.environ.get("PATH")
+    print("✓ env_builder starts from os.environ.copy() (PATH survives)")
+
+
+def test_env_builder_sentinel_when_no_key():
+    from src.profiles import ClaudeProfile, SENTINEL_API_KEY, build_claude_session_env
+
+    p = ClaudeProfile(name="P", slug="p", model_endpoints={}, api_key_ref=None)
+    env = build_claude_session_env(
+        profile=p,
+        proxy_base_url="http://127.0.0.1:3001",
+        config_dir="/tmp/cfg",
+        api_key=None,
+    )
+    assert env["ANTHROPIC_API_KEY"] == SENTINEL_API_KEY
+    print("✓ env_builder uses labeled sentinel when no key configured")
+
+
+# ---- TerminalSessionView env/cwd seam ------------------------------------
+
+
+def test_terminal_session_view_forwards_env_to_pty():
+    """A session with ``env={...}`` must surface those vars to the child."""
+    if not hasattr(os, "fork"):
+        print("⚠ POSIX-only test skipped on non-POSIX")
+        return
+    _qapp()
+    from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+    view = TerminalSessionView(
+        argv=["/bin/sh", "-c", "echo $UNIQ_TEST_VAR"],
+        env={**os.environ, "UNIQ_TEST_VAR": "hello-from-env"},
+        parent=None,
+    )
+    view.start()
+    # Wait for the echo output to land in the pyte buffer.
+    deadline_ms = 1500
+    step_ms = 50
+    waited = 0
+    found = False
+    while waited < deadline_ms:
+        _spin(step_ms)
+        waited += step_ms
+        screen = view._screen
+        if screen is None:
+            continue
+        text = "".join(
+            screen.buffer[y][x].data
+            for y in range(screen.lines)
+            for x in range(screen.columns)
+        )
+        if "hello-from-env" in text:
+            found = True
+            break
+    view.shutdown()
+    assert found, "child did not see UNIQ_TEST_VAR env var"
+    print("✓ TerminalSessionView forwards env to PTY child")
+
+
+def test_terminal_session_view_forwards_cwd_to_pty():
+    """A session with ``cwd=...`` must chdir the child to that path."""
+    if not hasattr(os, "fork"):
+        print("⚠ POSIX-only test skipped on non-POSIX")
+        return
+    _qapp()
+    from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+    tmp = _tmp_dir()
+    view = TerminalSessionView(
+        argv=["/bin/sh", "-c", "pwd"],
+        env=os.environ.copy(),
+        cwd=str(tmp),
+        parent=None,
+    )
+    view.start()
+    deadline_ms = 1500
+    step_ms = 50
+    waited = 0
+    found = False
+    expected_tail = tmp.name  # basename of the tmpdir
+    while waited < deadline_ms:
+        _spin(step_ms)
+        waited += step_ms
+        screen = view._screen
+        if screen is None:
+            continue
+        text = "".join(
+            screen.buffer[y][x].data
+            for y in range(screen.lines)
+            for x in range(screen.columns)
+        )
+        if expected_tail in text:
+            found = True
+            break
+    view.shutdown()
+    assert found, f"child did not chdir to {tmp}"
+    print("✓ TerminalSessionView forwards cwd to PTY child")
+
+
+def test_terminal_session_view_title_for_claude_argv():
+    """Tab title is the basename of argv[0] — so ``["claude"]`` → ``"claude"``."""
+    _qapp()
+    from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+    view = TerminalSessionView(argv=["claude"], parent=None)
+    assert view.title() == "claude"
+    print("✓ TerminalSessionView title() returns basename of argv[0]")
+
+
+# ---- ClaudeContainerView --------------------------------------------------
+
+
+def _container_with_proxy_callbacks(
+    *, running: bool = False, base_url: str = ""
+):
+    """Build a ClaudeContainerView with stub proxy callbacks."""
+    from src.ui.claude.claude_container_view import ClaudeContainerView
+
+    cv = ClaudeContainerView()
+    cv._suppress_dialogs = True  # headless: skip modal QMessageBox
+    cv.set_proxy_callbacks(
+        is_proxy_running=lambda: running,
+        get_proxy_base_url=lambda: base_url,
+        request_proxy_start=lambda: None,
+    )
+    return cv
+
+
+def test_claude_container_blocks_when_no_claude_binary(monkeypatch=None):
+    _qapp()
+    cv = _container_with_proxy_callbacks(running=True)
+    # Force shutil.which("claude") to return None.
+    import src.ui.claude.claude_container_view as cvm
+
+    original = cvm.shutil.which
+    cvm.shutil.which = lambda name: None if name == "claude" else original(name)
+    try:
+        view = cv.new_session()
+        assert view is None
+    finally:
+        cvm.shutil.which = original
+    print("✓ ClaudeContainerView refuses to launch when 'claude' not on PATH")
+
+
+def test_claude_container_queues_when_proxy_not_running():
+    _qapp()
+    requested = []
+    cv = _container_with_proxy_callbacks(running=False)
+    cv.proxy_requested.connect(lambda: requested.append(True))
+    # No profile configured → should short-circuit before proxy start.
+    # Force a profile so we exercise the proxy-request path.
+    from src.profiles import ClaudeProfile
+
+    p = ClaudeProfile(name="X", slug="x", model_endpoints={})
+    view = cv.new_session(profile=p)
+    # Proxy not running → launch deferred → returns None and emits signal.
+    assert view is None
+    assert requested, "proxy_requested signal was not emitted"
+    print("✓ ClaudeContainerView defers launch + asks main window to start proxy")
+
+
+def test_claude_container_flush_pending_launches():
+    _qapp()
+    from src.profiles import ClaudeProfile
+
+    # Use a path with a known basename so we can detect it in the PTY output.
+    tmp = _tmp_dir()
+    p = ClaudeProfile(
+        name="X",
+        slug="x",
+        model_endpoints={},
+        session_cwd=str(tmp),
+    )
+    # Patch shutil.which to find our fake "claude" wrapper. We use
+    # /bin/sh -c "<check>" as the wrapper — the existing
+    # new_session() uses argv=["claude"] verbatim, so we need an
+    # actual executable named "claude" on PATH. Simplest: a shim
+    # in a temp dir on PATH.
+    import src.ui.claude.claude_container_view as cvm
+
+    shim_dir = _tmp_dir()
+    shim = shim_dir / "claude"
+    # The shim prints the cwd so we can verify env/cwd were wired.
+    shim.write_text(
+        "#!/bin/sh\n"
+        "echo \"claude-shim-cwd=$(pwd)\"\n"
+        "echo \"claude-shim-base=$ANTHROPIC_BASE_URL\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    os.environ["PATH"] = f"{shim_dir}:{os.environ.get('PATH', '')}"
+
+    cv = _container_with_proxy_callbacks(
+        running=False, base_url="http://127.0.0.1:3001"
+    )
+    cv.new_session(profile=p)  # queues
+    # Now flip the proxy to "running" and flush.
+    cv._is_proxy_running = lambda: True
+    view = cv.flush_pending_launch()
+    assert view is not None, "flush_pending_launch didn't return a view"
+    # Spin until the shim exits and the buffer captures our marker.
+    deadline_ms = 2000
+    step_ms = 50
+    waited = 0
+    found_cwd = False
+    found_base = False
+    while waited < deadline_ms and not (found_cwd and found_base):
+        _spin(step_ms)
+        waited += step_ms
+        screen = view._screen
+        if screen is None:
+            continue
+        text = "".join(
+            screen.buffer[y][x].data
+            for y in range(screen.lines)
+            for x in range(screen.columns)
+        )
+        if f"claude-shim-cwd={tmp}" in text:
+            found_cwd = True
+        if "claude-shim-base=http://127.0.0.1:3001" in text:
+            found_base = True
+    view.shutdown()
+    assert found_cwd, f"session did not chdir to {tmp}"
+    assert found_base, "session did not see ANTHROPIC_BASE_URL"
+    # Cleanup: pop PATH back.
+    os.environ["PATH"] = os.environ["PATH"].replace(f"{shim_dir}:", "", 1)
+    print("✓ ClaudeContainerView.flush_pending_launch wires env + cwd correctly")
+
+
+# ---- Runner --------------------------------------------------------------
+
+
+def main():
+    tests = [
+        test_slugify_basic,
+        test_slugify_collapses_punctuation,
+        test_slugify_empty_falls_back,
+        test_credential_store_roundtrip,
+        test_credential_store_chmod_600,
+        test_credential_store_corrupt_file_treated_as_empty,
+        test_profile_store_roundtrip,
+        test_profile_store_migration_seeds_default_from_legacy_config,
+        test_profile_store_migration_idempotent,
+        test_profile_store_upsert_replaces_existing,
+        test_profile_store_delete_promotes_remaining_to_active,
+        test_profile_store_dedups_duplicate_slugs,
+        test_profile_store_chmod_600,
+        test_write_profile_config_writes_settings_json,
+        test_write_profile_config_writes_agent_markdown_with_frontmatter,
+        test_write_profile_config_prunes_stale_agents,
+        test_env_builder_includes_infra_vars,
+        test_env_builder_session_overrides_profile_overrides_base,
+        test_env_builder_warns_when_clobbered_and_re_applies,
+        test_env_builder_starts_from_os_environ_copy,
+        test_env_builder_sentinel_when_no_key,
+        test_terminal_session_view_forwards_env_to_pty,
+        test_terminal_session_view_forwards_cwd_to_pty,
+        test_terminal_session_view_title_for_claude_argv,
+        test_claude_container_blocks_when_no_claude_binary,
+        test_claude_container_queues_when_proxy_not_running,
+        test_claude_container_flush_pending_launches,
+    ]
+    failed = 0
+    for t in tests:
+        try:
+            t()
+        except Exception as e:  # noqa: BLE001
+            print(f"✗ {t.__name__}: {type(e).__name__}: {e}")
+            import traceback
+
+            traceback.print_exc()
+            failed += 1
+    if failed:
+        print(f"\n❌ {failed} test(s) failed")
+        sys.exit(1)
+    print(f"\n✅ All {len(tests)} Claude tests passed!")
+
+
+if __name__ == "__main__":
+    main()

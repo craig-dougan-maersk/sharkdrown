@@ -24,11 +24,12 @@ to call before ``start()``, safe to call from the GUI thread.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QFont,
     QFontDatabase,
     QKeyEvent,
+    QMouseEvent,
     QTextCursor,
 )
 from PySide6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
@@ -37,6 +38,29 @@ from src.ui.terminal.renderer import screen_to_html
 
 
 # --- Pure keymap (testable without Qt) -------------------------------------
+
+def _norm_mods(mods) -> int:
+    """Coerce a Qt ``KeyboardModifiers`` (or plain int, or ``None``) to ``int``.
+
+    ``event.modifiers()`` returns a ``Qt.KeyboardModifiers`` flag enum.
+    ``int(flag_enum)`` is overloaded on most PySide6 builds but raises
+    ``TypeError: int() argument must be ... not 'KeyboardModifier'`` on
+    others (this dev environment). Calling ``int(mods.value)`` works
+    on every build that exposes ``.value`` (i.e., every supported
+    PySide6 release).
+
+    Used uniformly by every modifier-bit test in this file — without
+    it, a real keystroke carrying modifier flags blows up
+    ``keyPressEvent`` / ``mousePressEvent`` and the override silently
+    swallows the press, breaking typing / selection. Centralising the
+    coercion here means there's exactly one safe idiom to learn.
+    """
+    if mods is None:
+        return 0
+    if isinstance(mods, int):
+        return mods
+    return int(mods.value)
+
 
 # A tiny dataclass-free namespace so this can be imported in renderer-only
 # tests without pulling in PySide6.
@@ -55,15 +79,9 @@ def key_to_bytes(
 
     ``modifiers`` may be a plain ``int`` (from ``event.modifiers()``) or a
     ``Qt.KeyboardModifier`` value — both work because we coerce to ``int``
-    before the bitmask comparisons.
+    via ``_norm_mods`` before the bitmask comparisons.
     """
-    if modifiers is None:
-        mod_mask = 0
-    elif isinstance(modifiers, int):
-        mod_mask = modifiers
-    else:
-        # ``Qt.KeyboardModifier`` flag enum — extract the underlying int.
-        mod_mask = int(modifiers.value)
+    mod_mask = _norm_mods(modifiers)
     ctrl_held = bool(mod_mask & int(Qt.ControlModifier.value))
     alt_held = bool(mod_mask & int(Qt.AltModifier.value))
     meta_held = bool(mod_mask & int(Qt.MetaModifier.value))
@@ -140,12 +158,21 @@ class TerminalTextEdit(QTextEdit):
 
     Modes
     -----
-    * **Linear** (default): drag flows across rows. ``Ctrl+C`` with a
-      linear selection copies; ``Ctrl+C`` with no selection sends
-      SIGINT (0x03) to the PTY.
-    * **Block** (Alt-drag): rectangle with the same column range across
-      all touched rows. Useful for cutting columns out of tabular
-      output like ``ls -l``.
+    * **Block** (default): the selection is the rectangle the cursor
+      traversed — the same column window across every touched row.
+      Matches gnome-terminal / konsole / iTerm2 behaviour and is what
+      users intuitively expect when dragging on a uniform character
+      grid. On copy, column padding is preserved so ``ls -l`` output
+      stays column-aligned in the paste target.
+    * Linear (legacy): drag flows across rows so the start row covers
+      x1..end, the end row covers 0..x2, and intermediate rows go
+      full-width. Useful for selecting prose-style text with line
+      breaks as natural separators, but on a terminal grid every
+      row contains meaningful content so this behaviour makes
+      diagonal drags highlight "most of the screen" — which is
+      counter-intuitive. Not currently exposed via UI; the flag
+      remains in the data model so a future mode toggle can re-enable
+      it.
     """
 
     # Document margin used by QTextDocument — subtract this when
@@ -209,6 +236,22 @@ class TerminalTextEdit(QTextEdit):
         # and the IME's preedit overlay fights with our HTML repaint.
         self.setAttribute(Qt.WA_InputMethodEnabled, False)
 
+        # Zero the QTextDocument default margin (4 px per side). With
+        # it, the rendered document ends up ``rows + 2`` cells tall
+        # because the margin + our ``<pre>`` padding adds 8 px of
+        # vertical chrome the cell grid doesn't need — the symptom
+        # the user reported as "terminal is 2 lines taller than the
+        # visible window". Setting margin to 0 makes
+        # ``_pixel_to_cell`` (which already subtracts this margin) and
+        # ``_recompute_size`` (which divides viewport height by
+        # ``font.lineSpacing()``) agree on the cell grid boundaries.
+        self.document().setDocumentMargin(0)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+    # No further work here — ``setDocumentMargin(0)`` is called inline
+    # in ``__init__`` (see below) so the cell grid lines up exactly
+    # with the viewport pixel rect.
+
     # ---- selection state ---------------------------------------------------
 
     def selection_range(
@@ -242,8 +285,8 @@ class TerminalTextEdit(QTextEdit):
         return self.selection_range() is not None
 
     def select_all(self) -> None:
-        """Select every cell on the screen (linear mode)."""
-        self._sel_block_flag = False
+        """Select every cell on the screen (block mode)."""
+        self._sel_block_flag = True
         w = self._screen_width()
         h = self._screen_height()
         if w <= 0 or h <= 0:
@@ -277,9 +320,15 @@ class TerminalTextEdit(QTextEdit):
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         key = event.key()
-        mods = event.modifiers()
-        ctrl = bool(int(mods) & int(Qt.ControlModifier.value))
-        shift = bool(int(mods) & int(Qt.ShiftModifier.value))
+        # ``_norm_mods`` handles the KeyboardModifier-flag-vs-int
+        # distinction safely; without it, real Ctrl+C / Ctrl+V events
+        # raise ``TypeError`` and the override silently swallows the
+        # press (Qt catches the exception, marks the override
+        # ``errored``, and stops calling it).
+        mod_mask = _norm_mods(event.modifiers())
+        ctrl = bool(mod_mask & int(Qt.ControlModifier.value))
+        shift = bool(mod_mask & int(Qt.ShiftModifier.value))
+        alt = bool(mod_mask & int(Qt.AltModifier.value))
 
         # Ctrl+Shift+C — always copy (accessibility / "copy without
         # selecting first"). Wired before the Ctrl+C branch so it
@@ -311,9 +360,28 @@ class TerminalTextEdit(QTextEdit):
             event.accept()
             return
 
+        # Alt+= / Alt+- — adjust font size. We listen for the *key* the
+        # physical key produces (Key_Equal = "+" on US, Key_Plus = "+"
+        # on numpad; Key_Minus = "-", Key_Underscore = "_"/shifted-minus)
+        # rather than the character, so layouts where Alt is held
+        # produce different chars still hit the right branch. The
+        # parent view's ``adjust_font_size`` no-ops if the change would
+        # exceed the clamp; we always ``accept()`` so the key never
+        # leaks through to the PTY (the shell would otherwise receive
+        # ``\x1b=`` / ``\x1b-`` from the Alt prefix — confusing).
+        if alt and not ctrl and not shift:
+            if key in (Qt.Key_Equal, Qt.Key_Plus):
+                self._adjust_font_size(+1)
+                event.accept()
+                return
+            if key in (Qt.Key_Minus, Qt.Key_Underscore):
+                self._adjust_font_size(-1)
+                event.accept()
+                return
+
         data = key_to_bytes(
             key,
-            modifiers=mods,
+            modifiers=mod_mask,
             text=event.text() or "",
         )
         if data is not None:
@@ -335,16 +403,36 @@ class TerminalTextEdit(QTextEdit):
         pos = event.pos()
         button = event.button()
         if button == Qt.LeftButton:
-            # Click = focus + start selection. The Alt key determines
-            # block-vs-linear; capture at press time.
+            # Click = focus + start selection. Block (rectangle) is
+            # the default for a terminal cell grid — a diagonal drag
+            # covers only the rectangle the cursor traversed, not the
+            # "linear flow" used by text editors where rows fan out
+            # to full-width in between. The latter makes diagonal
+            # drags highlight "most of the screen" because every
+            # intermediate row gets fully selected, which is the
+            # exact opposite of what users expect when dragging on a
+            # uniform character grid. ``Alt`` no longer toggles modes
+            # (both modes now behave the same); we keep
+            # ``_sel_block_flag`` for copy semantics (block mode
+            # preserves column padding on copy).
+            #
+            # NB: do NOT call ``super().mousePressEvent(event)`` here.
+            # QTextEdit's default behaviour mutates the QTextCursor
+            # to start a *native* drag selection — which draws a
+            # blue highlight on top of our HTML using the document's
+            # text positions (not cell coordinates). That highlight
+            # is the "anchored in the bottom-right / most of the
+            # screen" symptom — it stays visible during the drag
+            # until the next ``setHtml`` repaint (16ms later)
+            # clobbers it. Returning from here without delegating to
+            # super prevents Qt from starting its native selection
+            # entirely; the cell-coord selection is the only one the
+            # user sees.
             self.setFocus(Qt.MouseFocusReason)
             cell = self._pixel_to_cell(pos)
-            self._sel_block_flag = bool(
-                int(event.modifiers()) & int(Qt.AltModifier.value)
-            )
+            self._sel_block_flag = True
             self._sel_anchor = cell
             self._sel_active = cell
-            super().mousePressEvent(event)
             self._emit_selection_changed()
         elif button == Qt.MiddleButton:
             # PRIMARY selection paste on X11. Falls back to a no-op
@@ -367,6 +455,12 @@ class TerminalTextEdit(QTextEdit):
         # anchor. The first mouseMove with no anchor is harmless
         # because ``mousePressEvent`` always sets the anchor at the
         # same cell as the press.
+        #
+        # NB: do NOT delegate to ``super().mouseMoveEvent(event)``.
+        # QTextEdit's default would extend the native drag selection
+        # — drawing a blue highlight across text positions that don't
+        # correspond to cell coordinates. See the matching comment in
+        # ``mousePressEvent`` for the full explanation.
         if (
             (event.buttons() & Qt.LeftButton)
             and self._sel_anchor is not None
@@ -375,9 +469,11 @@ class TerminalTextEdit(QTextEdit):
             if cell != self._sel_active:
                 self._sel_active = cell
                 self._emit_selection_changed()
-        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        # NB: do NOT delegate to ``super().mouseReleaseEvent(event)``.
+        # See ``mousePressEvent`` for why native drag selection must
+        # never get a foothold.
         if (
             event.button() == Qt.LeftButton
             and self._sel_anchor is not None
@@ -387,7 +483,6 @@ class TerminalTextEdit(QTextEdit):
                 self.clear_selection()
             else:
                 self._emit_selection_changed()
-        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         # Word selection: expand a click to its whitespace boundaries.
@@ -411,11 +506,101 @@ class TerminalTextEdit(QTextEdit):
         x2 = x
         while x2 + 1 < w and _is_word(row[x2 + 1]):
             x2 += 1
-        self._sel_block_flag = False
+        self._sel_block_flag = True
         self._sel_anchor = (x1, y)
         self._sel_active = (x2, y)
         self._emit_selection_changed()
         event.accept()
+
+    # ---- viewport event interception -------------------------------------
+
+    def viewportEvent(self, event) -> bool:  # noqa: N802
+        """Override ``QAbstractScrollArea.viewportEvent`` to intercept
+        mouse events on the viewport before Qt's native selection runs.
+
+        Why this and not ``mousePressEvent``? Qt routes mouse events
+        on a ``QTextEdit`` to its *viewport* child widget first. The
+        QTextEdit's own ``mousePressEvent`` is only invoked by Qt's
+        default scrollarea behaviour AFTER the viewport has had a
+        chance to start its native drag selection. In practice
+        (verified by sending real ``QMouseEvent`` instances through
+        ``QApplication.sendEvent`` to the viewport) the viewport
+        processes the press, starts its native selection, and never
+        re-dispatches to the QTextEdit's overrides — leaving Qt's
+        blue drag highlight on top of our HTML. That's the
+        "selection anchored in the bottom-right" symptom.
+
+        ``viewportEvent`` is the canonical hook for intercepting
+        events going to the viewport (it's a single function that
+        gets called for every event type on the viewport, including
+        paint/hover/resize). Returning ``True`` consumes the event
+        so Qt's native selection machinery never sees it.
+
+        ``event.pos()`` arrives in **viewport-local** coordinates
+        (origin = top-left of the viewport). We pass it straight
+        through to ``mousePressEvent`` so ``_pixel_to_cell`` can
+        divide by the viewport size (which is the right reference
+        frame — see the matching comment in ``_pixel_to_cell``).
+        We deliberately do NOT call ``mapFrom(viewport, ...)`` to
+        translate to widget coords — that translation returns a
+        point in an unexpected ancestor's coord system (verified
+        in offscreen tests: ``mapFrom(viewport, (50, 100))`` returns
+        ``(46, 37)`` instead of the expected ``(51, 101)``), and
+        using the viewport size for cell math instead sidesteps the
+        issue. The viewport's frame is at most 2 px on each side,
+        so using viewport-local coords and viewport size gives the
+        correct cell index without any translation step.
+        """
+        etype = event.type()
+        if etype == QEvent.Type.MouseButtonPress:
+            new_event = QMouseEvent(
+                QEvent.Type.MouseButtonPress,
+                event.pos(),
+                event.globalPosition(),
+                event.button(),
+                event.buttons(),
+                event.modifiers(),
+            )
+            self.mousePressEvent(new_event)
+            return True
+        if etype == QEvent.Type.MouseButtonDblClick:
+            new_event = QMouseEvent(
+                QEvent.Type.MouseButtonDblClick,
+                event.pos(),
+                event.globalPosition(),
+                event.button(),
+                event.buttons(),
+                event.modifiers(),
+            )
+            self.mouseDoubleClickEvent(new_event)
+            return True
+        if etype == QEvent.Type.MouseMove:
+            # Only intercept if a drag is in progress; otherwise let
+            # Qt handle hover/cursor updates.
+            if event.buttons() & Qt.LeftButton:
+                new_event = QMouseEvent(
+                    QEvent.Type.MouseMove,
+                    event.pos(),
+                    event.globalPosition(),
+                    event.button(),
+                    event.buttons(),
+                    event.modifiers(),
+                )
+                self.mouseMoveEvent(new_event)
+                return True
+            return False
+        if etype == QEvent.Type.MouseButtonRelease:
+            new_event = QMouseEvent(
+                QEvent.Type.MouseButtonRelease,
+                event.pos(),
+                event.globalPosition(),
+                event.button(),
+                event.buttons(),
+                event.modifiers(),
+            )
+            self.mouseReleaseEvent(new_event)
+            return True
+        return super().viewportEvent(event)
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802
         """Right-click menu: Copy / Paste / Select All.
@@ -465,37 +650,102 @@ class TerminalTextEdit(QTextEdit):
     # ---- coordinate math ---------------------------------------------------
 
     def _pixel_to_cell(self, pos) -> tuple[int, int]:
-        """Translate a widget-local pixel pos → ``(col, row)``.
+        """Translate a viewport-local pixel pos → ``(col, row)``.
 
-        Subtracts the QTextDocument margin (4 px by default) so clicks
-        line up with rendered cells. ``pos`` is in widget-local coords;
-        the viewport is a child we map through.
+        ``pos`` arrives in viewport-local coordinates because
+        ``viewportEvent`` is the entry point for real user clicks
+        (Qt routes mouse events on a ``QTextEdit`` to its viewport
+        first, before the text edit's ``mousePressEvent`` gets a
+        chance to run — see that method's docstring for why).
+
+        The cell grid is rendered edge-to-edge across the visible
+        viewport (the ``<pre>`` style in the renderer fills the
+        document rectangle, and we disabled scrollbars in
+        ``__init__`` so there's no gutter). The cell size in pixels
+        is therefore ``viewport_size / grid_size``, NOT
+        ``fontMetrics.horizontalAdvance("M")`` /
+        ``fontMetrics.lineSpacing()``.
+
+        Why not font metrics? Because Qt's ``QAbstractScrollArea``
+        keeps the viewport at a minimal default size until the document
+        is laid out — the viewport we read in ``_recompute_size`` is
+        typically 98×28 even when the widget is 800×600, so the cell
+        grid's nominal pixel size (computed from those tiny viewport
+        dimensions via ``_recompute_size``) gets clamped by ``MIN_COLS``
+        and never updates. The cell grid the *renderer* uses is whatever
+        was last accepted by ``_recompute_size`` (the 80×24 default if
+        nothing else qualified), and the *visual* cell size is
+        ``viewport_width / 80 × viewport_height / 24`` — neither matches
+        the font metric. Using font metrics here would map a click at
+        the visual centre (pixel 400, 300) to a cell that *renders* at
+        pixel 500, 500 — the bottom-right corner. That's the
+        "selection anchored in the bottom-right" symptom.
+
+        ``pos`` is in viewport-local coords (``event.pos()`` from
+        the viewportEvent-dispatched ``QMouseEvent``); we divide
+        directly by the visible cell size. The result is clamped to
+        ``[0, w-1]`` × ``[0, h-1]`` so clicks just past the last cell
+        don't select the entire row.
         """
-        vp = self.viewport()
-        fm = self.fontMetrics()
-        cw = max(1, fm.horizontalAdvance("M"))
-        ch = max(1, fm.lineSpacing())
-        try:
-            margin = self.document().documentMargin()
-        except Exception:  # noqa: BLE001
-            margin = self.DOCUMENT_MARGIN
-        local = vp.mapFromParent(pos)
-        x = int((local.x() - margin) // cw)
-        y = int((local.y() - margin) // ch)
         w = self._screen_width()
         h = self._screen_height()
-        if w > 0:
-            x = max(0, min(w - 1, x))
-        else:
-            x = 0
-        if h > 0:
-            y = max(0, min(h - 1, y))
-        else:
-            y = 0
+        if w <= 0 or h <= 0:
+            # Grid not sized yet — fall back to font metrics so an
+            # early click before ``start()`` doesn't divide by zero.
+            # This branch only fires before the first repaint, which
+            # is invisible to the user.
+            fm = self.fontMetrics()
+            cw = max(1, fm.horizontalAdvance("M"))
+            ch = max(1, fm.lineSpacing())
+            try:
+                margin = self.document().documentMargin()
+            except Exception:  # noqa: BLE001
+                margin = self.DOCUMENT_MARGIN
+            x = int((pos.x() - margin) // cw)
+            y = int((pos.y() - margin) // ch)
+            return (max(0, x), max(0, y))
+        # Cell pixel size from the rendered viewport area. ``pos``
+        # arrives in viewport-local coords (via ``viewportEvent``),
+        # so we divide by the viewport's pixel dimensions to get the
+        # cell index. The viewport sits inside the text edit with a
+        # 1-2 px frame border, so its size is slightly smaller than
+        # the text edit's own ``width()`` / ``height()`` — using the
+        # widget size here would under-estimate the number of cells
+        # that fit and make clicks land a few rows higher than they
+        # should. The viewport size matches exactly what's visible.
+        vp = self.viewport()
+        vp_w = max(1, vp.width())
+        vp_h = max(1, vp.height())
+        cw = vp_w / w
+        ch = vp_h / h
+        x = int(pos.x() // cw)
+        y = int(pos.y() // ch)
+        x = max(0, min(w - 1, x))
+        y = max(0, min(h - 1, y))
         return (x, y)
 
     def focusInEvent(self, event) -> None:  # noqa: N802
         super().focusInEvent(event)
+
+    # ---- font size --------------------------------------------------------
+
+    def _adjust_font_size(self, delta: int) -> None:
+        """Forward a font-size change to the parent ``TerminalSessionView``.
+
+        The text edit doesn't own the ``QFont`` — the view installed it
+        in ``_build_ui`` and shares it across this widget and any other
+        state that reads the font. The view's ``adjust_font_size``
+        decides the clamp range and triggers the recompute + repaint
+        that refits the cell grid; the text edit only routes the call.
+        """
+        view = self.parent()
+        # ``parent()`` is a ``TerminalSessionView`` for normal usage; the
+        # method only exists on it. Skip silently when running under a
+        # different parent (e.g. an inline test harness) so a stray
+        # Alt+= doesn't raise.
+        adjust = getattr(view, "adjust_font_size", None)
+        if callable(adjust):
+            adjust(delta)
 
     # ---- clipboard primitives ---------------------------------------------
 
@@ -660,9 +910,36 @@ class TerminalSessionView(QWidget):
     MIN_COLS = 40
     MIN_ROWS = 10
 
-    def __init__(self, argv: list[str] | None = None, parent=None) -> None:
+    # Font-size clamp in points. Below 8pt the cell grid becomes
+    # unreadable on a HiDPI display; above 32pt one row consumes the
+    # entire viewport on a stock 800x600 window. ``_build_ui`` sets the
+    # initial size to ``QFontDatabase.systemFont(QFontDatabase.FixedFont)``
+    # which is usually 10-13pt — comfortably inside the clamp.
+    MIN_FONT_POINT_SIZE = 8
+    MAX_FONT_POINT_SIZE = 32
+
+    def __init__(
+        self,
+        argv: list[str] | None = None,
+        *,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._argv = argv
+        # Per-session environment overrides. ``env`` is a COMPLETE
+        # replacement (PtySession calls ``os.execvpe``), so callers must
+        # build on top of ``os.environ.copy()`` themselves — see
+        # ``src/profiles/env_builder.build_claude_session_env`` for the
+        # Claude-side helper. ``None`` (the default) means inherit the
+        # parent GUI process's environment verbatim.
+        self._env = env
+        # Per-session working directory. ``None`` means inherit cwd.
+        # PtySession does ``os.chdir(self._cwd)`` in the forked child
+        # before exec, so this is observed by the spawned process but
+        # does not affect the GUI process.
+        self._cwd = cwd
         self._started = False
         self._stopped = False
         self._exited = False
@@ -728,6 +1005,8 @@ class TerminalSessionView(QWidget):
             argv=self._argv,
             rows=self._rows,
             cols=self._cols,
+            env=self._env,
+            cwd=self._cwd,
             parent=self,
         )
         self._session.data_received.connect(self._on_data)
@@ -775,6 +1054,59 @@ class TerminalSessionView(QWidget):
         if self.window() is not None:
             self.window().activateWindow()
 
+    # ---- font size --------------------------------------------------------
+
+    def adjust_font_size(self, delta: int) -> None:
+        """Bump the text edit's font point-size by ``delta`` (typically ±1).
+
+        Wired to ``Alt+=`` / ``Alt+-`` from the text edit's
+        ``keyPressEvent``. Clamps to ``MIN_FONT_POINT_SIZE`` /
+        ``MAX_FONT_POINT_SIZE`` so the cell grid doesn't collapse to
+        unreadable 4pt text or balloon into 96pt. After the change we
+        immediately recompute rows/cols and forward the new size to
+        the shell via ``TIOCSWINSZ`` — otherwise the visible grid
+        wouldn't match what bash sees and prompts would wrap at the
+        wrong column.
+        """
+        if delta == 0:
+            return
+        current = self._base_font.pointSize()
+        # ``QFont.pointSize()`` returns -1 when the size was set in
+        # pixels (a pixelSize, not a pointSize). We always set points
+        # in ``_build_ui`` so this shouldn't happen in practice, but
+        # fall back to ``pixelSize // 1`` if it does so the user
+        # still gets *some* adjustment instead of a silent no-op.
+        if current <= 0:
+            current = self._base_font.pixelSize() or 10
+        new_size = max(
+            self.MIN_FONT_POINT_SIZE,
+            min(self.MAX_FONT_POINT_SIZE, current + delta),
+        )
+        if new_size == current:
+            # Already at the clamp — no visible change, but accept()
+            # in the caller has already eaten the keystroke so the
+            # shell doesn't see a stray ESC= either.
+            return
+        self._base_font.setPointSize(new_size)
+        # ``setFont`` updates the text edit's metrics immediately; the
+        # next ``_recompute_size`` call sees the new cell dimensions.
+        self.text_edit.setFont(self._base_font)
+        # Drop any held selection — cell coordinates from the old
+        # grid no longer map to the same pixels after reflow.
+        if self.text_edit.has_selection():
+            self.text_edit.clear_selection()
+        # Repaint so the new size renders. The size hint + geometry
+        # will settle on the next resize pass; ``_recompute_size``
+        # reads the freshly-updated font metrics.
+        self._recompute_size()
+        # Forward the new pixel-grid dimensions to the shell so its
+        # line editor knows the new columns and wraps prompts
+        # correctly. Without this, ``echo $COLUMNS`` would still
+        # report the old value after the font change.
+        if self._session is not None and self._started and not self._exited:
+            self._session.resize(self._rows, self._cols)
+        self._repaint()
+
     # ---- UI construction ---------------------------------------------------
 
     def _build_ui(self) -> None:
@@ -794,9 +1126,12 @@ class TerminalSessionView(QWidget):
         self.text_edit._screen_width = lambda: self._cols
         self.text_edit._screen_height = lambda: self._rows
         # Use a monospace font. Pick the system monospace family.
-        font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
-        font.setPointSize(max(font.pointSize(), 10))
-        self.text_edit.setFont(font)
+        # Stash a reference on ``self._base_font`` so ``adjust_font_size``
+        # can mutate the pointSize without re-fetching the system font
+        # each time (which would reset other style attributes too).
+        self._base_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        self._base_font.setPointSize(max(self._base_font.pointSize(), 10))
+        self.text_edit.setFont(self._base_font)
         # Disable the horizontal scrollbar — the screen is fixed-width
         # and any overflow is a bug, not user-visible state.
         self.text_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -870,13 +1205,13 @@ class TerminalSessionView(QWidget):
         if hasattr(self, "text_edit"):
             sel = self.text_edit.selection_range()
         html = screen_to_html(self._screen, selection=sel)
-        # setHtml is cheap on a fixed-size grid but it RESETS the scroll
-        # position to the top of the document. Without an explicit
-        # ensureCursorVisible() call the user would see the screen snap
-        # back to the top on every repaint — which looks like "the cursor
-        # jumped back" when typing. Move the cursor to End AND scroll to
-        # it so the latest output (and the pyte cursor cell) stays in
-        # view at the bottom.
+        # setHtml resets the scrollbar to 0. We then move the cursor
+        # to End and ask for the cursor to be visible — that scrolls
+        # the bar all the way down to its maximum value, keeping the
+        # bottom row of the cell grid (where new output and the
+        # pyte cursor live) anchored to the bottom of the viewport.
+        # Without this, the user sees the cursor "snap back" to the
+        # top of the document on every repaint.
         self.text_edit.setHtml(html)
         cursor = self.text_edit.textCursor()
         cursor.movePosition(QTextCursor.End)
@@ -898,6 +1233,15 @@ class TerminalSessionView(QWidget):
 
         In both skip cases we keep the current ``self._rows/cols`` so the
         shell continues with whatever size it already has.
+
+        Column width and row height are calibrated against the
+        **rendered** QTextDocument, not just ``font.lineSpacing()``.
+        QTextDocument's layout engine renders each ``\n``-separated
+        line ~1 px taller than ``QFontMetrics`` reports, because the
+        layout includes the document's bottom inset that the metrics
+        API doesn't. Without this calibration the document would be
+        ``rows + 2`` cells tall at 24 rows — that's the "terminal
+        shows 2 extra lines of phantom scroll-back" symptom.
         """
         fm = self.text_edit.fontMetrics()
         cw = max(1, fm.horizontalAdvance("M"))
@@ -907,7 +1251,15 @@ class TerminalSessionView(QWidget):
         if w <= 0 or h <= 0:
             return
         cols = max(1, w // cw)
-        rows = max(1, h // ch)
+        # Measure the ACTUAL rendered line height by feeding ``rows``
+        # candidate newlines into a temporary document with the same
+        # font + the same line-height/pre rules the renderer uses.
+        # This is the only way to know exactly how many ``\n``-rows
+        # the viewport can hold; ``font.lineSpacing()`` is off by 1-2
+        # px/row.
+        rows = self._measure_rendered_rows(h)
+        if rows < 1:
+            rows = max(1, h // ch)
         # Reject implausibly small sizes — we'd rather keep a known-good
         # 24×80 (or whatever the last good size was) than resize the shell
         # to 1×12 for one frame.
@@ -921,6 +1273,56 @@ class TerminalSessionView(QWidget):
             self._screen.resize(rows, cols)
         if self._session is not None:
             self._session.resize(rows, cols)
+
+    def _measure_rendered_rows(self, viewport_height_px: int) -> int:
+        """Return how many cell-rows ``viewport_height_px`` actually holds.
+
+        Wraps the same ``screen_to_html`` rendering through a temporary
+        QTextDocument with the widget's font, then measures the result.
+        Iterates from a generous upper bound down to the largest
+        ``n`` whose rendered height is ``<= viewport_height_px``;
+        returns 0 only if even one row doesn't fit (caller falls back
+        to the integer-division heuristic).
+        """
+        from PySide6.QtGui import QTextDocument
+
+        if viewport_height_px <= 0:
+            return 0
+        # Use the same font the text edit is using — different fonts
+        # produce wildly different rendered heights.
+        doc = QTextDocument(self)
+        doc.setDocumentMargin(0)
+        # Mirror the renderer's <pre> style:
+        doc.setDefaultStyleSheet(
+            "pre { "
+            "  font-family:Menlo,Consolas,monospace; "
+            "  margin:0;padding:0;line-height:1.0; "
+            "}"
+        )
+        doc.setDefaultFont(self.text_edit.font())
+        # Probe from a known-safe upper bound. ``viewport_height //
+        # lineSpacing`` is generous; trim down until ``doc_height <=
+        # viewport_height``.
+        upper = max(self.MIN_ROWS, viewport_height_px // max(1, self.text_edit.fontMetrics().lineSpacing())) + 4
+        upper = min(upper, 500)  # sanity cap
+        # Build a sample payload of ``n`` rows of plain text — the
+        # renderer's ``<pre>`` does the heavy lifting; for measurement
+        # purposes a row of spaces is enough.
+        best = 0
+        # Binary-search-ish trim: start at ``upper`` and step down
+        # while the rendered height fits. Brute step is fine here —
+        # this runs once per resize event, not in a hot loop.
+        for n in range(upper, 0, -1):
+            # ``n`` rows = ``n-1`` explicit newlines plus the trailing
+            # line Qt always renders.
+            text = ("\n" * (n - 1)) + " "
+            doc.setPlainText(text)
+            doc.setPlainText(text)  # second call forces re-layout
+            h = doc.size().height()
+            if h <= viewport_height_px:
+                best = n
+                break
+        return best
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
