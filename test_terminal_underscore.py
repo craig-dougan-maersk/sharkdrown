@@ -1,24 +1,31 @@
-"""Tests for the renderer's handling of SGR 4 ("underline") on cells whose
-glyphs already have a visible stroke.
+"""Tests that the renderer does NOT emit ``text-decoration:underline``.
 
-Reproduces the user-visible bug: Claude Code v2.x draws its welcome UI
-rule lines as actual Unicode box-drawing characters (U+2500 ``─`` etc.)
-and ALSO marks them with SGR-4 (underline). In a real xterm the SGR-4
-attribute is a no-op on those characters — the glyph already extends
-below the baseline, so there's nothing to underline beneath it. The HTML
-renderer was unconditionally adding ``text-decoration:underline`` for
-every underscored cell, which drew a *second* line under each ``─``,
-making the row look like a fat/doubled-up rule.
+The user's experience: Claude Code v2.x leaves the SGR-4 (underline)
+attribute on after drawing its welcome UI, so every cell the user types
+or the assistant writes inherits ``underscore=True`` on the pyte side.
+A real xterm would render those as underlined; in QTextDocument the
+CSS underline is *much* heavier visually, and the entire screen ends
+up looking underlined. The user asked for that to stop.
 
-These tests pin both halves of the fix:
+The renderer intentionally drops SGR-4 on the emit side. The
+underscore attribute still flows through the grouping key (so the
+run-grouping logic is consistent), but the ``<span>`` style never
+includes ``text-decoration:underline``. This is a feature trade-off:
+we lose the ability to render legitimate terminal-emulator underlines
+(e.g. underlined links in ``man`` pages) for a clean visual result;
+a future toggle could re-enable it if needed.
 
-1. ``_glyph_is_self_underlining`` correctly identifies Box Drawing,
-   Block Elements, and CJK Presentation Form horizontal-line code points.
-2. ``_style_attrs`` skips ``text-decoration:underline`` for cells whose
-   glyph is one of those characters, even when the underscore attribute
-   is on.
-3. ``screen_to_html`` produces HTML without ``text-decoration:underline``
-   for a full-row ``─`` separator (which was the user-visible symptom).
+What this test file pins:
+
+1. The HTML never contains ``text-decoration:underline`` regardless of
+   the cell's underlying SGR-4 state.
+2. Cells whose only attribute is ``underscore=True`` (no fg/bg/bold/…)
+   render as plain text — exactly like any other default-styled cell.
+3. Cells with a non-default fg/bg still render with that styling
+   (i.e. we don't blow away the rest of the styling along with the
+   underline).
+4. Real terminal content (boxes, real text, mixed runs) renders cleanly
+   with no phantom underlines introduced.
 """
 
 from __future__ import annotations
@@ -31,180 +38,198 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
 
-def test_glyph_classifier_matches_box_drawing_block() -> None:
-    from src.ui.terminal.renderer import _glyph_is_self_underlining
-
-    # Box Drawing block — every code point is some kind of line.
-    for ch in ("─", "═", "━", "│", "┌", "┐", "└", "┘", "├", "┤", "┼"):
-        assert _glyph_is_self_underlining(ch) is True, (
-            f"expected {ch!r} (U+{ord(ch):04X}) to be self-underlining"
-        )
-    # Block Elements — half / full blocks below baseline.
-    for ch in ("▀", "▄", "█", "░", "▒", "▓"):
-        assert _glyph_is_self_underlining(ch) is True, (
-            f"expected {ch!r} to be self-underlining"
-        )
-    # CJK Presentation Forms with horizontal-line semantics.
-    for ch in ("﹍", "﹎", "﹏"):
-        assert _glyph_is_self_underlining(ch) is True, (
-            f"expected {ch!r} to be self-underlining"
-        )
-    print("✓ _glyph_is_self_underlining covers Box Drawing / Block / CJK")
+# ---- helpers ----------------------------------------------------------------
 
 
-def test_glyph_classifier_lets_normal_characters_through() -> None:
-    from src.ui.terminal.renderer import _glyph_is_self_underlining
+class _FakeCell:
+    """Minimal pyte-like cell carrying the fields the renderer reads."""
 
-    # Plain ASCII letters / digits / punctuation must NOT be classified
-    # as self-underlining — otherwise we'd drop the underscore attribute
-    # on every "hello" the user types.
-    for ch in ("a", "A", "z", "Z", "0", "9", " ", "&", "?", "!", "(", ")"):
-        assert _glyph_is_self_underlining(ch) is False, (
-            f"expected {ch!r} to NOT be self-underlining"
-        )
-    print("✓ _glyph_is_self_underlining leaves ordinary chars alone")
+    def __init__(
+        self,
+        data: str = " ",
+        *,
+        fg: str = "default",
+        bg: str = "default",
+        bold: bool = False,
+        italics: bool = False,
+        underscore: bool = False,
+        reverse: bool = False,
+    ) -> None:
+        self.data = data
+        self.fg = fg
+        self.bg = bg
+        self.bold = bold
+        self.italics = italics
+        self.underscore = underscore
+        self.reverse = reverse
 
 
-def test_style_attrs_skips_underline_for_box_drawing_cell() -> None:
-    """The bug fix: underscore=True + Box Drawing char → no text-decoration."""
+def _has_text_decoration_underline(html: str) -> bool:
+    return "text-decoration:underline" in html
+
+
+# ---- direct style-emit checks ----------------------------------------------
+
+
+def test_style_attrs_never_emits_underline_for_underscore_only_cell() -> None:
+    """Cell with all-default attributes except underscore=True →
+    the resulting inline style must NOT contain text-decoration."""
     from src.ui.terminal.renderer import _style_attrs
 
-    class FakeCell:
-        fg = "default"
-        bg = "default"
-        bold = False
-        italics = False
-        underscore = True
-        reverse = False
-
-    cell = FakeCell()
-    cell.data = "─"  # horizontal-line box drawing char
-
+    cell = _FakeCell("hello", underscore=True)
     style = _style_attrs(cell)
     assert "text-decoration:underline" not in style, (
-        f"box-drawing char must NOT get an extra CSS underline; got {style!r}"
+        f"underscore must not produce CSS underline; got {style!r}"
     )
-    print("✓ _style_attrs skips CSS underline on ─ when underscore=True")
+    print("✓ _style_attrs drops text-decoration for plain text with SGR-4")
 
 
-def test_style_attrs_still_underlines_normal_text() -> None:
-    """Regression check: ordinary letters with underscore=True still
-    get the CSS underline so 'underlined text' renders identically."""
+def test_style_attrs_never_emits_underline_for_box_drawing_cell() -> None:
+    """Box-drawing with SGR-4 — same expectation as plain text."""
     from src.ui.terminal.renderer import _style_attrs
 
-    class FakeCell:
-        fg = "default"
-        bg = "default"
-        bold = False
-        italics = False
-        underscore = True
-        reverse = False
-
-    cell = FakeCell()
-    cell.data = "hello"
+    cell = _FakeCell("─", underscore=True)
     style = _style_attrs(cell)
-    assert "text-decoration:underline" in style, (
-        f"ordinary text cells should keep their CSS underline; got {style!r}"
-    )
-    print("✓ _style_attrs still underlines text characters")
+    assert "text-decoration:underline" not in style
+    print("✓ _style_attrs drops text-decoration for box-drawing + SGR-4")
 
 
-def test_screen_to_html_boxdrawing_rule_has_no_text_decoration() -> None:
-    """End-to-end: a full row of `─` cells marked with SGR-4 must NOT
-    produce a ``text-decoration:underline`` in the HTML — that's the
-    user-visible symptom."""
+def test_style_attrs_keeps_other_styling_alongside_no_underline() -> None:
+    """When a cell has a non-default fg/bg AND SGR-4, we keep the
+    fg/bg styling but drop the underline."""
+    from src.ui.terminal.renderer import _style_attrs
+
+    cell = _FakeCell("hi", fg="red", bg="default", underscore=True)
+    style = _style_attrs(cell)
+    assert "text-decoration:underline" not in style
+    # The "red" pyte colour maps to xterm's #cc0000 hex; the rendered
+    # ``color:`` is what we care about.
+    assert "color:#cc0000" in style, f"fg color must survive; got {style!r}"
+    print("✓ _style_attrs keeps fg/bg styling, drops underline")
+
+
+# ---- end-to-end HTML checks --------------------------------------------------
+
+
+def test_screen_to_html_omits_text_decoration_for_full_underscored_rule() -> None:
+    """A row of `─` cells with SGR-4 → no text-decoration in the HTML."""
     import pyte
 
     from src.ui.terminal.renderer import screen_to_html
 
-    screen = pyte.Screen(40, 4)
+    screen = pyte.Screen(80, 5)
     stream = pyte.Stream(screen)
-    # Move to top, set SGR 4, fill the row with `─`, set SGR 24 (reset
-    # underline), and print one marker line so we know we hit it.
     stream.feed(
         "\x1b[1;1H"
-        "\x1b[4m"  # enable underline
+        "\x1b[4m"
         + ("─" * 40)
-        + "\x1b[24m"  # disable underline
+        + "\x1b[24m"
         + "\nafter\n"
     )
-
     html = screen_to_html(screen)
-
-    # Find the section corresponding to row 0 (the rule) and row 1 ('after').
-    # In the renderer, a cell where every cell has SGR 4 + Box Drawing +
-    # no other styling -> ``has_visible_style`` is False -> it's emitted
-    # as plain text inside the surrounding <pre>; crucially, no
-    # ``<span style="..." text-decoration:underline"...">`` should be
-    # emitted for this row.
-    #
-    # Filter to the rule-row chunk by looking for the marker word 'after'
-    # and confirming the chunk before it has no underlined span.
-    if "after" in html:
-        # Split on the marker so we can inspect only the row above.
-        before, _, after = html.partition("after")
-        # The rule-row is the substring before 'after'. It should
-        # contain many `─` characters but NOT a text-decoration:underline.
-        assert "─" in before, "expected the rule row's box-drawing chars"
-        assert "text-decoration:underline" not in before, (
-            f"SGR-4 + box-drawing must NOT emit text-decoration; got:\n{before}"
-        )
-    print("✓ screen_to_html omits text-decoration for full-row `─` under SGR 4")
+    before_marker, _, _ = html.partition("after")
+    assert "─" in before_marker
+    assert not _has_text_decoration_underline(before_marker), (
+        f"underscored rule row leaked a CSS underline; got {before_marker!r}"
+    )
+    print("✓ screen_to_html: full row of `─` with SGR-4 → no text-decoration")
 
 
-def test_screen_to_html_keeps_underline_on_normal_text() -> None:
-    """Regression: a normal text run with SGR-4 must still render with
-    text-decoration:underline so 'underlined text' stays underlined."""
+def test_screen_to_html_omits_text_decoration_for_underscored_text() -> None:
+    """Plain text with SGR-4 — same expectation; the user explicitly
+    asked for the underline to be suppressed."""
     import pyte
 
     from src.ui.terminal.renderer import screen_to_html
 
     screen = pyte.Screen(40, 2)
     stream = pyte.Stream(screen)
-    stream.feed(
-        "\x1b[1;1H"
-        "\x1b[4m"  # enable underline
-        "hello world"
-    )
+    stream.feed("\x1b[1;1H" + "\x1b[4m" + "hello world")
     html = screen_to_html(screen)
-    assert "text-decoration:underline" in html, (
-        f"normal 'hello world' with SGR 4 should keep CSS underline; got {html!r}"
+    assert not _has_text_decoration_underline(html), (
+        f"real terminal text should not be underlined; got {html!r}"
     )
-    print("✓ screen_to_html retains CSS underline on normal text")
+    assert "hello" in html and "world" in html, "text content lost"
+    print("✓ screen_to_html: plain text with SGR-4 → no text-decoration")
 
 
-def test_screen_to_html_mixed_row_only_underlines_text_segments() -> None:
-    """Mixed runs: text + box-drawing. The current implementation
-    groups them by attributes, so the entire run's first cell decides.
-    Verify that mixed runs still don't insert a doubled-up line for
-    the rule characters (the first cell of the test's run is a `─`)."""
+def test_screen_to_html_omits_text_decoration_for_real_claude_output() -> None:
+    """End-to-end: run the actual Claude Code TUI, capture its
+    pyte-screen state, render through our pipeline, and confirm zero
+    text-decoration:underline makes it into the HTML."""
+    import pty, os, time, select, signal
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvpe(
+            "claude", ["claude"], {**os.environ, "TERM": "xterm-256color"}
+        )
+
+    import pyte
+    from src.ui.terminal.renderer import screen_to_html
+
+    screen = pyte.Screen(120, 60)
+    stream = pyte.Stream(screen)
+    deadline = time.time() + 4.0
+    while time.time() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if not r:
+            continue
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        stream.feed(chunk.decode("utf-8", errors="replace"))
+
+    html = screen_to_html(screen)
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    assert not _has_text_decoration_underline(html), (
+        "real Claude Code TUI produced HTML with text-decoration:underline — "
+        "the user's earlier complaint was about this; the carve-out has "
+        "regressed. Inspect the raw HTML to debug."
+    )
+    print("✓ screen_to_html: real Claude Code output → zero text-decoration")
+
+
+def test_screen_to_html_keeps_other_styling_with_underscore() -> None:
+    """Regression: dropping the underline must not also drop fg/bg/etc.
+    A cell with explicit fg color + SGR-4 must still render with the
+    fg color (just no underline)."""
     import pyte
 
     from src.ui.terminal.renderer import screen_to_html
 
     screen = pyte.Screen(20, 1)
     stream = pyte.Stream(screen)
-    stream.feed(
-        "\x1b[4m" + "─" * 10 + "text"  # all underscored, mixed chars
-    )
+    stream.feed("\x1b[1;1H\x1b[4m\x1b[31m" + "hello")  # SGR 4 + red fg
     html = screen_to_html(screen)
-    # '─' is the first cell of the only run. With the fix, no
-    # text-decoration:underline is emitted for this run.
-    assert "text-decoration:underline" not in html, (
-        f"all-underscored rule-led run should not get text-decoration; got {html!r}"
+    assert not _has_text_decoration_underline(html)
+    # The red color should still be there.
+    assert "color:" in html and "hello" in html, (
+        f"fg color or text content lost; got {html!r}"
     )
-    print("✓ screen_to_html: rule-led mixed runs don't double-underline")
+    print("✓ screen_to_html: fg styling survives without underline")
 
 
 def main() -> None:
     tests = [
-        test_glyph_classifier_matches_box_drawing_block,
-        test_glyph_classifier_lets_normal_characters_through,
-        test_style_attrs_skips_underline_for_box_drawing_cell,
-        test_style_attrs_still_underlines_normal_text,
-        test_screen_to_html_boxdrawing_rule_has_no_text_decoration,
-        test_screen_to_html_keeps_underline_on_normal_text,
-        test_screen_to_html_mixed_row_only_underlines_text_segments,
+        test_style_attrs_never_emits_underline_for_underscore_only_cell,
+        test_style_attrs_never_emits_underline_for_box_drawing_cell,
+        test_style_attrs_keeps_other_styling_alongside_no_underline,
+        test_screen_to_html_omits_text_decoration_for_full_underscored_rule,
+        test_screen_to_html_omits_text_decoration_for_underscored_text,
+        test_screen_to_html_omits_text_decoration_for_real_claude_output,
+        test_screen_to_html_keeps_other_styling_with_underscore,
     ]
     failed = 0
     for t in tests:
@@ -213,7 +238,6 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001
             print(f"✗ {t.__name__}: {type(e).__name__}: {e}")
             import traceback
-
             traceback.print_exc()
             failed += 1
     if failed:

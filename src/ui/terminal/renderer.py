@@ -200,52 +200,16 @@ def _style_attrs(cell, *, force_reverse: bool = False) -> str:
         parts.append("font-weight:bold")
     if getattr(cell, "italics", False):
         parts.append("font-style:italic")
-    if getattr(cell, "underscore", False) and not _glyph_is_self_underlining(
-        cell.data
-    ):
-        # SGR-4 ("underline") on cells whose glyph already extends below
-        # the baseline would render as a *second* horizontal line under
-        # the existing character. Box-drawing characters (U+2500–U+259F,
-        # which Claude Code v2.x uses for its welcome-screen borders) are
-        # the main offender; see :func:`_glyph_is_self_underlining` for
-        # the full set. In a real xterm the SGR-4 attribute is a no-op
-        # on those characters, so skipping it here brings the renderer
-        # in line with how a native terminal would draw them.
-        parts.append("text-decoration:underline")
+    # NOTE: SGR-4 (underline) is intentionally NOT rendered. Claude Code
+    # v2.x leaves the underline attribute on after drawing its welcome
+    # UI, so every cell the user types or the assistant writes inherits
+    # ``underscore=True`` — and producing a CSS underline on every one
+    # of those cells results in the entire screen looking underlined.
+    # Real terminals do underline them, but the visual weight of
+    # ``text-decoration:underline`` in QTextDocument is much heavier
+    # than xterm's default, so the user-visible result is unacceptable.
+    # Strip the attribute here; a future toggle could re-enable it.
     return ";".join(parts)
-
-
-def _glyph_is_self_underlining(ch: str) -> bool:
-    """True when ``ch``'s glyph already has a visible horizontal stroke
-    below the baseline.
-
-    Rendering such a glyph with CSS ``text-decoration:underline`` would
-    draw a *second* line under the existing character — visually the
-    cell becomes a "doubled-up" / over-thick horizontal rule compared
-    to what a real xterm would show. The main offenders are Claude
-    Code v2.x's box-drawing separator lines (``─``, ``═``, …) which
-    it emits with the SGR-4 underline attribute set; without this
-    filter the renderer paints a phantom underline beneath every one
-    of those glyphs.
-
-    Matched ranges:
-
-    - ``U+2500–U+257F``: Box Drawing block — every code point is some
-      kind of line / corner.
-    - ``U+2580–U+259F``: Block Elements — half- and full-block cells
-      sit on/below the baseline; a CSS underline would double-stroke
-      them too.
-    - ``U+FE4D–U+FE4F``: CJK Compatibility horizontal lines
-      (PRESENTATION FORM FOR VERTICAL / HORIZONTAL ELLIPSIS / STROKE).
-    """
-    if not ch:
-        return False
-    cp = ord(ch[0])
-    return (
-        0x2500 <= cp <= 0x257F
-        or 0x2580 <= cp <= 0x259F
-        or 0xFE4D <= cp <= 0xFE4F
-    )
 
 
 def screen_to_html(
@@ -340,12 +304,19 @@ def screen_to_html(
             # contains a cursor cell OR contains a selected cell —
             # otherwise plain text in the surrounding <pre> already
             # renders correctly with no span.
+            #
+            # ``run_attrs[4]`` is the raw ``cell.underscore`` flag. The
+            # CSS underline is no longer emitted from ``_style_attrs``
+            # (see the note there), so an underscored default-styled
+            # cell joins the no-visible-style branch and renders as
+            # plain text — which is what we want, since the user no
+            # longer has to look at a screen every character of which
+            # is underlined.
             has_visible_style = (
                 run_attrs[0] != "default"
                 or run_attrs[1] != "default"
                 or run_attrs[2]
                 or run_attrs[3]
-                or run_attrs[4]
                 or run_attrs[5]
                 or run_cursor
                 or run_selected
