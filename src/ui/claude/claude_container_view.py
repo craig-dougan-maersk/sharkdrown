@@ -1,12 +1,19 @@
 """Container page for the "Claude" top-level tab.
 
-Hosts a closable ``QTabWidget`` of ``TerminalSessionView`` instances
-running the ``claude`` CLI, plus a toolbar with a ``+ New Session``
-button. Reuses the terminal widget as-is — Claude Code is just another
-PTY child process with a profile-specific environment.
+Hosts a nested ``QTabWidget`` with three kinds of tabs:
 
-This widget is the page inserted into ``view_tabs`` as the 5th top-level
-tab in ``src/ui/main_window.py``.
+* **Pinned** — ``Dashboard`` (index 0) and ``Recent Activity`` (index 1).
+  These are always present, never closable, and always in this order.
+  The first two tabs are pinned by index; their close buttons are
+  hidden via ``tabBar().setTabButton(idx, RightSide, None)`` and any
+  stray close-request signals are filtered out in ``_on_close_requested``.
+* **Sessions** — ``Claude Code`` PTY sessions at index 2 onward.
+  Each is closable via the ``×`` button and labelled with the
+  profile name.
+
+The container also owns the proxy lifecycle hooks (callbacks installed
+by the main window) and lazily builds the heavy ``DashboardView`` (a
+``QWebEngineView``) on first proxy start.
 
 Lifecycle of a new session
 --------------------------
@@ -29,6 +36,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QTabBar,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
@@ -36,12 +44,20 @@ from PySide6.QtWidgets import (
 )
 
 from src.profiles.config_dir import write_profile_config
-from src.profiles.env_builder import build_claude_session_env
+from src.profiles.env_builder import build_claude_session_env, resolve_api_key
 from src.profiles.models import ClaudeProfile
 from src.profiles.paths_helpers import profile_config_base_dir
 from src.profiles.store import ProfileStore
+from src.proxy.dashboard_view import DashboardView
 from src.proxy.paths import data_dir
+from src.ui.recent_activity_view import RecentActivityView
 from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+
+# Number of pinned tabs at the head of the inner ``QTabWidget``. Session
+# tabs slot in at index ``_NUM_PINNED`` and above. Centralised so the
+# close-request filter and the close-button hiding stay in sync.
+_NUM_PINNED = 2
 
 
 @dataclass
@@ -59,7 +75,7 @@ class _PendingLaunch:
 
 
 class ClaudeContainerView(QWidget):
-    """Page widget: toolbar + closable tab strip of Claude Code sessions.
+    """Page widget: toolstrip + nested tab strip (pinned + sessions).
 
     The container owns the tab strip and the per-session lifecycle, but
     *not* the embedded proxy — that's owned by ``MainWindow``. The
@@ -98,6 +114,15 @@ class ClaudeContainerView(QWidget):
         # Test hook: when True, ``new_session`` skips ``QMessageBox``
         # warnings so headless tests don't block on modal dialogs.
         self._suppress_dialogs = False
+        # Dashboard view is built lazily when the proxy starts — the
+        # ``QWebEngineWidgets`` import is heavy and only useful once
+        # we have a URL to point at.
+        self.dashboard_view: DashboardView | None = None
+        self._dashboard_placeholder: QLabel | None = None
+        # Recent Activity view is built up-front (no heavy deps; just
+        # a QTableWidget). Polling is paused until ``set_base_url``
+        # is called with a real URL.
+        self.recent_activity_view: RecentActivityView | None = None
         self._build_ui()
 
     # ---- public API --------------------------------------------------------
@@ -129,6 +154,34 @@ class ClaudeContainerView(QWidget):
                 path=data_dir() / "profiles.json",
             )
         return self._profile_store
+
+    def set_base_url(self, url: str) -> None:
+        """Point the embedded dashboard and recent-activity views at
+        a freshly-started proxy URL.
+
+        Called from :class:`MainWindow` when the proxy signals it's
+        listening (``started_ok``). On first call with a non-empty URL
+        the heavy ``DashboardView`` is built and the placeholder label
+        is replaced. An empty URL stops both views' polling — the
+        dashboard keeps its last-rendered page, the recent activity
+        table clears.
+        """
+        url = url.rstrip("/")
+        # Build the dashboard view lazily to avoid the QWebEngineWidgets
+        # import until we actually have a proxy to point at.
+        if url and self.dashboard_view is None:
+            self._build_dashboard_view()
+        if self.dashboard_view is not None:
+            self.dashboard_view.set_base_url(url)
+        if self.recent_activity_view is not None:
+            self.recent_activity_view.set_base_url(url)
+
+    def stop_polling(self) -> None:
+        """Stop the recent-activity view's polling (dashboard keeps
+        its last-rendered page). Idempotent.
+        """
+        if self.recent_activity_view is not None:
+            self.recent_activity_view.stop()
 
     def new_session(self, profile: ClaudeProfile | None = None) -> TerminalSessionView | None:
         """Spawn a new Claude Code session and add it as a tab.
@@ -175,18 +228,22 @@ class ClaudeContainerView(QWidget):
                 )
             return None
 
-        api_key = None
-        if profile.api_key_ref:
-            api_key = self.profile_store.credential_store.get(profile.api_key_ref)
-            if not api_key:
-                if not self._suppress_dialogs:
-                    QMessageBox.warning(
-                        self,
-                        "API key missing",
-                        f"Profile {profile.name!r} references credential "
-                        f"{profile.api_key_ref!r} but it has no value stored.\n\n"
-                        "Open Claude → Manage Profiles… to set the key.",
-                    )
+        # Resolve the API key for the profile's default model. The
+        # helper walks model_endpoints → key_ref → CredentialStore. If
+        # the model has no key configured, we still launch with the
+        # sentinel (Claude Code refuses to start without an
+        # ``ANTHROPIC_API_KEY``) and warn the user.
+        api_key = resolve_api_key(profile, self.profile_store.credential_store)
+        if api_key is None and profile.default_model:
+            endpoint = profile.model_endpoints.get(profile.default_model)
+            if endpoint and endpoint.key_ref and not self._suppress_dialogs:
+                QMessageBox.warning(
+                    self,
+                    "API key missing",
+                    f"Profile {profile.name!r} references credential "
+                    f"{endpoint.key_ref!r} but it has no value stored.\n\n"
+                    "Open Claude → Manage Profiles… to set the key.",
+                )
                 # Fall through with the sentinel — the user has been
                 # warned and can still launch the session to interact
                 # with Claude Code's own auth flow.
@@ -219,24 +276,66 @@ class ClaudeContainerView(QWidget):
         """Focus the active session's text edit. Called by MainWindow
         when the Claude tab becomes the current top-level tab — same
         pattern as TerminalContainerView.focus_active_session.
+
+        No-op if the current inner tab is one of the pinned tabs
+        (Dashboard / Recent Activity) — those don't have a text edit
+        to focus.
         """
-        widget = self.session_tabs.currentWidget()
+        widget = self.tabs.currentWidget()
         if isinstance(widget, TerminalSessionView):
             widget.focus_terminal()
+
+    def show_dashboard(self) -> None:
+        """Switch the inner tab strip to the Dashboard pane."""
+        self.tabs.setCurrentIndex(0)
+
+    def show_recent_activity(self) -> None:
+        """Switch the inner tab strip to the Recent Activity pane."""
+        self.tabs.setCurrentIndex(1)
 
     @property
     def session_count(self) -> int:
         return len(self._sessions)
 
     def shutdown(self) -> None:
-        """Idempotent full-shutdown of every Claude session."""
+        """Idempotent full-shutdown of every Claude session and the
+        embedded polling widgets.
+        """
         for view in list(self._sessions):
             try:
                 view.shutdown()
             except Exception:  # noqa: BLE001
                 pass
+        if self.recent_activity_view is not None:
+            try:
+                self.recent_activity_view.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---- internals ---------------------------------------------------------
+
+    def _build_dashboard_view(self) -> None:
+        """Replace the placeholder label with the real ``DashboardView``.
+
+        Split out so the heavy ``QWebEngineWidgets`` import and the
+        ``replaceWidget`` swap are isolated in one place. Idempotent
+        — guards against the second call from a stop/start cycle.
+        """
+        if self.dashboard_view is not None or self._dashboard_placeholder is None:
+            return
+        view = DashboardView()
+        view.url_loaded.connect(
+            lambda url: self.parent().statusBar().showMessage(
+                f"Dashboard loaded: {url}", 3000
+            )
+            if self.parent() is not None and hasattr(self.parent(), "statusBar")
+            else None
+        )
+        old = self._dashboard_placeholder
+        self._dashboard_placeholder = None  # type: ignore[assignment]
+        self.dashboard_layout.replaceWidget(old, view)
+        old.deleteLater()
+        self.dashboard_view = view
 
     def _launch_session(
         self,
@@ -273,10 +372,9 @@ class ClaudeContainerView(QWidget):
         # Tab title shows the profile so the user can tell two tabs of
         # the same ``claude`` binary apart at a glance.
         title = profile.name
-        index = self.session_tabs.addTab(view, title)
-        self.session_tabs.setCurrentIndex(index)
+        index = self.tabs.addTab(view, title)
+        self.tabs.setCurrentIndex(index)
         self._sessions.append(view)
-        self.session_tabs.tabBar().setVisible(True)
         self._update_info_label()
         view.start()
         view.focus_terminal()
@@ -311,14 +409,75 @@ class ClaudeContainerView(QWidget):
         toolbar_layout.addWidget(self.info_label)
         layout.addWidget(toolbar)
 
-        # --- Inner tab widget (closable, movable) -------------------------
-        self.session_tabs = QTabWidget()
-        self.session_tabs.setTabsClosable(True)
-        self.session_tabs.setMovable(True)
-        self.session_tabs.tabCloseRequested.connect(self._close_session)
-        # Hide the tab bar when there are no sessions.
-        self.session_tabs.tabBar().setVisible(False)
-        layout.addWidget(self.session_tabs, 1)
+        # --- Inner tab strip ---------------------------------------------
+        # A single QTabWidget hosts Dashboard (index 0), Recent Activity
+        # (index 1), and any number of Claude sessions (index 2+).
+        # ``tabsClosable`` is enabled so session tabs show their ``×``;
+        # ``tabCloseRequested`` is filtered to ignore pinned indices.
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        # Movement is disabled so the "Dashboard always first, Recent
+        # Activity always second, sessions from index 2 onward" ordering
+        # holds across user interaction. The first two tabs are pinned
+        # in the literal sense: their close buttons are hidden and the
+        # close-request slot refuses to close them.
+        self.tabs.setMovable(False)
+        self.tabs.tabCloseRequested.connect(self._on_close_requested)
+
+        # Pinned tab 0: Dashboard. The placeholder is replaced by the
+        # real ``DashboardView`` lazily, on first proxy start — see
+        # ``_build_dashboard_view``.
+        self.dashboard_container = QWidget()
+        self.dashboard_layout = QVBoxLayout(self.dashboard_container)
+        self.dashboard_layout.setContentsMargins(0, 0, 0, 0)
+        self.dashboard_layout.setSpacing(0)
+        self._dashboard_placeholder = QLabel(
+            "Dashboard not yet available.\n\n"
+            "Start the proxy via:\n"
+            "    Claude → Start Proxy\n\n"
+            "Or configure it to auto-start via:\n"
+            "    Claude → Settings..."
+        )
+        self._dashboard_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._dashboard_placeholder.setStyleSheet("color: gray; font-size: 14px;")
+        self.dashboard_layout.addWidget(self._dashboard_placeholder)
+        self.tabs.addTab(self.dashboard_container, "Dashboard")
+
+        # Pinned tab 1: Recent Activity. Built up-front (no heavy deps);
+        # polling stays paused until ``set_base_url`` is called.
+        self.recent_activity_view = RecentActivityView()
+        self.tabs.addTab(self.recent_activity_view, "Recent Activity")
+
+        # Strip the close buttons from the pinned tabs. ``setTabButton``
+        # with ``None`` removes the button that ``setTabsClosable(True)``
+        # would otherwise install.
+        self._set_pinned_tab(0)
+        self._set_pinned_tab(1)
+
+        layout.addWidget(self.tabs, 1)
+
+    def _set_pinned_tab(self, index: int) -> None:
+        """Hide the close button on a pinned tab so it can't be closed.
+
+        ``QTabBar.setTabButton(idx, RightSide, None)`` removes the
+        button Qt installed automatically. ``tabCloseRequested`` is
+        still filtered in ``_on_close_requested`` so any programmatic
+        attempt to close a pinned tab is also rejected.
+        """
+        self.tabs.tabBar().setTabButton(
+            index, QTabBar.ButtonPosition.RightSide, None
+        )
+
+    def _on_close_requested(self, index: int) -> None:
+        """Slot for the inner tab strip's ``tabCloseRequested``.
+
+        The first ``_NUM_PINNED`` tabs are pinned (Dashboard, Recent
+        Activity) and cannot be closed by user or by code. Closing
+        attempts for those indices are silently ignored.
+        """
+        if index < _NUM_PINNED:
+            return
+        self._close_session(index)
 
     def _on_new_clicked(self) -> None:
         # Toolbar button click → new session with the active profile.
@@ -328,24 +487,25 @@ class ClaudeContainerView(QWidget):
         self.new_session()
 
     def _close_session(self, index: int) -> None:
-        widget = self.session_tabs.widget(index)
+        widget = self.tabs.widget(index)
         if widget is None:
             return
         try:
             widget.shutdown()
         except Exception:  # noqa: BLE001
             pass
-        self.session_tabs.removeTab(index)
+        self.tabs.removeTab(index)
         if widget in self._sessions:
             self._sessions.remove(widget)
         widget.deleteLater()
-        if self.session_tabs.count() == 0:
-            self.session_tabs.tabBar().setVisible(False)
         self._update_info_label()
 
     def _on_session_exited(self, view: TerminalSessionView) -> None:
-        for i in range(self.session_tabs.count()):
-            if self.session_tabs.widget(i) is view:
+        # Linear scan — session count is small (handful at most), and
+        # the close-button-hidden pinned tabs guarantee that index 0
+        # and 1 never match a ``TerminalSessionView``.
+        for i in range(self.tabs.count()):
+            if self.tabs.widget(i) is view:
                 # Reuse the view's own title() so the suffix matches
                 # what TerminalSessionView already says (e.g. "claude
                 # (exited)"). The profile name is shown as the prefix
@@ -355,7 +515,7 @@ class ClaudeContainerView(QWidget):
                 title = view.title()
                 if "(exited)" not in title:
                     title = f"{title} (exited)"
-                self.session_tabs.setTabText(i, title)
+                self.tabs.setTabText(i, title)
                 break
         self._update_info_label()
 

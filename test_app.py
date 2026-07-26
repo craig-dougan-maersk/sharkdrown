@@ -34,7 +34,11 @@ def test_app():
 
     # Verify window exists
     assert window is not None
-    assert window.windowTitle() == "Pandas Markdown Editor"
+    # The window title comes from ``src.config.APP_TITLE`` — assert the
+    # constant rather than the literal so a rename in one place flows
+    # through here automatically.
+    from src.config import APP_TITLE
+    assert window.windowTitle() == APP_TITLE
 
     print("✓ Main window created successfully")
     print(f"✓ Window size: {window.size().width()}x{window.size().height()}")
@@ -45,11 +49,21 @@ def test_app():
     assert isinstance(editor, EditorWidget)
     print("✓ Editor widget created successfully")
 
-    # Check preview tabs
+    # With the new defaults (split_enabled=False, preview_visible=False),
+    # no preview tab is created on the initial New. Verify the empty
+    # state, then toggle Preview on and confirm a preview tab materialises.
+    assert window.preview_tabs.count() == 0, (
+        "no preview tab should be created when split + preview are off"
+    )
+    print("✓ Preview tab is empty by default (single-pane editor)")
+
+    window.action_toggle_preview.trigger()
+    assert window.preview_visible is True
+    assert window.split_enabled is True
     from src.ui.widgets.preview_widget import PreviewWidget
     preview = window.preview_tabs.widget(0)
     assert isinstance(preview, PreviewWidget)
-    print("✓ Preview widget created successfully")
+    print("✓ Toggling Preview creates a preview tab and enables split")
 
     # Test document
     from src.core.document import DocumentTab
@@ -60,11 +74,13 @@ def test_app():
 
     # Regression: clicking File → New used to break with
     # ``setPlainText(bool)`` because ``triggered`` emits a bool that was
-    # being passed as ``content`` to ``_create_new_tab``.
+    # being passed as ``content`` to ``_create_new_tab``. (The toolbar
+    # ``tb_new`` action it used to call was removed along with the
+    # toolbar — File → New is the only entry point now.)
     initial_tabs = window.editor_tabs.count()
     window.action_new.trigger()
     window.action_new.trigger()
-    window.tb_new.trigger()
+    window.action_new.trigger()
     assert window.editor_tabs.count() == initial_tabs + 3, (
         f"expected {initial_tabs + 3} tabs after 3 New clicks, "
         f"got {window.editor_tabs.count()}"

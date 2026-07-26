@@ -9,11 +9,13 @@ This module provides the main window layout with:
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QClipboard, QIcon, QKeySequence
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QAction, QActionGroup, QClipboard, QKeySequence
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QInputDialog,
     QLabel,
@@ -23,22 +25,19 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSplitter,
     QTabWidget,
-    QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
+from src.config import APP_TITLE
 from src.core.document import DocumentTab
 from src.profiles.store import ProfileStore
 from src.proxy.activity_tile import ActivityTile
-from src.proxy.dashboard_view import DashboardView
 from src.proxy.paths import default_db_path
 from src.proxy.proxy_config import ProxyConfig
 from src.proxy.server_thread import ProxyServerThread
-from src.proxy.settings_dialog import ProxySettingsDialog
 from src.ui.claude.claude_container_view import ClaudeContainerView
 from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
-from src.ui.recent_activity_view import RecentActivityView
 from src.ui.terminal.terminal_container_view import TerminalContainerView
 
 
@@ -47,12 +46,17 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Pandas Markdown Editor")
+        self.setWindowTitle(APP_TITLE)
         self.resize(1200, 800)
 
         # State management
-        self.split_enabled = True
-        self.preview_visible = True
+        # ``split_enabled`` and ``preview_visible`` default to False:
+        # the user wants a single-pane editor on startup. Toggling
+        # Preview re-enables Split (the existing escalation logic in
+        # ``_toggle_preview``), and toggling Split reveals the empty
+        # second pane without surfacing the preview.
+        self.split_enabled = False
+        self.preview_visible = False
         # Per-instance tab-pair tracking. Was previously declared at class
         # scope, which made every MainWindow share the same dicts.
         self._tab_pairs: dict[int, int] = {}
@@ -62,9 +66,7 @@ class MainWindow(QMainWindow):
         self.proxy_thread: ProxyServerThread | None = None
         self.proxy_port: int = 0
         self.proxy_host: str = "127.0.0.1"
-        self.dashboard_view: DashboardView | None = None
         self.activity_tile: ActivityTile | None = None
-        self.recent_activity_view: RecentActivityView | None = None
         self.terminal_container: TerminalContainerView | None = None
         self.claude_container: ClaudeContainerView | None = None
         self.profile_store: ProfileStore | None = None
@@ -74,14 +76,28 @@ class MainWindow(QMainWindow):
         # Initialize components
         self._init_central_widget()
         self._init_menu()
-        self._init_server_menu()
         self._init_terminal_menu()
         self._init_claude_menu()
-        self._init_toolbar()
         self._init_status_bar()
 
         # Create initial tab
         self._create_new_tab()
+
+        # Apply the initial split/preview visibility. The splitter and
+        # preview_tabs are created in their default-visible state by
+        # _init_central_widget, so without this call the window would
+        # open as a 2-pane layout regardless of the split_enabled
+        # default. Call after _create_new_tab so the existing
+        # tab-pair logic is in place.
+        self._apply_view_state()
+
+        # Sync the status-bar format combo to the first document's
+        # detected format, and gate the right-edge widgets for the
+        # current top-level tab. The first call to ``_on_view_tab_changed``
+        # happens on user click, so the initial state must be set
+        # explicitly here.
+        self._sync_format_combo_to_current_document()
+        self._update_status_bar_visibility(self._TAB_INDEX_DOCUMENTS)
 
         # Honour the user's autostart preference (deferred so the window
         # is fully constructed before we kick off the background thread).
@@ -93,16 +109,19 @@ class MainWindow(QMainWindow):
     def _init_central_widget(self) -> None:
         """Initialize the central widget.
 
-        Layout: a top-level ``QTabWidget`` with two view modes:
+        Layout: a top-level ``QTabWidget`` with three top-level tabs:
 
           * **Documents** — the existing editor/preview ``QSplitter``.
             Multiple files can be open as tabs in either pane.
-          * **Dashboard** — the embedded proxy dashboard, which fills the
-            window when its tab is active. Treated like a document tab
-            so it can be opened, closed, and re-opened via the menu.
+          * **Terminals** — closable tab strip of embedded PTY sessions.
+          * **Claude** — owns a nested tab strip with the proxy
+            Dashboard (pinned), Recent Activity (pinned), and any
+            number of Claude Code sessions (closable). See
+            :class:`ClaudeContainerView` for the inner structure.
 
-        Switching to the Dashboard tab "maximises" it (it fills the
-        window); switching back to Documents restores the editor.
+        Switching to the Claude tab shows the inner tab strip; the
+        inner selection tracks the user's last activity in the
+        container (default: Dashboard).
         """
         # Inner splitter for the editor/preview pair (unchanged).
         self.splitter = QSplitter(Qt.Horizontal)
@@ -126,18 +145,18 @@ class MainWindow(QMainWindow):
         self.splitter.addWidget(self.editor_tabs)
         self.splitter.addWidget(self.preview_tabs)
 
-        # ---- Top-level view tabs (Documents / Dashboard) ---------------
+        # ---- Top-level view tabs (Documents / Terminals / Claude) ------
         self.view_tabs = QTabWidget()
         self.view_tabs.setDocumentMode(True)
         self.view_tabs.setTabsClosable(False)
         self.view_tabs.setMovable(False)
-        # Hold a reference so ``_ensure_dashboard_loaded`` can locate the
-        # tab index for the dashboard.
+        # Tab indices — kept as constants so menu slots and tests can
+        # refer to them without re-counting. The Claude container
+        # owns its own internal pinned/session tab strip; these
+        # constants only refer to the top-level view tabs.
         self._TAB_INDEX_DOCUMENTS = 0
-        self._TAB_INDEX_DASHBOARD = 1
-        self._TAB_INDEX_RECENT_ACTIVITY = 2
-        self._TAB_INDEX_TERMINALS = 3
-        self._TAB_INDEX_CLAUDE = 4
+        self._TAB_INDEX_TERMINALS = 1
+        self._TAB_INDEX_CLAUDE = 2
 
         # Page 1: Documents (existing editor/preview splitter).
         documents_page = QWidget()
@@ -148,42 +167,16 @@ class MainWindow(QMainWindow):
         self.view_tabs.addTab(documents_page, "Documents")
         self.view_tabs.currentChanged.connect(self._on_view_tab_changed)
 
-        # Page 2: Dashboard placeholder; the actual DashboardView is
-        # constructed lazily once the proxy signals it's ready (avoids
-        # the heavy QtWebEngine import until needed).
-        self.dashboard_container = QWidget()
-        self.dashboard_layout = QVBoxLayout(self.dashboard_container)
-        self.dashboard_layout.setContentsMargins(0, 0, 0, 0)
-        self.dashboard_layout.setSpacing(0)
-        # A placeholder QLabel until the proxy starts; replaced by the
-        # real ``DashboardView`` in ``_ensure_dashboard_loaded``.
-        self.dashboard_placeholder = QLabel(
-            "Dashboard not yet available.\n\n"
-            "Start the proxy via:\n"
-            "    Server → Start\n\n"
-            "Or configure it to auto-start via:\n"
-            "    Server → Settings"
-        )
-        self.dashboard_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.dashboard_placeholder.setStyleSheet("color: gray; font-size: 14px;")
-        self.dashboard_layout.addWidget(self.dashboard_placeholder)
-        self.view_tabs.addTab(self.dashboard_container, "Dashboard")
-
-        # Page 3: Recent Activity — a native Qt table view of the same
-        # /api/requests the dashboard uses. Built up-front (no heavy
-        # web-engine dep). Polling is disabled until the proxy starts.
-        self.recent_activity_view = RecentActivityView()
-        self.view_tabs.addTab(self.recent_activity_view, "Recent Activity")
-
-        # Page 4: Terminals — closable tab strip of embedded PTY sessions.
+        # Page 2: Terminals — closable tab strip of embedded PTY sessions.
         # Constructed up-front (no heavy deps; just Qt widgets) but no
         # shell is started until the user clicks "+ New Session".
         self.terminal_container = TerminalContainerView()
         self.view_tabs.addTab(self.terminal_container, "Terminals")
 
-        # Page 5: Claude — closable tab strip of Claude Code PTY sessions.
-        # Same UX as Terminals; the container takes care of proxy
-        # auto-start, env construction, and Claude settings dir layout.
+        # Page 3: Claude — owns the proxy Dashboard, Recent Activity,
+        # and a closable tab strip of Claude Code sessions. The
+        # container takes care of proxy auto-start, env construction,
+        # and Claude settings dir layout.
         self.claude_container = ClaudeContainerView()
         self.claude_container.set_proxy_callbacks(
             is_proxy_running=self._is_proxy_running,
@@ -246,14 +239,14 @@ class MainWindow(QMainWindow):
         self.action_toggle_split = QAction("&Toggle Split View", self)
         self.action_toggle_split.setShortcut("Ctrl+D")
         self.action_toggle_split.setCheckable(True)
-        self.action_toggle_split.setChecked(True)
+        self.action_toggle_split.setChecked(False)
         self.action_toggle_split.triggered.connect(self._toggle_split)
         view_menu.addAction(self.action_toggle_split)
 
         self.action_toggle_preview = QAction("&Toggle Preview", self)
         self.action_toggle_preview.setShortcut("Ctrl+P")
         self.action_toggle_preview.setCheckable(True)
-        self.action_toggle_preview.setChecked(True)
+        self.action_toggle_preview.setChecked(False)
         self.action_toggle_preview.triggered.connect(self._toggle_preview)
         view_menu.addAction(self.action_toggle_preview)
 
@@ -269,134 +262,124 @@ class MainWindow(QMainWindow):
         self.action_stacked.triggered.connect(lambda: self._set_split_orientation(Qt.Vertical))
         view_menu.addAction(self.action_stacked)
 
-        # Format menu
-        format_menu = menubar.addMenu("&Format")
-
-        self.action_format_markdown = QAction("Markdown", self)
-        self.action_format_markdown.setCheckable(True)
-        self.action_format_markdown.setChecked(True)
-        self.action_format_markdown.triggered.connect(lambda: self._set_format("markdown"))
-        format_menu.addAction(self.action_format_markdown)
-
-        self.action_format_json = QAction("JSON", self)
-        self.action_format_json.setCheckable(True)
-        self.action_format_json.triggered.connect(lambda: self._set_format("json"))
-        format_menu.addAction(self.action_format_json)
-
-        self.action_format_yaml = QAction("YAML", self)
-        self.action_format_yaml.setCheckable(True)
-        self.action_format_yaml.triggered.connect(lambda: self._set_format("yaml"))
-        format_menu.addAction(self.action_format_yaml)
-
-    def _init_toolbar(self) -> None:
-        """Initialize the toolbar."""
-        toolbar = QToolBar()
-        toolbar.setIconSize(QSize(16, 16))
-        self.addToolBar(toolbar)
-
-        # New file
-        self.tb_new = QAction(QIcon.fromTheme("document-new"), "New", self)
-        # Lambda wrapper — see action_new comment for why.
-        self.tb_new.triggered.connect(lambda _checked=False: self._create_new_tab())
-        toolbar.addAction(self.tb_new)
-
-        # Open file
-        self.tb_open = QAction(QIcon.fromTheme("document-open"), "Open", self)
-        self.tb_open.triggered.connect(self._open_file)
-        toolbar.addAction(self.tb_open)
-
-        # Save
-        self.tb_save = QAction(QIcon.fromTheme("document-save"), "Save", self)
-        self.tb_save.triggered.connect(self._save_file)
-        toolbar.addAction(self.tb_save)
-
-        toolbar.addSeparator()
-
-        # Toggle split
-        self.tb_toggle_split = QAction(QIcon.fromTheme("view-split"), "Toggle Split", self)
-        self.tb_toggle_split.setCheckable(True)
-        self.tb_toggle_split.setChecked(True)
-        self.tb_toggle_split.triggered.connect(self._toggle_split)
-        toolbar.addAction(self.tb_toggle_split)
-
-        # Toggle preview
-        self.tb_toggle_preview = QAction(QIcon.fromTheme("view-preview"), "Preview", self)
-        self.tb_toggle_preview.setCheckable(True)
-        self.tb_toggle_preview.setChecked(True)
-        self.tb_toggle_preview.triggered.connect(self._toggle_preview)
-        toolbar.addAction(self.tb_toggle_preview)
+        # Format menu was removed — the format is now picked from a
+        # drop-down selector in the status bar (see ``_init_status_bar``),
+        # visible only on the Documents tab.
 
     def _init_status_bar(self) -> None:
         """Initialize the status bar.
 
-        Two permanent widgets sit on the right edge:
-          * ``proxy_status_label`` — connection state ("Proxy: running on :3001")
-          * ``activity_tile`` — live request counts ("12 req / 2 err / 4 empty")
-        The activity tile also serves as a shortcut to the dashboard:
-        clicking it focuses the Dashboard tab.
+        Three permanent widgets live on the right edge, but their
+        visibility is gated by the active top-level tab:
+
+        * ``format_combo`` — visible only on the **Documents** tab.
+          Picks the current document's format (markdown / json / yaml).
+          Synced to the active editor tab on tab switches via
+          ``_on_editor_tab_changed``.
+        * ``proxy_status_label`` — visible only on the **Claude** tab.
+          Connection state ("Proxy: running on :3001").
+        * ``activity_tile`` — visible only on the **Claude** tab. Live
+          request counts ("12 req / 2 err / 4 empty"); also serves as a
+          shortcut to the Claude container's Dashboard sub-tab.
+
+        On Terminals, the right edge of the status bar is empty (the
+        transient ``showMessage`` text on the left still appears).
         """
         self.status = self.statusBar()
         self.status.showMessage("Ready")
+
+        # ---- Format selector -------------------------------------------
+        # The user picks the current document's format from this combo.
+        # ``Markdown / JSON / YAML`` strings match the values used by
+        # ``DocumentTab.format_type`` and the ``EditorWidget`` highlighter
+        # switch in ``_update_highlighter``.
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["markdown", "json", "yaml"])
+        self.format_combo.setToolTip(
+            "Format for the current document.\n"
+            "Drives syntax highlighting and preview rendering."
+        )
+        # ``currentTextChanged`` fires on every change, including
+        # programmatic ones — the sync helpers block signals during
+        # assignment so we don't bounce.
+        self.format_combo.currentTextChanged.connect(self._on_format_combo_changed)
+        self.status.addPermanentWidget(self.format_combo)
+
+        # ---- Proxy status (Claude tab only) ---------------------------
         self.proxy_status_label = QLabel("Proxy: stopped")
         self.status.addPermanentWidget(self.proxy_status_label)
 
+        # ---- Activity tile (Claude tab only) --------------------------
         self.activity_tile = ActivityTile()
         self.activity_tile.clicked.connect(self._focus_proxy_tab)
         self.status.addPermanentWidget(self.activity_tile)
 
-    def _init_server_menu(self) -> None:
-        """Add the Server menu between View and Format.
+        # Default visibility: Documents tab is the initial tab, so
+        # the format combo is on, the proxy widgets are off. The actual
+        # gate is ``_update_status_bar_visibility`` which runs in
+        # ``_on_view_tab_changed``.
+        self.proxy_status_label.setVisible(False)
+        self.activity_tile.setVisible(False)
 
-        Mirrors the conventions used elsewhere in ``_init_menu``: each
-        action is stored as ``self.action_*`` so tests can introspect it
-        and so the action can be referenced from outside (e.g. the toolbar
-        or a status bar menu). State transitions (Start ↔ Stop, etc.) are
-        driven by the ``*_on_proxy_*`` slots.
+    # ------------------------------------------------------------------
+    # Status-bar tab-conditional visibility
+    # ------------------------------------------------------------------
+
+    def _update_status_bar_visibility(self, view_index: int) -> None:
+        """Show the right permanent widgets for the active top-level tab.
+
+        * **Documents** — ``format_combo`` visible; proxy widgets hidden.
+        * **Terminals** — all right-edge widgets hidden (the message
+          area on the left is unaffected).
+        * **Claude** — proxy status + activity tile visible; format
+          combo hidden (format only makes sense for documents).
         """
-        menubar = self.menuBar()
-        server_menu = menubar.addMenu("&Server")
+        is_documents = view_index == getattr(self, "_TAB_INDEX_DOCUMENTS", -1)
+        is_claude = view_index == getattr(self, "_TAB_INDEX_CLAUDE", -1)
 
-        self.action_start_server = QAction("&Start", self)
-        self.action_start_server.triggered.connect(self._start_server)
-        server_menu.addAction(self.action_start_server)
+        self.format_combo.setVisible(is_documents)
+        self.proxy_status_label.setVisible(is_claude)
+        self.activity_tile.setVisible(is_claude)
 
-        self.action_stop_server = QAction("S&top", self)
-        self.action_stop_server.setEnabled(False)
-        self.action_stop_server.triggered.connect(self._stop_server)
-        server_menu.addAction(self.action_stop_server)
+    def _sync_format_combo_to_current_document(self) -> None:
+        """Point the format combo at the active document's format.
 
-        server_menu.addSeparator()
+        Called from ``_on_editor_tab_changed`` and at startup. We
+        block the combo's ``currentTextChanged`` signal during the
+        assignment so it doesn't fire ``_on_format_combo_changed``
+        for what's effectively a UI update, not a user action.
 
-        self.action_show_dashboard = QAction("Show &Dashboard", self)
-        # Checkable so the menu state mirrors which top-level tab is
-        # active. ``_on_view_tab_changed`` keeps it in sync.
-        self.action_show_dashboard.setCheckable(True)
-        self.action_show_dashboard.setChecked(False)
-        self.action_show_dashboard.setEnabled(False)
-        self.action_show_dashboard.triggered.connect(self._toggle_dashboard_panel)
-        server_menu.addAction(self.action_show_dashboard)
+        If no editor tab is open the combo is left at its previous
+        value — it shouldn't be visible in that state anyway.
+        """
+        current_idx = self.editor_tabs.currentIndex()
+        if current_idx < 0:
+            return
+        editor = self.editor_tabs.widget(current_idx)
+        if editor is None or editor.document is None:
+            return
+        fmt = editor.document.format_type
+        if self.format_combo.currentText() != fmt:
+            self.format_combo.blockSignals(True)
+            try:
+                self.format_combo.setCurrentText(fmt)
+            finally:
+                self.format_combo.blockSignals(False)
 
-        self.action_show_recent = QAction("Show &Recent Activity", self)
-        self.action_show_recent.setEnabled(False)
-        self.action_show_recent.triggered.connect(self._show_recent_activity)
-        server_menu.addAction(self.action_show_recent)
+    def _on_format_combo_changed(self, fmt: str) -> None:
+        """Slot for ``format_combo.currentTextChanged``.
 
-        self.action_open_browser = QAction("Open in &Browser", self)
-        self.action_open_browser.setEnabled(False)
-        self.action_open_browser.triggered.connect(self._open_dashboard_external)
-        server_menu.addAction(self.action_open_browser)
-
-        server_menu.addSeparator()
-
-        self.action_proxy_settings = QAction("&Settings...", self)
-        self.action_proxy_settings.triggered.connect(self._show_proxy_settings)
-        server_menu.addAction(self.action_proxy_settings)
+        The user has picked a new format. Apply it to the current
+        document and re-render the preview.
+        """
+        self._set_current_format(fmt)
 
     def _init_terminal_menu(self) -> None:
-        """Add the Terminal menu between Server and Format.
+        """Add the Terminal menu between Format and Claude.
 
-        Mirrors the conventions of ``_init_server_menu`` — actions stored
-        as ``self.action_*`` and always available (no proxy-state gating).
+        Mirrors the conventions used in ``_init_claude_menu`` — actions
+        stored as ``self.action_*`` and always available (no proxy-state
+        gating).
 
         The Copy / Paste entries use ``QKeySequence.Copy`` /
         ``QKeySequence.Paste`` so the platform-correct shortcuts are
@@ -453,6 +436,13 @@ class MainWindow(QMainWindow):
     def _init_claude_menu(self) -> None:
         """Add the Claude menu between Terminal and Format.
 
+        As of the menu merge, the Claude menu owns everything
+        Claude-related *and* everything that used to be in the Server
+        menu: session creation, proxy lifecycle (Start / Stop Proxy),
+        view toggles (Show Dashboard / Show Recent Activity / Open in
+        Browser), proxy settings, the profile dropdown, and the
+        profile manager.
+
         Pattern mirrors ``_init_terminal_menu``: actions stored as
         ``self.action_*``, all always available (no proxy-state
         gating — Claude sessions auto-start the proxy on demand).
@@ -466,6 +456,7 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
         claude_menu = menubar.addMenu("C&laude")
 
+        # ---- Session actions ------------------------------------------
         self.action_new_claude_session = QAction("&New Claude Session", self)
         self.action_new_claude_session.setShortcut("Ctrl+Alt+C")
         self.action_new_claude_session.triggered.connect(self._new_claude_session)
@@ -478,39 +469,90 @@ class MainWindow(QMainWindow):
 
         claude_menu.addSeparator()
 
-        # ---- Profile dropdown -----------------------------------------
-        # A QMenu inside the Claude menu; populated by
-        # _refresh_profile_menu() on first access and whenever the
-        # profile list changes.
+        # ---- Proxy lifecycle (absorbed from the old Server menu) ------
+        self.action_start_proxy = QAction("Start &Proxy", self)
+        self.action_start_proxy.triggered.connect(self._start_server)
+        claude_menu.addAction(self.action_start_proxy)
+
+        self.action_stop_proxy = QAction("Stop P&roxy", self)
+        self.action_stop_proxy.setEnabled(False)
+        self.action_stop_proxy.triggered.connect(self._stop_server)
+        claude_menu.addAction(self.action_stop_proxy)
+
+        claude_menu.addSeparator()
+
+        # ---- View toggles (absorbed from the old Server menu) ---------
+        # ``Show Dashboard`` is checkable so the menu state mirrors the
+        # currently-active inner tab in the Claude container.
+        self.action_show_dashboard = QAction("Show &Dashboard", self)
+        self.action_show_dashboard.setCheckable(True)
+        self.action_show_dashboard.setChecked(True)
+        self.action_show_dashboard.triggered.connect(self._show_dashboard_panel)
+        claude_menu.addAction(self.action_show_dashboard)
+
+        self.action_show_recent = QAction("Show &Recent Activity", self)
+        self.action_show_recent.setCheckable(True)
+        self.action_show_recent.setChecked(False)
+        self.action_show_recent.triggered.connect(self._show_recent_activity)
+        claude_menu.addAction(self.action_show_recent)
+
+        self.action_open_browser = QAction("Open in &Browser", self)
+        self.action_open_browser.setEnabled(False)
+        self.action_open_browser.triggered.connect(self._open_dashboard_external)
+        claude_menu.addAction(self.action_open_browser)
+
+        claude_menu.addSeparator()
+
+        # ---- Profile submenu ------------------------------------------
+        # "Profile" now hosts three things: the active-profile
+        # switcher (radio group of profile names, Default pinned at
+        # the top), the proxy Settings dialog (the active profile's
+        # bind/port/config_dir/model_endpoints), and the Manage
+        # Profiles list dialog. Settings used to be a top-level
+        # Claude menu item; the user moved it under Profiles because
+        # the proxy's network identity is now a per-profile concern.
         self.profile_menu = QMenu("&Profile", self)
         self.profile_group = QActionGroup(self)
         self.profile_group.setExclusive(True)
         claude_menu.addMenu(self.profile_menu)
 
-        claude_menu.addSeparator()
+        # "Settings…" inside the Profile submenu — edits the active
+        # profile. Now that bind/port/config_dir live on the
+        # profile, this is a thin alias for the profile editor
+        # opened on the active profile.
+        self.action_proxy_settings = QAction("&Settings…", self)
+        self.action_proxy_settings.triggered.connect(self._show_proxy_settings)
+        self.profile_menu.addAction(self.action_proxy_settings)
+
+        self.profile_menu.addSeparator()
 
         self.action_manage_profiles = QAction("&Manage Profiles…", self)
         self.action_manage_profiles.triggered.connect(self._show_profile_editor)
-        claude_menu.addAction(self.action_manage_profiles)
+        self.profile_menu.addAction(self.action_manage_profiles)
 
         # Populate on first show (lazy — avoids spinning up the
         # ProfileStore during cold start when the user might never
-        # open the Claude tab).
+        # open the Claude tab). The switcher goes *below* the
+        # static Settings / Manage entries so the radio list is
+        # always anchored to the bottom of the submenu.
         self.profile_menu.aboutToShow.connect(self._refresh_profile_menu)
 
     def _refresh_profile_menu(self) -> None:
-        """Rebuild the profile dropdown from the on-disk store.
+        """Rebuild the profile radio list from the on-disk store.
 
         Idempotent — called whenever the menu is about to show and
         after every edit. The checkable actions live inside
         ``self.profile_group`` so exactly one is checked (the active
         profile); switching another triggers ``_set_active_profile``.
+
+        The static entries at the top of the submenu (Settings,
+        Manage Profiles) are *not* touched — only the dynamic radio
+        entries below them are rebuilt.
         """
-        # Clear existing actions; tear them out of the group too so
-        # they don't get GC'd while still referenced.
+        # Tear out the existing radio actions from the group + menu.
         for action in list(self.profile_group.actions()):
             self.profile_group.removeAction(action)
-        self.profile_menu.clear()
+            self.profile_menu.removeAction(action)
 
         store = self._profile_store()
         profiles = store.load()
@@ -519,7 +561,10 @@ class MainWindow(QMainWindow):
         )
 
         for p in profiles:
-            act = QAction(p.name, self)
+            label = p.name
+            if getattr(p, "is_default", False) or p.name == "Default":
+                label = f"{p.name}  (default)"
+            act = QAction(label, self)
             act.setCheckable(True)
             act.setChecked(p.name == active_name)
             act.triggered.connect(lambda _checked=False, n=p.name: self._set_active_profile(n))
@@ -684,9 +729,20 @@ class MainWindow(QMainWindow):
             self._close_tab(current_idx)
 
     def _on_editor_tab_changed(self, index: int) -> None:
-        """Handle editor tab change."""
+        """Handle editor tab change.
+
+        Two side effects beyond the preview-pane sync:
+
+        * ``_sync_format_combo_to_current_document`` — the status-bar
+          format selector should reflect the *current* document's
+          format, not the last one the user picked.
+        * The combo's signal is blocked during the sync so a tab
+          switch doesn't trigger an unwanted re-render.
+        """
         if index in self._tab_pairs:
             self.preview_tabs.setCurrentIndex(self._tab_pairs[index])
+        # Keep the format combo pointed at the active document.
+        self._sync_format_combo_to_current_document()
 
     def _on_preview_tab_changed(self, index: int) -> None:
         """Handle preview tab change."""
@@ -694,12 +750,46 @@ class MainWindow(QMainWindow):
         pass
 
     def _apply_view_state(self) -> None:
-        """Apply the current split/preview visibility state to the UI."""
-        show_preview = self.split_enabled and self.preview_visible
-        self.preview_tabs.setVisible(show_preview)
+        """Apply the current split/preview visibility state to the UI.
 
-        if show_preview:
-            # Sync the visible preview tab to the active editor tab
+        The two toggles are independent:
+
+        * ``split_enabled`` controls whether the splitter shows two
+          panes. When on, the right pane (``preview_tabs``) is visible;
+          when off, it's hidden and the splitter collapses to one pane
+          (the editor only).
+        * ``preview_visible`` controls whether the right pane has any
+          content. When on, ``_toggle_preview`` has already ensured a
+          preview tab exists for the current editor; when off, the
+          right pane may be empty (no preview tab has been created
+          yet) — and that's fine, the user is signalling they want the
+          pane space but not the rendered content.
+
+        This decoupling is what lets ``Toggle Split`` work on its own
+        — historically the right pane was only shown when *both* were
+        true, so toggling Split with Preview off did nothing visible.
+        """
+        # Right pane exists iff the split is on. The preview content
+        # is created on demand when Toggle Preview is first enabled.
+        self.preview_tabs.setVisible(self.split_enabled)
+
+        # When the right pane is visible, redistribute the splitter
+        # to a 50/50 split. ``setStretchFactor(1, 1)`` on both children
+        # only governs how the splitter *grows* on resize; it doesn't
+        # initialise the current sizes, so after a hide→show cycle
+        # the right pane would inherit the stale size of the moment it
+        # was hidden (typically 0). Pin the sizes to an even split
+        # every time the right pane becomes visible.
+        if self.split_enabled:
+            total = max(1, self.splitter.width())
+            half = total // 2
+            self.splitter.setSizes([half, total - half])
+
+        # When the right pane is visible and a preview tab exists for
+        # the current editor, sync the preview-tab selection to follow
+        # editor changes — the user expects switching editors to
+        # switch the rendered preview.
+        if self.split_enabled:
             current = self.editor_tabs.currentIndex()
             if current in self._tab_pairs:
                 self.preview_tabs.setCurrentIndex(self._tab_pairs[current])
@@ -709,11 +799,11 @@ class MainWindow(QMainWindow):
 
         Splitting only shows/hides the second (preview) panel. The preview
         preference itself is independent, so toggling split back on restores
-        the preview if it was enabled.
+        the preview if it was enabled. ``_apply_view_state`` redistributes
+        the splitter to a 50/50 split when the right pane becomes visible.
         """
         self.split_enabled = not self.split_enabled
         self.action_toggle_split.setChecked(self.split_enabled)
-        self.tb_toggle_split.setChecked(self.split_enabled)
         self._apply_view_state()
 
     def _toggle_preview(self) -> None:
@@ -724,7 +814,6 @@ class MainWindow(QMainWindow):
             # Preview lives inside the split, so the split must be on
             self.split_enabled = True
             self.action_toggle_split.setChecked(True)
-            self.tb_toggle_split.setChecked(True)
 
             # Ensure the current editor has a preview tab
             current = self.editor_tabs.currentIndex()
@@ -733,19 +822,39 @@ class MainWindow(QMainWindow):
                 self._create_preview_for(current, editor.document)
 
         self.action_toggle_preview.setChecked(self.preview_visible)
-        self.tb_toggle_preview.setChecked(self.preview_visible)
         self._apply_view_state()
 
     def _set_split_orientation(self, orientation: Qt.Orientation) -> None:
         """Set the split orientation (horizontal or vertical)."""
         self.splitter.setOrientation(orientation)
 
-    def _set_format(self, format_type: str) -> None:
-        """Set the current document format."""
+    def _set_current_format(self, format_type: str) -> None:
+        """Set the current document's format and re-render the preview.
+
+        The menu used to call this; the status-bar ``QComboBox`` is now
+        the only caller (see ``_init_status_bar``). The combo fires
+        ``currentTextChanged``; we block the sync signal back into the
+        combo so the assignment doesn't bounce. If no editor tab is
+        active the change is a no-op.
+        """
         current_idx = self.editor_tabs.currentIndex()
-        if current_idx >= 0:
-            editor = self.editor_tabs.widget(current_idx)
-            editor.document.format_type = format_type
+        if current_idx < 0:
+            return
+        editor = self.editor_tabs.widget(current_idx)
+        if editor is None or editor.document is None:
+            return
+        editor.document.format_type = format_type
+        # Trigger a re-render of the preview pane (if the user has
+        # enabled Preview) and a fresh syntax highlighter on the editor.
+        # ``_on_editor_content_changed`` does the preview re-render
+        # using the *current* content; we feed it through directly.
+        self._on_editor_content_changed(current_idx, editor.document)
+        # Update the highlighter — set_format alone doesn't rebind it
+        # for the currently-displayed document. The editor widget
+        # installs the highlighter in ``_update_highlighter`` on focus
+        # changes; safest path is to call the same hook.
+        if hasattr(editor, "_update_highlighter"):
+            editor._update_highlighter()
 
     # ------------------------------------------------------------------
     # Embedded proxy control
@@ -754,28 +863,77 @@ class MainWindow(QMainWindow):
         """Start (or restart) the embedded proxy on its own QThread.
 
         Safe to call when the thread is already running — the early return
-        prevents a double-start. The thread reads its configuration from
-        QSettings so the user can change port/host via the Settings dialog
-        without editing this code.
+        prevents a double-start. The thread's bind address, port, config
+        dir, and model endpoints are read from the **active profile**
+        (the per-profile proxy settings replaced the legacy
+        ``ProxyConfig``). The profile is the single source of truth:
+        switching active profile naturally causes a restart with new
+        routing and bind settings.
         """
         if self.proxy_thread is not None and self.proxy_thread.isRunning():
             return
 
-        cfg = ProxyConfig.load()
-        self.proxy_host = cfg.host
-        self.proxy_port = cfg.port
+        # Resolve the active profile. ``ensure_default`` guarantees we
+        # always have at least one, even on a fresh install.
+        active = self._profile_store().get_active() or self._profile_store().ensure_default()
+        host = active.bind_address or "127.0.0.1"
+        port = int(active.port or 3001)
+        config_dir_path = (
+            Path(active.config_dir) if active.config_dir else None
+        )
+        # ``default_endpoint`` lives in ``claude_settings`` until
+        # Phase 3 (it's not a first-class profile field yet).
+        default_endpoint = ""
+        if isinstance(active.claude_settings, dict):
+            default_endpoint = str(
+                active.claude_settings.get("proxy_default_endpoint", "") or ""
+            )
+        # Flatten ``model_endpoints`` (``dict[str, ModelEndpoint]``) into
+        # ``dict[str, str]`` for the proxy thread — the proxy only
+        # needs upstream URLs at routing time. Each endpoint names
+        # a provider (``provider_name``); the URL is resolved
+        # through ``active.providers`` here. Per-endpoint credential
+        # selection lives on the profile; the session launcher
+        # resolves the right key via ``resolve_api_key``.
+        proxy_endpoints: dict[str, str] = {}
+        providers_map: dict[str, object] = dict(active.providers or {})
+        for model, ep in (active.model_endpoints or {}).items():
+            url: str = ""
+            if isinstance(ep, str):
+                # Legacy: bare URL strings (older profiles pre-dating
+                # the ModelEndpoint/Provider split).
+                url = ep
+            else:
+                provider_name = getattr(ep, "provider_name", None) or ""
+                if provider_name and provider_name in providers_map:
+                    provider = providers_map[provider_name]
+                    url = getattr(provider, "url", "") or ""
+                else:
+                    # ``ep.url`` is a backward-compat fallback — newer
+                    # profiles store ``provider_name`` only, but if
+                    # an endpoint somehow still carries a literal URL
+                    # (e.g. from a half-migrated on-disk file) we
+                    # honour it instead of dropping the route.
+                    url = getattr(ep, "url", "") or ""
+            if url:
+                proxy_endpoints[str(model)] = str(url)
 
-        self.proxy_status_label.setText(f"Proxy: starting on {cfg.base_url}…")
-        self.action_start_server.setEnabled(False)
-        self.action_stop_server.setEnabled(True)
+        self.proxy_host = host
+        self.proxy_port = port
+
+        self.proxy_status_label.setText(
+            f"Proxy: starting on http://{host}:{port}…"
+        )
+        self.action_start_proxy.setEnabled(False)
+        self.action_stop_proxy.setEnabled(True)
 
         thread = ProxyServerThread(
-            host=cfg.host,
-            port=cfg.port,
+            host=host,
+            port=port,
             storage_path=default_db_path(),
-            config_dir=cfg.config_dir_path,
-            model_endpoints=cfg.model_endpoints,
-            default_endpoint=cfg.default_endpoint or None,
+            config_dir=config_dir_path,
+            model_endpoints=proxy_endpoints,
+            default_endpoint=default_endpoint or None,
             parent=self,
         )
         thread.started_ok.connect(self._on_proxy_started)
@@ -794,7 +952,7 @@ class MainWindow(QMainWindow):
         if self.proxy_thread is None:
             return
         self.proxy_status_label.setText("Proxy: stopping…")
-        self.action_stop_server.setEnabled(False)
+        self.action_stop_proxy.setEnabled(False)
         self.proxy_thread.request_stop()
 
     def _on_proxy_started(self, port: int) -> None:
@@ -803,25 +961,23 @@ class MainWindow(QMainWindow):
         # unless we ever expose port=0 in the settings dialog.
         self.proxy_port = port
         self.proxy_status_label.setText(f"Proxy: running on {self.proxy_host}:{port}")
-        self.action_start_server.setEnabled(True)
-        self.action_stop_server.setEnabled(True)
+        self.action_start_proxy.setEnabled(True)
+        self.action_stop_proxy.setEnabled(True)
         self.action_show_dashboard.setEnabled(True)
         self.action_show_recent.setEnabled(True)
         self.action_open_browser.setEnabled(True)
         # Kick off the activity tile's polling against the live proxy.
         if self.activity_tile is not None:
             self.activity_tile.set_base_url(f"http://{self.proxy_host}:{port}")
-        # Same for the Recent Activity tab.
-        if self.recent_activity_view is not None:
-            self.recent_activity_view.set_base_url(f"http://{self.proxy_host}:{port}")
+        # The Claude container owns the dashboard and recent-activity
+        # views; routing the URL through it means the container decides
+        # whether to lazily build the heavy DashboardView.
+        if self.claude_container is not None:
+            self.claude_container.set_base_url(f"http://{self.proxy_host}:{port}")
         self.status.showMessage(
             f"Proxy ready — point Claude Code at http://{self.proxy_host}:{port}",
             5000,
         )
-        # Lazily construct the dashboard view if the user hasn't opened
-        # the tab yet. This avoids the heavy QWebEngineWidgets import
-        # until the server is actually running.
-        self._ensure_dashboard_loaded()
         # Flush any Claude session that was queued while the proxy
         # was starting. The container holds at most one pending
         # launch; if nothing was queued this is a no-op.
@@ -831,8 +987,8 @@ class MainWindow(QMainWindow):
     def _on_proxy_failed(self, msg: str) -> None:
         """Called when the thread or uvicorn fails to start."""
         self.proxy_status_label.setText("Proxy: failed")
-        self.action_start_server.setEnabled(True)
-        self.action_stop_server.setEnabled(False)
+        self.action_start_proxy.setEnabled(True)
+        self.action_stop_proxy.setEnabled(False)
         self.action_show_dashboard.setEnabled(False)
         self.action_show_recent.setEnabled(False)
         self.action_open_browser.setEnabled(False)
@@ -841,17 +997,17 @@ class MainWindow(QMainWindow):
     def _on_proxy_stopped(self) -> None:
         """Called after the lifespan has fully torn down."""
         self.proxy_status_label.setText("Proxy: stopped")
-        self.action_start_server.setEnabled(True)
-        self.action_stop_server.setEnabled(False)
+        self.action_start_proxy.setEnabled(True)
+        self.action_stop_proxy.setEnabled(False)
         self.action_show_dashboard.setEnabled(False)
         self.action_show_recent.setEnabled(False)
         self.action_open_browser.setEnabled(False)
-        self.action_show_dashboard.setChecked(False)
-        # Stop polling — the URL is now invalid.
+        # Stop polling — the URL is now invalid. The container handles
+        # both the dashboard view and the recent-activity view.
         if self.activity_tile is not None:
             self.activity_tile.stop()
-        if self.recent_activity_view is not None:
-            self.recent_activity_view.stop()
+        if self.claude_container is not None:
+            self.claude_container.stop_polling()
         # Drop our reference to the finished QThread. Qt's event loop
         # will then clean up the underlying C++ object on the next pass.
         # Without this, closeEvent later would touch a dangling object.
@@ -862,87 +1018,52 @@ class MainWindow(QMainWindow):
             self._restart_after_stop = False
             QTimer.singleShot(0, self._start_server)
 
-    def _ensure_dashboard_loaded(self) -> None:
-        """Lazy-build the DashboardView inside the Dashboard tab.
-
-        Called only when the proxy has actually started — this avoids
-        loading the heavy QtWebEngine module during cold-start. The
-        placeholder shown in the Dashboard tab stays put until this
-        runs. Subsequent calls just reload the URL with the new port.
-        """
-        if self.proxy_port == 0:
-            # Proxy hasn't started yet; leave the placeholder visible.
-            return
-        if self.dashboard_view is None:
-            self.dashboard_view = DashboardView()
-            self.dashboard_view.url_loaded.connect(
-                lambda url: self.status.showMessage(f"Dashboard loaded: {url}", 3000)
-            )
-            # Swap the placeholder out for the actual web view. Use
-            # deleteLater() so any in-flight QResizeEvent from the
-            # placeholder doesn't fight with the new widget.
-            old = self.dashboard_placeholder
-            self.dashboard_placeholder = self.dashboard_view  # type: ignore[assignment]
-            self.dashboard_layout.replaceWidget(old, self.dashboard_view)
-            old.deleteLater()
-
-        # (Re)point the WebView at the proxy URL — works for both first
-        # use and after a stop/start cycle.
-        self.dashboard_view.set_base_url(f"http://{self.proxy_host}:{self.proxy_port}")
-
     def _focus_proxy_tab(self) -> None:
-        """Bring the proxy's primary tab to the front.
+        """Bring the Claude tab to the front and switch to the inner
+        Dashboard sub-tab.
 
-        Called by the activity tile in the status bar. Prefers the
-        Recent Activity tab if it exists (it's a slimmer, more focused
-        view than the full dashboard); falls back to Dashboard when
-        Recent Activity is unavailable. Documents is the last resort
-        so the click still does something visible if proxy state is
-        stale.
+        Called by the activity tile in the status bar. With the
+        Dashboard now living inside the Claude container, the click
+        surfaces the same primary view it always did.
         """
-        # The attribute only exists once Task #19 ships.
-        recent_idx = getattr(self, "_TAB_INDEX_RECENT_ACTIVITY", None)
-        dashboard_idx = getattr(
-            self, "_TAB_INDEX_DASHBOARD", self._TAB_INDEX_DASHBOARD
-        )
-        if recent_idx is not None and self.view_tabs.widget(recent_idx) is not None:
-            self.view_tabs.setCurrentIndex(recent_idx)
-            return
-        self.view_tabs.setCurrentIndex(dashboard_idx)
+        self.view_tabs.setCurrentIndex(self._TAB_INDEX_CLAUDE)
+        if self.claude_container is not None:
+            self.claude_container.show_dashboard()
 
     def _show_recent_activity(self) -> None:
-        """Slot for Server → Show Recent Activity."""
-        idx = getattr(self, "_TAB_INDEX_RECENT_ACTIVITY", None)
-        if idx is not None:
-            self.view_tabs.setCurrentIndex(idx)
+        """Switch to the Claude tab and select the Recent Activity pane.
 
-    def _toggle_dashboard_panel(self, visible: bool) -> None:
-        """Slot for the Server → Show Dashboard action.
-
-        Switches the top-level view tabs to the Dashboard page. The
-        actual ``DashboardView`` is built by ``_on_proxy_started`` when
-        the proxy signals it's listening; this just switches the tab.
+        Wired to ``Claude → Show Recent Activity`` (was
+        ``Server → Show Recent Activity`` before the menu merge).
         """
-        if visible:
-            self.view_tabs.setCurrentIndex(self._TAB_INDEX_DASHBOARD)
-        else:
-            self.view_tabs.setCurrentIndex(self._TAB_INDEX_DOCUMENTS)
+        self.view_tabs.setCurrentIndex(self._TAB_INDEX_CLAUDE)
+        if self.claude_container is not None:
+            self.claude_container.show_recent_activity()
+
+    def _show_dashboard_panel(self) -> None:
+        """Slot for ``Claude → Show Dashboard``."""
+        self.view_tabs.setCurrentIndex(self._TAB_INDEX_CLAUDE)
+        if self.claude_container is not None:
+            self.claude_container.show_dashboard()
 
     def _on_view_tab_changed(self, index: int) -> None:
-        """Sync the Server → Show Dashboard action with the active tab.
+        """Sync the inner Claude tab state with the active view tab.
 
-        Blocks signals on the action so clicking the menu doesn't
-        recursively drive the tab bar. Also transfers keyboard focus to
-        the visible widget — without this, the QTabBar keeps focus after
-        a click on a tab title and subsequent keystrokes go to it
+        The Claude tab now owns both Dashboard and Recent Activity as
+        inner tabs, so the top-level ``_on_view_tab_changed`` only
+        needs to handle focus transfer (not action-checked state —
+        those actions drive the inner tab via ``_show_*`` above).
+
+        Without the focus transfer the ``QTabBar`` keeps focus after a
+        click on a tab title and subsequent keystrokes go to it
         instead of the visible widget (this is the root cause of
         "typing in the terminal does nothing" when the user clicks the
         Terminals tab).
         """
-        is_dashboard = index == self._TAB_INDEX_DASHBOARD
-        self.action_show_dashboard.blockSignals(True)
-        self.action_show_dashboard.setChecked(is_dashboard)
-        self.action_show_dashboard.blockSignals(False)
+        # Tab-conditional visibility for status-bar permanent widgets.
+        # Format combo lives on Documents; proxy status + activity tile
+        # live on Claude. Terminals shows neither.
+        self._update_status_bar_visibility(index)
 
         # If the Terminals tab just became active, focus the currently
         # selected session's text edit. ``focus_active_session`` is a
@@ -952,7 +1073,9 @@ class MainWindow(QMainWindow):
                 self.terminal_container.focus_active_session()
         # Same for Claude — without the focus transfer, keystrokes
         # after switching tabs would go to the QTabBar (Alt+arrows
-        # become tab-navigation shortcuts, etc.).
+        # become tab-navigation shortcuts, etc.). The container's
+        # focus_active_session is a no-op when the inner tab is one
+        # of the pinned tabs (Dashboard / Recent Activity).
         if index == getattr(self, "_TAB_INDEX_CLAUDE", -1):
             if self.claude_container is not None:
                 self.claude_container.focus_active_session()
@@ -1051,25 +1174,6 @@ class MainWindow(QMainWindow):
             return
         self.terminal_container.shutdown()
         self.status.showMessage("Killed all terminal sessions.", 3000)
-
-    def _show_proxy_settings(self) -> None:
-        """Open the settings dialog; restart the proxy if the user changed settings."""
-        was_running = self.proxy_thread is not None and self.proxy_thread.isRunning()
-        current = ProxyConfig.load()
-        dialog = ProxySettingsDialog(current, parent=self)
-        new_cfg, changed = dialog.exec_and_return()
-        if not changed:
-            return
-        new_cfg.save()
-        if was_running:
-            self.status.showMessage("Restarting proxy with new settings...", 3000)
-            self._stop_server()
-            # Stop is async; wait briefly then start the new instance.
-            # The thread emits stopped() which we already handle; we just
-            # need to know when it's safe to call _start_server again.
-            self._restart_after_stop = True
-        else:
-            self.status.showMessage("Proxy settings saved.", 3000)
 
     # ------------------------------------------------------------------
     # Claude session control
@@ -1181,57 +1285,59 @@ class MainWindow(QMainWindow):
             self._refresh_profile_menu()
 
     def _show_profile_editor(self) -> None:
-        """Open the Manage Profiles dialog.
+        """Open the Manage Profiles list dialog.
 
-        The dialog edits a single profile at a time. To avoid
-        bouncing between dialogs, we use a small "list + edit"
-        pattern: an initial dialog (or a custom sub-dialog)
-        presents a list of profiles plus New / Edit / Delete
-        actions. For v1, we open the editor for the active
-        profile and let the user edit the rest via the dropdown
-        on the way out.
+        Replaces the old "pick one and edit it" flow. The dialog
+        shows every profile, with the Default pinned at the top,
+        and exposes Add / Edit / Delete actions. Edit opens the
+        per-profile editor (:class:`ProfileEditorDialog`).
+        """
+        from src.ui.claude.profile_editor_dialog import ManageProfilesDialog
 
-        A more complete multi-profile manager is Phase 4; for now
-        this gives the user a working path to edit / create
-        profiles without disrupting the menu.
+        store = self._profile_store()
+        dlg = ManageProfilesDialog(store, parent=self)
+        # Snapshot the active profile name so we can detect edits to
+        # the active profile and trigger a proxy restart after the
+        # dialog closes. The dialog itself doesn't restart the proxy
+        # — that's a window-level concern.
+        prev_active = store.get_active_name()
+        was_running = self._is_proxy_running()
+        dlg.exec()
+        # The dialog mutates the store directly; refresh the menu
+        # so the radio group reflects any adds/deletes.
+        self._refresh_profile_menu()
+        new_active = store.get_active_name()
+        # Restart the proxy if the active profile's bind/port/
+        # endpoints/credentials were edited while it was running.
+        if was_running and new_active == prev_active:
+            # Same active profile but the editor may have changed
+            # its bind/port/config_dir/model_endpoints. The cheapest
+            # way to apply is a stop+start cycle.
+            self.status.showMessage(
+                "Restarting proxy to apply profile changes…", 3000
+            )
+            self._restart_after_stop = True
+            self._stop_server()
+
+    def _show_proxy_settings(self) -> None:
+        """Open the active profile's editor.
+
+        Settings used to be a top-level menu item editing the
+        legacy ``ProxyConfig``. After the move to per-profile
+        proxy settings, "Settings…" inside the Profile submenu is
+        just the editor opened on the active profile — the proxy's
+        network identity (bind address, port, config dir) and
+        model routing all live on the profile now.
         """
         store = self._profile_store()
-        profiles = store.load()
-        if not profiles:
-            # No profiles — open editor for a fresh "New Profile"
-            # draft and let the user fill it in.
-            from src.profiles.models import ClaudeProfile, slugify
-
-            draft = ClaudeProfile(
-                name="",
-                slug=slugify(""),
-                model_endpoints={},
-            )
-        else:
-            # Pick which profile to edit. If only one exists, jump
-            # straight into editing it.
-            if len(profiles) == 1:
-                draft = profiles[0]
-            else:
-                names = [p.name for p in profiles]
-                active = store.get_active()
-                current = (
-                    names.index(active.name) if active in profiles else 0
-                )
-                choice, ok = QInputDialog.getItem(
-                    self,
-                    "Manage Profiles",
-                    "Edit which profile?",
-                    names,
-                    current,
-                    False,
-                )
-                if not ok:
-                    return
-                draft = next(p for p in profiles if p.name == choice)
-
+        active = store.get_active()
+        if active is None:
+            active = store.ensure_default()
+        was_running = self._is_proxy_running()
         dlg = ProfileEditorDialog(
-            draft, credential_store=store.credential_store, parent=self
+            copy.deepcopy(active),
+            credential_store=store.credential_store,
+            parent=self,
         )
         if dlg.exec() != dlg.DialogCode.Accepted:
             return
@@ -1241,17 +1347,15 @@ class MainWindow(QMainWindow):
         store.upsert(edited)
         self.status.showMessage(f"Saved profile {edited.name!r}.", 3000)
         self._refresh_profile_menu()
-        # If the proxy is running and we just changed the active
-        # profile's endpoints, the model_endpoints may have drifted —
-        # restart to pick them up.
-        active_name = store.get_active_name()
-        if self._is_proxy_running() and active_name == edited.name:
+        # Apply proxy-level changes: a stop+start cycle picks up the
+        # new bind/port/config_dir/model_endpoints. The new code path
+        # is gated on the proxy actually running, same as before.
+        if was_running:
+            self.status.showMessage(
+                "Restarting proxy to apply profile changes…", 3000
+            )
             self._restart_after_stop = True
             self._stop_server()
-        elif not self._is_proxy_running():
-            # No proxy running — nothing to restart, but the next
-            # session launch will read the updated endpoints.
-            pass
 
     # ------------------------------------------------------------------
     # Window lifecycle
@@ -1263,8 +1367,6 @@ class MainWindow(QMainWindow):
         # — avoids one final httpx call after the port has been released.
         if self.activity_tile is not None:
             self.activity_tile.stop()
-        if self.recent_activity_view is not None:
-            self.recent_activity_view.shutdown()
         if self.terminal_container is not None:
             # Shut down all PTY sessions BEFORE the proxy thread so that
             # any child shells that talk to the proxy get a chance to
@@ -1272,10 +1374,10 @@ class MainWindow(QMainWindow):
             # bounded — same philosophy as the proxy thread teardown.
             self.terminal_container.shutdown()
         if self.claude_container is not None:
-            # Same pattern — Claude Code sessions are PTY children too,
-            # and they hold connections to the proxy. Shutting them
-            # down before the proxy thread tears down avoids stray
-            # asyncio tasks referencing a closed event loop.
+            # Shuts down the Claude Code sessions AND the embedded
+            # recent-activity view (polling). The dashboard view is
+            # lazy and belongs to the container; if it was never built
+            # nothing needs to be torn down.
             self.claude_container.shutdown()
         if thread is not None and thread.isRunning():
             thread.request_stop()

@@ -27,7 +27,13 @@ from dataclasses import asdict
 from pathlib import Path
 
 from src.profiles.credential_store import CredentialStore
-from src.profiles.models import ClaudeProfile, Subagent, slugify
+from src.profiles.models import (
+    ClaudeProfile,
+    ModelEndpoint,
+    Provider,
+    Subagent,
+    slugify,
+)
 
 
 SCHEMA_VERSION = 1
@@ -77,24 +83,22 @@ class ProfileStore:
         """Read all profiles from disk.
 
         Performs the first-launch migration if applicable — see the
-        module docstring. Returns an empty list when the file is
-        missing AND no legacy data exists; otherwise seeds a
-        ``"Default"`` profile from the legacy ``ProxyConfig``
-        ``model_endpoints``.
+        module docstring. Always materialises a ``"Default"`` profile
+        (the seed function does this whether or not legacy data
+        exists). The returned list is ordered: ``Default`` first,
+        then everything else in their on-disk order.
         """
         data = self._read_raw()
         if data is None:
-            # First launch (or someone deleted the file). Try the
-            # migration; if no legacy data, start empty so the user
-            # creates profiles intentionally via the Manage Profiles
-            # dialog. We deliberately don't seed a "Default" when
-            # there's no legacy data — silently materialising an
-            # empty profile would be confusing in the menu.
+            # First launch (or someone deleted the file). Always
+            # seed a "Default" profile — the user expects it to be
+            # there, and it acts as the template for new profiles.
             seeded = self._seed_from_legacy_or_default()
             self._save_raw(seeded)
             profiles = self._parse_profiles(seeded["profiles"])
-            return self._dedup_slugs(profiles)
+            return self._ensure_default_present(profiles)
         profiles = self._parse_profiles(data.get("profiles", []))
+        profiles = self._ensure_default_present(profiles)
         return self._dedup_slugs(profiles)
 
     def get_active_name(self) -> str | None:
@@ -190,14 +194,46 @@ class ProfileStore:
     def delete(self, name: str) -> None:
         """Remove the named profile.
 
-        No-op if it doesn't exist. If the deleted profile was active,
-        the next ``load()`` picks a new active (first remaining).
+        No-op if it doesn't exist. The ``Default`` profile is
+        non-deletable — a UI bug or a manual ``profiles.json``
+        edit shouldn't be able to remove the template profile.
+        If the deleted profile was active, the next ``load()`` picks
+        a new active (first remaining).
         """
+        if name == DEFAULT_PROFILE_NAME:
+            # Belt-and-braces: the Manage Profiles dialog disables
+            # the Delete button, but guard the underlying API too.
+            return
         profiles = self.load()
         kept = [p for p in profiles if p.name != name]
         if len(kept) == len(profiles):
             return
         self.save(kept, active_name=None)  # let save() pick a new active
+
+    def ensure_default(self) -> ClaudeProfile:
+        """Return the Default profile, creating one if it doesn't exist.
+
+        Used by the ``Manage Profiles`` "Add New" flow to guarantee
+        there's always a template to seed from, even if the user
+        somehow deleted the on-disk file. The returned profile is
+        also persisted (as a defensive save) so a follow-up call
+        to ``upsert`` of a "new profile seeded from default" works
+        without a write race.
+        """
+        profiles = self.load()
+        for p in profiles:
+            if p.name == DEFAULT_PROFILE_NAME:
+                return p
+        # Fall back to a brand-new seed (no legacy data here; we've
+        # already read the file once).
+        default = ClaudeProfile(
+            name=DEFAULT_PROFILE_NAME,
+            slug=slugify(DEFAULT_PROFILE_NAME),
+            is_default=True,
+        )
+        profiles.append(default)
+        self.save(profiles, active_name=DEFAULT_PROFILE_NAME)
+        return default
 
     # ---- internals ---------------------------------------------------------
 
@@ -233,32 +269,92 @@ class ProfileStore:
     def _seed_from_legacy_or_default(self) -> dict:
         """First-launch seed.
 
-        Only materialises a ``"Default"`` profile when there's
-        legacy ``ProxyConfig.model_endpoints`` to migrate. An empty
-        ``profiles.json`` otherwise — the user creates profiles
-        intentionally via the UI.
+        Always materialises a ``"Default"`` profile — the user
+        expects there to be a default at the top of the list that
+        can't be deleted, and which acts as the template for new
+        profiles. If there's legacy ``ProxyConfig`` data to migrate
+        (host / port / config_dir / model_endpoints / default_endpoint)
+        we copy it into the Default profile; otherwise the Default
+        profile starts with the dataclass defaults.
+
+        Legacy ``model_endpoints`` are bare ``{model: url}`` strings.
+        We dedup the URLs into :class:`Provider` records keyed by a
+        slug of the URL host (or the URL itself when it can't be
+        parsed) and have each endpoint reference its provider by
+        name. The post-migration shape matches what the editor
+        writes, so a freshly-seeded profile opens cleanly in the
+        new "Model Configuration" tab.
         """
-        endpoints: dict[str, str] = {}
+        providers: dict[str, Provider] = {}
+        endpoints: dict[str, ModelEndpoint] = {}
+        bind_address = "127.0.0.1"
+        port = 3001
+        config_dir = ""
+        default_endpoint = ""
         if self._legacy_proxy_config_provider is not None:
             try:
                 cfg = self._legacy_proxy_config_provider()
-                endpoints = dict(getattr(cfg, "model_endpoints", {}) or {})
+                raw_endpoints = dict(getattr(cfg, "model_endpoints", {}) or {})
+                # Build provider records first (one per unique URL).
+                # ``_url_to_provider_name`` derives a stable name from
+                # the URL host so two URLs that happen to share a host
+                # collapse into a single provider (good — they
+                # probably are the same service).
+                url_to_name: dict[str, str] = {}
+                for url in raw_endpoints.values():
+                    if not url:
+                        continue
+                    url_s = str(url)
+                    if url_s not in url_to_name:
+                        url_to_name[url_s] = _url_to_provider_name(
+                            url_s, taken=set(providers.keys())
+                        )
+                        providers[url_to_name[url_s]] = Provider(
+                            name=url_to_name[url_s],
+                            url=url_s,
+                        )
+                # Now build endpoint records that name their provider.
+                for model, url in raw_endpoints.items():
+                    if not url:
+                        continue
+                    url_s = str(url)
+                    endpoints[str(model)] = ModelEndpoint(
+                        provider_name=url_to_name[url_s],
+                    )
+                bind_address = str(getattr(cfg, "host", "127.0.0.1") or "127.0.0.1")
+                try:
+                    port = int(getattr(cfg, "port", 3001) or 3001)
+                except (TypeError, ValueError):
+                    port = 3001
+                config_dir = str(getattr(cfg, "config_dir", "") or "")
+                default_endpoint = str(getattr(cfg, "default_endpoint", "") or "")
             except Exception:  # noqa: BLE001 — never let migration break startup
+                providers = {}
                 endpoints = {}
-        profiles: list[dict] = []
-        active: str | None = None
-        if endpoints:
-            default = ClaudeProfile(
-                name=DEFAULT_PROFILE_NAME,
-                slug=slugify(DEFAULT_PROFILE_NAME),
-                model_endpoints=endpoints,
-            )
-            profiles = [_serialize_profile(default)]
-            active = default.name
+        default_kwargs: dict = {
+            "name": DEFAULT_PROFILE_NAME,
+            "slug": slugify(DEFAULT_PROFILE_NAME),
+            "providers": providers,
+            "model_endpoints": endpoints,
+            "bind_address": bind_address,
+            "port": port,
+            "config_dir": config_dir,
+            "is_default": True,
+        }
+        # ``default_endpoint`` isn't a first-class profile field yet —
+        # the proxy still reads it from ProxyConfig (the live migration
+        # to per-profile default_endpoint is a future step). Stash it
+        # as a Claude Code settings key for now so the value isn't
+        # silently dropped.
+        if default_endpoint:
+            default_kwargs["claude_settings"] = {
+                "proxy_default_endpoint": default_endpoint,
+            }
+        default = ClaudeProfile(**default_kwargs)
         return {
             "schema_version": SCHEMA_VERSION,
-            "active_profile": active,
-            "profiles": profiles,
+            "active_profile": default.name,
+            "profiles": [_serialize_profile(default)],
         }
 
     @staticmethod
@@ -303,6 +399,40 @@ class ProfileStore:
             out.append(p)
         return out
 
+    @staticmethod
+    def _ensure_default_present(
+        profiles: list[ClaudeProfile],
+    ) -> list[ClaudeProfile]:
+        """Return ``profiles`` with the Default profile at index 0.
+
+        If no Default profile is on disk, create a fresh one with
+        dataclass defaults and prepend it. The Default profile is
+        the template for new profiles and the always-visible anchor
+        of the profile list — it must always be present, and it
+        must be at the top so the UI doesn't have to special-case
+        ordering.
+        """
+        for i, p in enumerate(profiles):
+            if p.name == DEFAULT_PROFILE_NAME:
+                # Move to the front; preserve the rest of the order.
+                if i != 0:
+                    profiles = [p, *profiles[:i], *profiles[i + 1:]]
+                # ``is_default`` may have been forgotten on a manual
+                # JSON edit; re-assert it here so the Manage Profiles
+                # dialog can use the flag reliably.
+                if not getattr(p, "is_default", False):
+                    p = copy.copy(p)
+                    p.is_default = True
+                    profiles[0] = p
+                return profiles
+        # No Default on disk — fabricate one with defaults.
+        default = ClaudeProfile(
+            name=DEFAULT_PROFILE_NAME,
+            slug=slugify(DEFAULT_PROFILE_NAME),
+            is_default=True,
+        )
+        return [default, *profiles]
+
     @property
     def path(self) -> Path:
         return self._path
@@ -311,10 +441,54 @@ class ProfileStore:
 # ---- (de)serialisation helpers --------------------------------------------
 
 
+def _url_to_provider_name(url: str, *, taken: set[str]) -> str:
+    """Derive a stable provider name from a URL.
+
+    Used by :meth:`ProfileStore._seed_from_legacy_or_default` to
+    collapse legacy ``{model: url}`` records into named providers.
+    The host portion of the URL is preferred (``api.anthropic.com``
+    → ``"Anthropic"`` is too speculative, so we use ``"api-anthropic-com"``
+    — a slug the user can rename in the editor if they like). When
+    the URL can't be parsed we fall back to a hash-derived slug so
+    the name is still stable and unique.
+
+    ``taken`` is the set of provider names already in use so the
+    returned name is unique within the seeding pass — collisions get
+    a numeric suffix.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001 — defensive: bad URL shouldn't crash seed
+        parsed = None
+    host = (parsed.hostname if parsed else "") or ""
+    if host:
+        # ``api.anthropic.com`` → ``api-anthropic-com``. Lowercase +
+        # dashes; collapse repeated dashes.
+        import re as _re
+        slug = _re.sub(r"[^a-z0-9-]+", "-", host.lower())
+        slug = _re.sub(r"-+", "-", slug).strip("-") or "provider"
+    else:
+        # URL had no recognisable host (e.g. local path) — use the
+        # URL itself, slugified.
+        import re as _re
+        slug = _re.sub(r"[^a-z0-9-]+", "-", url.lower())
+        slug = _re.sub(r"-+", "-", slug).strip("-") or "provider"
+    base = slug
+    n = 2
+    candidate = base
+    while candidate in taken:
+        candidate = f"{base}-{n}"
+        n += 1
+    return candidate
+
+
 def _serialize_profile(p: ClaudeProfile) -> dict:
     d = asdict(p)
-    # ``asdict`` recursively converts Subagent dataclasses too; that's
-    # what we want — drop the ``None`` fields so the JSON stays tidy.
+    # ``asdict`` recursively converts Subagent + ModelEndpoint +
+    # Provider dataclasses too — drop None fields on each so the JSON
+    # stays tidy.
     subagents = []
     for sa in d.get("subagents", []):
         if not isinstance(sa, dict):
@@ -322,13 +496,53 @@ def _serialize_profile(p: ClaudeProfile) -> dict:
         sa = {k: v for k, v in sa.items() if v is not None}
         subagents.append(sa)
     d["subagents"] = subagents
+    raw_providers = d.get("providers") or {}
+    if not isinstance(raw_providers, dict):
+        raw_providers = {}
+    providers_out: dict[str, dict] = {}
+    for name, prov in raw_providers.items():
+        if isinstance(prov, dict):
+            prov_d = {k: v for k, v in prov.items() if v is not None}
+        else:
+            continue
+        # ``name`` + ``url`` are required; ``name`` is the dict key.
+        if prov_d.get("url"):
+            providers_out[str(name)] = prov_d
+    d["providers"] = providers_out
+    raw_endpoints = d.get("model_endpoints") or {}
+    if not isinstance(raw_endpoints, dict):
+        raw_endpoints = {}
+    endpoints_out: dict[str, dict] = {}
+    for model, ep in raw_endpoints.items():
+        if isinstance(ep, dict):
+            ep_d = {k: v for k, v in ep.items() if v is not None}
+        else:
+            ep_d = {"url": str(ep)}
+        # ``provider_name`` is required (or legacy ``url``); ``key_ref``
+        # is optional and dropped when None. ``url`` is only retained
+        # for the legacy shape — the new shape uses ``provider_name``.
+        if "provider_name" in ep_d:
+            if ep_d.get("provider_name"):
+                endpoints_out[str(model)] = ep_d
+        elif ep_d.get("url"):
+            endpoints_out[str(model)] = ep_d
+    d["model_endpoints"] = endpoints_out
     # Drop empty optional fields so the JSON doesn't carry noise.
     if d.get("default_model") is None:
         d.pop("default_model", None)
-    if d.get("api_key_ref") is None:
-        d.pop("api_key_ref", None)
     if d.get("session_cwd") is None:
         d.pop("session_cwd", None)
+    # Keep the proxy-side fields only when they differ from the
+    # dataclass defaults — most profiles will inherit them and the
+    # file stays compact.
+    if d.get("bind_address") == "127.0.0.1":
+        d.pop("bind_address", None)
+    if d.get("port") == 3001:
+        d.pop("port", None)
+    if not d.get("config_dir"):
+        d.pop("config_dir", None)
+    if d.get("is_default") is False:
+        d.pop("is_default", None)
     return d
 
 
@@ -337,16 +551,65 @@ def _deserialize_profile(d: dict) -> ClaudeProfile:
     if not name:
         raise ValueError("profile missing name")
     slug = str(d.get("slug") or "").strip() or slugify(name)
+    raw_providers = d.get("providers") or {}
+    if not isinstance(raw_providers, dict):
+        raw_providers = {}
+    providers: dict[str, Provider] = {}
+    for prov_name, raw in raw_providers.items():
+        if not isinstance(raw, dict):
+            continue
+        prov_url = raw.get("url")
+        if not prov_url:
+            continue
+        # The key in the dict IS the provider's stable name. If the
+        # inner ``name`` field disagrees, prefer the key (it's the
+        # canonical identifier and the dict key under which endpoints
+        # will look the provider up).
+        providers[str(prov_name)] = Provider(
+            name=str(prov_name),
+            url=str(prov_url),
+        )
     raw_endpoints = d.get("model_endpoints") or {}
     if not isinstance(raw_endpoints, dict):
         raw_endpoints = {}
-    endpoints = {str(k): str(v) for k, v in raw_endpoints.items() if v}
+    # Accept four shapes:
+    #   - new: {"model": {"provider_name": "...", "key_ref": "..."}}
+    #   - transitional: {"model": {"provider_name": "..."}}
+    #   - older: {"model": {"url": "...", "key_ref": "..."}}
+    #   - legacy flat-string: {"model": "https://..."} (pre-ModelEndpoint)
+    endpoints: dict[str, ModelEndpoint] = {}
+    for model, raw in raw_endpoints.items():
+        if isinstance(raw, dict):
+            key_ref = raw.get("key_ref")
+            provider_name = raw.get("provider_name")
+            if provider_name:
+                endpoints[str(model)] = ModelEndpoint(
+                    provider_name=str(provider_name),
+                    key_ref=(str(key_ref) if key_ref is not None else None),
+                )
+            else:
+                url = raw.get("url")
+                if not url:
+                    continue
+                # Older shape: endpoints carried a literal URL. Treat
+                # that URL's host portion as the provider name (and
+                # auto-create the provider on the fly) so the profile
+                # round-trips without throwing away the routing info.
+                # The on-disk providers dict is still empty — the
+                # editor will surface this and let the user re-attach
+                # the endpoint to a named provider on first edit.
+                endpoints[str(model)] = ModelEndpoint(
+                    provider_name="",
+                    key_ref=(str(key_ref) if key_ref is not None else None),
+                )
+        elif raw:
+            # Legacy flat-string: bare URL. Same shape as above — the
+            # endpoint carries an empty ``provider_name`` until the
+            # user attaches it on first edit.
+            endpoints[str(model)] = ModelEndpoint(provider_name="")
     default_model = d.get("default_model")
     if default_model is not None:
         default_model = str(default_model) or None
-    api_key_ref = d.get("api_key_ref")
-    if api_key_ref is not None:
-        api_key_ref = str(api_key_ref) or None
     env_vars_raw = d.get("env_vars") or {}
     if not isinstance(env_vars_raw, dict):
         env_vars_raw = {}
@@ -373,14 +636,34 @@ def _deserialize_profile(d: dict) -> ClaudeProfile:
     session_cwd = d.get("session_cwd")
     if session_cwd is not None:
         session_cwd = str(session_cwd) or None
+    bind_address = d.get("bind_address")
+    if bind_address is not None:
+        bind_address = str(bind_address) or "127.0.0.1"
+    else:
+        bind_address = "127.0.0.1"
+    raw_port = d.get("port")
+    try:
+        port = int(raw_port) if raw_port is not None else 3001
+    except (TypeError, ValueError):
+        port = 3001
+    config_dir = d.get("config_dir")
+    if config_dir is not None:
+        config_dir = str(config_dir) or ""
+    else:
+        config_dir = ""
+    is_default = bool(d.get("is_default", False))
     return ClaudeProfile(
         name=name,
         slug=slug,
+        providers=providers,
         model_endpoints=endpoints,
         default_model=default_model,
-        api_key_ref=api_key_ref,
         env_vars=env_vars,
         claude_settings=settings_raw,
         subagents=subagents,
         session_cwd=session_cwd,
+        bind_address=bind_address,
+        port=port,
+        config_dir=config_dir,
+        is_default=is_default,
     )

@@ -134,14 +134,18 @@ def test_credential_store_corrupt_file_treated_as_empty():
 
 
 def _make_profile(name: str = "Test") -> "ClaudeProfile":
-    from src.profiles import ClaudeProfile
+    from src.profiles import ClaudeProfile, ModelEndpoint, Provider
 
     return ClaudeProfile(
         name=name,
         slug=name.lower(),
-        model_endpoints={"claude-opus-4-8": "https://api.example.com"},
+        providers={
+            "default": Provider(name="default", url="https://api.example.com"),
+        },
+        model_endpoints={
+            "claude-opus-4-8": ModelEndpoint(provider_name="default"),
+        },
         default_model="claude-opus-4-8",
-        api_key_ref="default-key",
         env_vars={"FOO": "bar"},
     )
 
@@ -154,16 +158,26 @@ def test_profile_store_roundtrip():
     p = _make_profile("Alice")
     store.upsert(p)
     loaded = store.load()
-    assert len(loaded) == 1
-    assert loaded[0].name == "Alice"
-    assert loaded[0].model_endpoints == p.model_endpoints
-    assert loaded[0].env_vars == p.env_vars
-    assert store.get_active_name() == "Alice"
+    # ``load()`` always materialises a Default profile (the user
+    # contract: there's always a default at the top of the list),
+    # so the persisted list now contains both the Default and Alice.
+    assert len(loaded) == 2
+    assert loaded[0].name == "Default", (
+        f"Default profile should be at index 0, got {loaded[0].name!r}"
+    )
+    by_name = {p.name: p for p in loaded}
+    assert by_name["Alice"].model_endpoints == p.model_endpoints
+    assert by_name["Alice"].env_vars == p.env_vars
+    # The Default profile stays active when a new profile is added —
+    # the user opts in by switching via the menu. This matches the
+    # "seeded from default" semantics: a new profile is just a
+    # starting point, not an auto-activation.
+    assert store.get_active_name() == "Default"
     print("✓ ProfileStore save/load roundtrip preserves fields")
 
 
 def test_profile_store_migration_seeds_default_from_legacy_config():
-    from src.profiles import ProfileStore
+    from src.profiles import ModelEndpoint, ProfileStore
 
     base = _tmp_dir()
 
@@ -181,10 +195,13 @@ def test_profile_store_migration_seeds_default_from_legacy_config():
     profiles = store.load()
     assert len(profiles) == 1
     assert profiles[0].name == "Default"
-    assert (
-        profiles[0].model_endpoints
-        == _FakeCfg.model_endpoints
-    )
+    # Legacy model_endpoints become providers (one per unique URL)
+    # plus endpoints referencing them by name. The keys survive
+    # verbatim and route through the new ``provider_name`` indirection.
+    assert profiles[0].model_endpoints == {
+        "claude-opus-4-8": ModelEndpoint(provider_name="api-anthropic-com"),
+        "claude-sonnet-4-6": ModelEndpoint(provider_name="api-example-com"),
+    }
     # Active profile should be Default after migration.
     assert store.get_active_name() == "Default"
     print("✓ ProfileStore seeds Default from legacy ProxyConfig on first launch")
@@ -222,8 +239,9 @@ def test_profile_store_upsert_replaces_existing():
     edited.env_vars = {"FOO": "updated"}
     store.upsert(edited)
     profiles = store.load()
-    assert len(profiles) == 1
-    assert profiles[0].env_vars == {"FOO": "updated"}
+    # Default is auto-prepended; Alpha is the only user profile.
+    by_name = {p.name: p for p in profiles}
+    assert by_name["Alpha"].env_vars == {"FOO": "updated"}
     print("✓ ProfileStore.upsert replaces by name")
 
 
@@ -237,9 +255,10 @@ def test_profile_store_delete_promotes_remaining_to_active():
     store.set_active("First")
     assert store.get_active_name() == "First"
     store.delete("First")
-    # Active should now be Second (the only one left).
-    assert store.get_active_name() == "Second"
-    print("✓ ProfileStore.delete promotes remaining profile to active")
+    # With Default always present, the new active is the first
+    # remaining profile — which is "Default" (the always-on template).
+    assert store.get_active_name() == "Default"
+    print("✓ ProfileStore.delete falls back to Default as active")
 
 
 def test_profile_store_dedups_duplicate_slugs():
@@ -251,8 +270,9 @@ def test_profile_store_dedups_duplicate_slugs():
     store.upsert(_make_profile("My-Profile"))  # same slug after slugify
     store.upsert(_make_profile("my profile"))  # same slug again
     profiles = store.load()
-    slugs = [p.slug for p in profiles]
-    assert len(profiles) == 3
+    # Default is auto-prepended in addition to the three user profiles.
+    slugs = [p.slug for p in profiles if p.name != "Default"]
+    assert len(slugs) == 3
     assert len(set(slugs)) == 3, f"slugs collided: {slugs}"
     print("✓ ProfileStore dedups duplicate slugs (preserves name, suffixes slug)")
 
@@ -456,7 +476,7 @@ def test_env_builder_starts_from_os_environ_copy():
 def test_env_builder_sentinel_when_no_key():
     from src.profiles import ClaudeProfile, SENTINEL_API_KEY, build_claude_session_env
 
-    p = ClaudeProfile(name="P", slug="p", model_endpoints={}, api_key_ref=None)
+    p = ClaudeProfile(name="P", slug="p", model_endpoints={})
     env = build_claude_session_env(
         profile=p,
         proxy_base_url="http://127.0.0.1:3001",

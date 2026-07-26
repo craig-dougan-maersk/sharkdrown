@@ -7,6 +7,7 @@ This module initializes the Qt application and launches the main window.
 import os
 import sys
 from pathlib import Path
+from src.config import APP_TITLE, APP_NAME, APP_ORG
 
 # Configure QtWebEngine BEFORE importing any PySide6 widgets. Chromium
 # reads these flags at process start to decide whether to spin up a GPU
@@ -32,9 +33,9 @@ def main() -> None:
     #   Linux:   ~/.local/share/Sharkdrown/PandasMarkdownEditor/
     #   macOS:   ~/Library/Application Support/Sharkdrown/PandasMarkdownEditor/
     #   Windows: %APPDATA%/Sharkdrown/PandasMarkdownEditor/
-    app.setOrganizationName("Sharkdrown")
-    app.setApplicationName("PandasMarkdownEditor")
-    app.setApplicationDisplayName("Pandas Markdown Editor")
+    app.setOrganizationName(APP_ORG)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_TITLE)
     app.setApplicationVersion("0.1.0")
 
     # Set the application icon if available

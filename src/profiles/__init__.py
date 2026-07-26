@@ -3,8 +3,10 @@
 Public surface
 --------------
 - :class:`ClaudeProfile` — one profile's worth of configuration
-- :class:`ModelEndpoint` — upstream URL for a single model (per-model
-  credentials are deferred to Phase 3; v1 shares one key per profile)
+- :class:`ModelEndpoint` — model → named :class:`Provider` with an
+  optional credential ref
+- :class:`Provider` — a named upstream service (e.g. "Anthropic",
+  "MiniMax") and its base URL
 - :class:`Subagent` — one ``agents/<name>.md`` entry's worth of frontmatter
 - :func:`slugify` — derive a filesystem-safe slug from a profile name
 - :class:`CredentialStore` — read/write API keys (chmod 600 JSON)
@@ -19,10 +21,12 @@ from src.profiles.credential_store import CredentialStore
 from src.profiles.env_builder import (
     INFRA_ENV_VARS,
     build_claude_session_env,
+    resolve_api_key,
 )
 from src.profiles.models import (
     ClaudeProfile,
     ModelEndpoint,
+    Provider,
     Subagent,
     slugify,
 )
@@ -40,10 +44,12 @@ __all__ = [
     "INFRA_ENV_VARS",
     "ModelEndpoint",
     "ProfileStore",
+    "Provider",
     "SCHEMA_VERSION",
     "SENTINEL_API_KEY",
     "Subagent",
     "build_claude_session_env",
+    "resolve_api_key",
     "slugify",
     "write_profile_config",
 ]

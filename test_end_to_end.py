@@ -1,17 +1,17 @@
 """End-to-end test: start the proxy via the UI button, hit it, then stop.
 
-Simulates the user clicking Server → Start, waits for the proxy to be
+Simulates the user clicking Claude → Start Proxy, waits for the proxy to be
 listening, makes a couple of HTTP requests against the embedded server,
-and then simulates Server → Stop. This exercises the full signal flow:
+and then simulates Claude → Stop Proxy. This exercises the full signal flow:
 
-    click Start
+    click Start Proxy
       → MainWindow._start_server creates ProxyServerThread
       → thread.start() → QThread.run() → asyncio.run(self._serve())
         → uvicorn binds, lifespan opens SQLite, started_ok signal fires
       → MainWindow._on_proxy_started enables dashboard action
     HTTP GET /health → 200
     HTTP GET /v1/models → 200, empty list
-    click Stop
+    click Stop Proxy
       → MainWindow._stop_server → thread.request_stop()
         → uvicorn drains, lifespan finally closes SQLite, stopped signal fires
       → MainWindow._on_proxy_stopped resets UI state
@@ -82,20 +82,45 @@ def main() -> None:
 
     # Pick a free port so we don't clash with anything else.
     port = _find_free_port()
-    s.setValue("proxy/host", "127.0.0.1")
-    s.setValue("proxy/port", port)
     s.setValue("proxy/autostart", False)
     s.sync()
+
+    # The proxy's bind/port now live on the *active profile*, not on
+    # the legacy ``ProxyConfig`` QSettings keys. Wire the test's
+    # chosen port onto the active profile so the thread picks it up.
+    from src.profiles.models import ModelEndpoint, Provider
+    from src.profiles.store import ProfileStore
+    from src.proxy.paths import data_dir
+
+    profiles_path = data_dir() / "profiles.json"
+    store = ProfileStore(path=profiles_path)
+    active = store.get_active() or store.ensure_default()
+    active.bind_address = "127.0.0.1"
+    active.port = port
+    # Endpoints now reference a provider by name; the provider
+    # carries the URL. Seed a default provider + one endpoint so
+    # the proxy has a routing target — the test doesn't actually
+    # fire requests through a particular model, but the proxy
+    # refuses to start with zero endpoints.
+    if not active.providers:
+        active.providers = {
+            "default": Provider(name="default", url="https://api.anthropic.com"),
+        }
+    if not active.model_endpoints:
+        active.model_endpoints = {
+            "claude-opus-4-8": ModelEndpoint(provider_name="default"),
+        }
+    store.upsert(active)
 
     window = MainWindow()
     window.show()
     print(f"✓ MainWindow created (proxy port will be {port})")
 
-    # ---- Click Server → Start -------------------------------------------
-    assert window.action_start_server.isEnabled(), "Start should be enabled initially"
-    assert not window.action_stop_server.isEnabled()
-    window.action_start_server.trigger()
-    print("✓ triggered Server → Start")
+    # ---- Click Claude → Start Proxy ------------------------------------
+    assert window.action_start_proxy.isEnabled(), "Start Proxy should be enabled initially"
+    assert not window.action_stop_proxy.isEnabled()
+    window.action_start_proxy.trigger()
+    print("✓ triggered Claude → Start Proxy")
 
     # Wait for the started_ok signal to be delivered to the slot
     # (_on_proxy_started) which enables the dashboard action.
@@ -129,33 +154,39 @@ def main() -> None:
 
     # ---- Toggle the dashboard tab on -----------------------------------
     assert window.action_show_dashboard.isEnabled(), "Show Dashboard should be enabled"
-    # The DashboardView is built eagerly in _on_proxy_started so the URL
-    # can be pointed at the bound port. The view is hosted in the
-    # top-level "Dashboard" tab; switching to that tab makes it fill the
-    # window (the previous dock-based design only gave it part of it).
-    assert window.dashboard_view is not None, "dashboard view should exist after start"
-    assert window.dashboard_view.base_url() == f"http://127.0.0.1:{port}"
-    # Tab structure: two top-level tabs, "Documents" and "Dashboard".
-    assert window.view_tabs.count() == 2
-    assert window.view_tabs.tabText(1) == "Dashboard"
+    # The DashboardView is built lazily in the Claude container's
+    # set_base_url() the first time the proxy comes up. The view is
+    # hosted inside the Claude container's nested tab strip.
+    claude_container = window.claude_container
+    assert claude_container.dashboard_view is not None, (
+        "dashboard view should exist after start"
+    )
+    assert claude_container.dashboard_view.base_url() == f"http://127.0.0.1:{port}"
+    # Top-level tab structure: Documents, Terminals, Claude.
+    assert window.view_tabs.count() == 3
+    assert window.view_tabs.tabText(0) == "Documents"
+    assert window.view_tabs.tabText(1) == "Terminals"
+    assert window.view_tabs.tabText(2) == "Claude"
     print(f"✓ dashboard view built and pointed at http://127.0.0.1:{port}")
 
-    # Switch to the Dashboard tab and verify the menu action syncs.
-    window.view_tabs.setCurrentIndex(1)
+    # Trigger the Show Dashboard action — it should switch to the
+    # Claude tab and select the inner Dashboard sub-tab.
+    window.action_show_dashboard.trigger()
     _spin(app, 0.2)
-    assert window.action_show_dashboard.isChecked(), (
-        "Show Dashboard action should sync with active tab"
+    assert window.view_tabs.currentIndex() == window._TAB_INDEX_CLAUDE
+    assert claude_container.tabs.currentIndex() == 0, (
+        "Show Dashboard should select the inner Dashboard tab (index 0)"
     )
-    print("✓ Show Dashboard action syncs with tab bar")
+    print("✓ Show Dashboard action switches to inner Dashboard tab")
 
-    # ---- Click Server → Stop --------------------------------------------
+    # ---- Click Claude → Stop Proxy --------------------------------------
     # Give uvicorn's main_loop a chance to actually start polling
     # should_exit. In real desktop usage the user has the proxy running
     # for many seconds before clicking Stop, so this is a test artifact,
     # not a real-world bug. We spin the event loop for 1s.
     _spin(app, 1.0)
-    window.action_stop_server.trigger()
-    print("✓ triggered Server → Stop")
+    window.action_stop_proxy.trigger()
+    print("✓ triggered Claude → Stop Proxy")
     # Wait for stopped signal: the status label flips back to "stopped"
     # after _on_proxy_stopped runs.
     ok = _wait_for(
@@ -172,8 +203,8 @@ def main() -> None:
     assert not window.action_open_browser.isEnabled()
 
     # ---- Verify the dashboard view is preserved across stop ------
-    assert window.dashboard_view is not None
-    assert window.view_tabs.count() == 2
+    assert claude_container.dashboard_view is not None
+    assert window.view_tabs.count() == 3
     print("✓ dashboard view preserved across stop")
 
     # ---- Clean shutdown -------------------------------------------------

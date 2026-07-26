@@ -27,6 +27,7 @@ import os
 import warnings
 from typing import Mapping
 
+from src.profiles.credential_store import CredentialStore
 from src.profiles.models import ClaudeProfile
 from src.profiles.store import SENTINEL_API_KEY
 
@@ -46,6 +47,42 @@ INFRA_ENV_VARS: frozenset[str] = frozenset(
         "COLORTERM",
     }
 )
+
+
+def resolve_api_key(
+    profile: ClaudeProfile,
+    credential_store: CredentialStore,
+) -> str | None:
+    """Return the resolved API key for the profile's default model.
+
+    The session launcher calls this once per session. It walks the
+    profile's ``model_endpoints`` map, finds the entry for
+    ``profile.default_model``, and resolves its ``key_ref`` to a
+    plaintext value via :class:`CredentialStore`.
+
+    Returns ``None`` if the profile has no ``default_model``, the
+    model isn't in ``model_endpoints``, the endpoint has no
+    ``key_ref``, or the ref doesn't resolve to a stored value. In all
+    of these cases :func:`build_claude_session_env` substitutes the
+    labeled sentinel so Claude Code still launches.
+
+    Parameters
+    ----------
+    profile
+        The profile the session is locked to.
+    credential_store
+        Where named keys live. May return ``None`` if the named key
+        has been deleted externally; this function surfaces that
+        cleanly rather than raising.
+    """
+    if not profile.default_model:
+        return None
+    endpoint = profile.model_endpoints.get(profile.default_model)
+    if endpoint is None:
+        return None
+    if not endpoint.key_ref:
+        return None
+    return credential_store.get(endpoint.key_ref)
 
 
 def build_claude_session_env(
