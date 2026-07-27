@@ -131,7 +131,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             if callable(close):
                 try:
                     await close()
-                except Exception:
+                except Exception:  # noqa: BLE001 — provider close is best-effort cleanup
                     logger.warning(
                         "provider %r close failed",
                         getattr(provider, "name", provider),
@@ -182,10 +182,10 @@ def create_app(
         storage_path = settings.storage.db_path
     app.state.storage = StorageService(db_path=storage_path)
 
-    # CORS — open by default; localhost tool.
+    # CORS — restrict to localhost origins to prevent DNS rebinding attacks.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$",
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )

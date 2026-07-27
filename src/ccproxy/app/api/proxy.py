@@ -43,8 +43,7 @@ def sanitize_headers_dict(headers: Any) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
     for key in headers:
         values = headers.getlist(key)
-        sanitized = sanitize_headers({key: values[0] if values else ""})
-        out[key] = [sanitized[key]]
+        out[key] = [sanitize_headers({key: v})[key] for v in values]
     return out
 
 
@@ -235,7 +234,7 @@ async def post_v1_messages(request: Request) -> Response:
 
     try:
         req = AnthropicRequest.model_validate_json(body)
-    except Exception as e:
+    except (ValueError, TypeError) as e:
         logger.warning(
             "invalid /v1/messages body: %s — returning 400 without "
             "logging a request record (body parse failed before "

@@ -28,13 +28,19 @@ logger = logging.getLogger("claude_code_proxy.router.subagent")
 
 # ---- Provider pattern table -------------------------------------------------
 
-# First match wins. Order matters: shorter prefixes come after their
-# potentially-overlapping longer prefixes (none here, but it's the rule).
-ProviderPattern = tuple[str, str]  # (prefix, provider_name)
+# First match wins. Order matters: longer prefixes before shorter ones.
+# Entries ending with "-" are pure prefixes; entries without "-" require
+# an exact match OR that the model continues with "-" (e.g., "o1-mini"
+# matches but "oracle-3b" does not).
+ProviderPattern = tuple[str, str]  # (pattern, provider_name)
 _PROVIDER_PATTERNS: tuple[ProviderPattern, ...] = (
     ("gpt-", "openai"),
+    ("o1-", "openai"),
     ("o1", "openai"),
+    ("o3-", "openai"),
     ("o3", "openai"),
+    ("o4-", "openai"),
+    ("o4", "openai"),
     ("claude-", "anthropic"),
 )
 
@@ -45,9 +51,13 @@ def provider_for_model(model: str) -> str:
     Falls back to ``"anthropic"`` for unknown models (matches the upstream
     Go router's behaviour).
     """
-    for prefix, name in _PROVIDER_PATTERNS:
-        if model.startswith(prefix):
-            return name
+    for pattern, name in _PROVIDER_PATTERNS:
+        if pattern.endswith("-"):
+            if model.startswith(pattern):
+                return name
+        else:
+            if model == pattern or model.startswith(pattern + "-"):
+                return name
     return "anthropic"
 
 
@@ -215,6 +225,8 @@ class RouteDecision(BaseModel):
 class SubagentRouter:
     """Inspect each Anthropic request and choose a provider + target model."""
 
+    _REFRESH_INTERVAL_S = 30.0
+
     def __init__(
         self,
         settings: Settings,
@@ -223,12 +235,55 @@ class SubagentRouter:
         cwd: Path | None = None,
         home: Path | None = None,
     ) -> None:
+        import time
+
         self._settings = settings
         self._providers = providers
+        self._cwd = cwd
+        self._home = home
         # Precomputed {prompt_hash: (target_model, target_provider, provider)}.
         self._custom_agents: dict[str, tuple[str, str, Provider]] = load_custom_agents(
             settings, providers, cwd=cwd, home=home
         )
+        self._last_refresh_time = time.monotonic()
+        self._agents_mtime = self._max_agents_mtime()
+
+    def _max_agents_mtime(self) -> float:
+        """Return the max mtime across all agent .md files in search dirs."""
+        import os
+
+        resolved_home = self._home or Path(os.path.expanduser("~"))
+        search_dirs: list[Path] = [resolved_home / ".claude" / "agents"]
+        if self._cwd is not None:
+            search_dirs.insert(0, self._cwd / ".claude" / "agents")
+
+        max_mtime = 0.0
+        for d in search_dirs:
+            if not d.is_dir():
+                continue
+            for f in d.glob("*.md"):
+                try:
+                    max_mtime = max(max_mtime, f.stat().st_mtime)
+                except OSError:
+                    pass
+        return max_mtime
+
+    def _maybe_refresh_agents(self) -> None:
+        """Refresh the agent hash cache if any .md file has been modified."""
+        import time
+
+        now = time.monotonic()
+        if now - self._last_refresh_time < self._REFRESH_INTERVAL_S:
+            return
+        self._last_refresh_time = now
+
+        current_mtime = self._max_agents_mtime()
+        if current_mtime > self._agents_mtime:
+            logger.info("agent files changed (mtime %s > %s); refreshing hashes", current_mtime, self._agents_mtime)
+            self._custom_agents = load_custom_agents(
+                self._settings, self._providers, cwd=self._cwd, home=self._home
+            )
+            self._agents_mtime = current_mtime
 
     @property
     def custom_agent_count(self) -> int:
@@ -237,6 +292,9 @@ class SubagentRouter:
     def determine_route(self, req: AnthropicRequest) -> RouteDecision:
         """Pick the provider and target model for one inbound request."""
         model = req.model
+
+        # Periodically check whether agent files have been edited.
+        self._maybe_refresh_agents()
 
         # Subagent detection — only when enabled.
         if self._settings.subagents.enable:

@@ -42,7 +42,7 @@ class DocumentTab:
             return bool(self.content)
         try:
             return self.content != self.file_path.read_text(encoding="utf-8")
-        except Exception:
+        except (OSError, UnicodeDecodeError):
             return bool(self.content)
 
     def load_content(self) -> str:
@@ -58,5 +58,5 @@ class DocumentTab:
         try:
             self.file_path.write_text(self.content, encoding="utf-8")
             return True
-        except Exception:
+        except OSError:
             return False

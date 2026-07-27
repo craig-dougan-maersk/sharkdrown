@@ -154,7 +154,9 @@ class ProxyServerThread(QThread):
             # Wait for uvicorn to finish startup (or fail) before emitting.
             while not serve_task.done():
                 if server.started:
-                    self.started_ok.emit(self._port)
+                    bound_port = self._resolve_bound_port(server)
+                    self._port = bound_port
+                    self.started_ok.emit(bound_port)
                     break
                 await asyncio.sleep(0.05)
             # If startup failed before ``started`` flipped, surface the error.
@@ -176,6 +178,21 @@ class ProxyServerThread(QThread):
         finally:
             self._server = None
             self.stopped.emit()
+
+    def _resolve_bound_port(self, server: uvicorn.Server) -> int:
+        """Extract the actual bound port from uvicorn's listening sockets.
+
+        When the user configures port=0, the OS assigns an ephemeral port.
+        After ``server.started`` is True, ``server.servers`` holds the
+        asyncio Server objects whose sockets report the real address.
+        Falls back to ``self._port`` if extraction fails (non-zero config).
+        """
+        for srv in getattr(server, "servers", []):
+            for sock in srv.sockets or []:
+                addr = sock.getsockname()
+                if isinstance(addr, tuple) and len(addr) >= 2:
+                    return int(addr[1])
+        return self._port
 
     # -- Configuration -----------------------------------------------------
     def _build_settings(self) -> Settings | None:

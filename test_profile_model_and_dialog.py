@@ -507,8 +507,8 @@ def test_active_profile_drives_proxy_start() -> None:
             def start(self) -> None:
                 self._is_running = True
 
-        import src.ui.main_window as mw
-        original = mw.ProxyServerThread
+        import src.ui.main_window._proxy_lifecycle as _plm
+        original = _plm.ProxyServerThread
 
         class _FakeThreadWithSignals(_FakeThread):
             """Fake thread that exposes the Qt signals MainWindow hooks
@@ -540,11 +540,11 @@ def test_active_profile_drives_proxy_start() -> None:
             failed = _Signal()
             stopped = _Signal()
 
-        mw.ProxyServerThread = _FakeThreadWithSignals
+        _plm.ProxyServerThread = _FakeThreadWithSignals
         try:
             w._start_server()
         finally:
-            mw.ProxyServerThread = original
+            _plm.ProxyServerThread = original
             # Tear down the captured thread if ``_start_server`` set
             # ``self.proxy_thread`` to it; prevents a dangling
             # QThread warning on the next test.

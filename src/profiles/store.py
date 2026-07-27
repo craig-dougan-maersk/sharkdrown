@@ -22,9 +22,15 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
+import sys
 from dataclasses import asdict
 from pathlib import Path
+
+logger = logging.getLogger("sharkdrown.profiles")
+
+_IS_POSIX = sys.platform != "win32"
 
 from src.profiles.credential_store import CredentialStore
 from src.profiles.models import (
@@ -251,20 +257,16 @@ class ProfileStore:
         return data
 
     def _save_raw(self, data: dict) -> None:
-        """Atomic JSON write with chmod 600 re-asserted on save."""
+        """Atomic JSON write with chmod 600 (POSIX only) re-asserted on save."""
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         with tmp.open("w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, sort_keys=True)
             fh.write("\n")
-        try:
+        if _IS_POSIX:
             os.chmod(tmp, 0o600)
-        except OSError:
-            pass
         os.replace(tmp, self._path)
-        try:
+        if _IS_POSIX:
             os.chmod(self._path, 0o600)
-        except OSError:
-            pass
 
     def _seed_from_legacy_or_default(self) -> dict:
         """First-launch seed.

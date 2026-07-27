@@ -73,7 +73,7 @@ class PandasTableProcessor:
                     return value.to_markdown(index=False)
 
             return None
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — exec() of user code can raise anything
             return f"<!-- Error executing pandas code: {e} -->\n<!-- Original code:\n{code}\n-->"
 
     @staticmethod

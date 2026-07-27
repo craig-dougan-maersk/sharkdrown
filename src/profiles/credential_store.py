@@ -24,10 +24,17 @@ caller is :class:`ProfileStore` and :func:`build_claude_session_env`.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
+import sys
 from pathlib import Path
 from typing import Iterable
+
+logger = logging.getLogger("sharkdrown.credentials")
+
+_IS_POSIX = sys.platform != "win32"
+_WINDOWS_CHMOD_WARNING_ISSUED = False
 
 
 class CredentialStore:
@@ -136,28 +143,28 @@ class CredentialStore:
             return {"schema_version": self.SCHEMA_VERSION, "credentials": {}}
 
     def _write(self, data: dict) -> None:
+        global _WINDOWS_CHMOD_WARNING_ISSUED  # noqa: PLW0603
+
         data["schema_version"] = self.SCHEMA_VERSION
-        # Write-then-chmod: on POSIX, ``open(..., O_CREAT, 0o600)`` is
-        # the cleanest way to set the mode at creation time, but for
-        # portability we always re-assert after writing (handles the
-        # case where the file already exists with looser perms).
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         with tmp.open("w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, sort_keys=True)
             fh.write("\n")
-        try:
+
+        if _IS_POSIX:
             os.chmod(tmp, 0o600)
-        except OSError:
-            # Non-POSIX (Windows) — chmod is best-effort.
-            pass
-        # Atomic replace: avoids a window where the file is half-written.
+        elif not _WINDOWS_CHMOD_WARNING_ISSUED:
+            logger.warning(
+                "credential store on Windows has no file-permission protection; "
+                "ensure %s is in a user-private directory",
+                self._path,
+            )
+            _WINDOWS_CHMOD_WARNING_ISSUED = True
+
         os.replace(tmp, self._path)
-        # Re-assert on the final path in case the replace lost perms
-        # (POSIX preserves them, but defensive).
-        try:
+
+        if _IS_POSIX:
             os.chmod(self._path, 0o600)
-        except OSError:
-            pass
 
     @property
     def path(self) -> Path:
