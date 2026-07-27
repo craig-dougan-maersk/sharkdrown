@@ -502,7 +502,17 @@ def _serialize_profile(p: ClaudeProfile) -> dict:
     providers_out: dict[str, dict] = {}
     for name, prov in raw_providers.items():
         if isinstance(prov, dict):
-            prov_d = {k: v for k, v in prov.items() if v is not None}
+            # ``key_ref`` is a string-or-None optional field; we drop
+            # None to keep the JSON tidy. ``available_models`` is a
+            # tuple-or-omitted optional; drop empty tuples too — the
+            # ``available_models is None or available_models == ()``
+            # check above already filtered them in the dataclass,
+            # but a defensive drop doesn't hurt here.
+            prov_d = {
+                k: v
+                for k, v in prov.items()
+                if v is not None and v != ()
+            }
         else:
             continue
         # ``name`` + ``url`` are required; ``name`` is the dict key.
@@ -515,11 +525,17 @@ def _serialize_profile(p: ClaudeProfile) -> dict:
     endpoints_out: dict[str, dict] = {}
     for model, ep in raw_endpoints.items():
         if isinstance(ep, dict):
-            ep_d = {k: v for k, v in ep.items() if v is not None}
+            # ``ModelEndpoint`` carries only ``provider_name`` +
+            # ``aliases`` in the post-refactor shape. ``key_ref`` is
+            # now a property of the *Provider*, not the endpoint, so
+            # we drop it on write. ``aliases`` is dropped when empty
+            # so profiles that don't use them stay tidy.
+            ep_d = {k: v for k, v in ep.items() if v is not None and v != ()}
+            ep_d.pop("key_ref", None)  # legacy: was attached per-endpoint
         else:
             ep_d = {"url": str(ep)}
-        # ``provider_name`` is required (or legacy ``url``); ``key_ref``
-        # is optional and dropped when None. ``url`` is only retained
+        # ``provider_name`` is required (or legacy ``url``); ``aliases``
+        # is optional and dropped when empty. ``url`` is only retained
         # for the legacy shape — the new shape uses ``provider_name``.
         if "provider_name" in ep_d:
             if ep_d.get("provider_name"):
@@ -565,27 +581,82 @@ def _deserialize_profile(d: dict) -> ClaudeProfile:
         # inner ``name`` field disagrees, prefer the key (it's the
         # canonical identifier and the dict key under which endpoints
         # will look the provider up).
+        # ``key_ref`` is the CredentialStore ref the proxy uses to
+        # authenticate requests routed through this provider. ``None``
+        # means "no proxy-side auth" — the Anthropic path forwards
+        # the client's ``x-api-key``; the OpenAI path falls back to
+        # its configured ``OPENAI_API_KEY``.
+        raw_key_ref = raw.get("key_ref")
+        key_ref = str(raw_key_ref) if raw_key_ref is not None else None
+        # ``available_models`` may be either a JSON list of strings,
+        # a single comma-separated string, or a tuple of strings (the
+        # shape :func:`dataclasses.asdict` produces from the dataclass
+        # default). All three round-trip; we normalise to a tuple of
+        # stripped, deduped strings.
+        am_raw = raw.get("available_models")
+        if isinstance(am_raw, (list, tuple)):
+            available_models = tuple(
+                dict.fromkeys(
+                    str(m).strip() for m in am_raw if str(m).strip()
+                )
+            )
+        elif isinstance(am_raw, str):
+            available_models = tuple(
+                dict.fromkeys(
+                    s.strip() for s in am_raw.split(",") if s.strip()
+                )
+            )
+        else:
+            available_models = ()
         providers[str(prov_name)] = Provider(
             name=str(prov_name),
             url=str(prov_url),
+            key_ref=key_ref,
+            available_models=available_models,
         )
     raw_endpoints = d.get("model_endpoints") or {}
     if not isinstance(raw_endpoints, dict):
         raw_endpoints = {}
     # Accept four shapes:
-    #   - new: {"model": {"provider_name": "...", "key_ref": "..."}}
-    #   - transitional: {"model": {"provider_name": "..."}}
-    #   - older: {"model": {"url": "...", "key_ref": "..."}}
+    #   - new (post-refactor): {"model": {"provider_name": "...",
+    #     "aliases": [...]}}
+    #   - transitional: {"model": {"provider_name": "..."}} (no aliases)
+    #   - legacy with per-endpoint key_ref: {"model": {"url": "...",
+    #     "key_ref": "..."}}
     #   - legacy flat-string: {"model": "https://..."} (pre-ModelEndpoint)
+    #
+    # Note: per-endpoint ``key_ref`` is no longer a thing post-refactor
+    # (the key lives on the provider now). The deserializer below just
+    # ignores ``key_ref`` on the endpoint — the provider's ``key_ref``
+    # is the auth source.
     endpoints: dict[str, ModelEndpoint] = {}
     for model, raw in raw_endpoints.items():
         if isinstance(raw, dict):
-            key_ref = raw.get("key_ref")
-            provider_name = raw.get("provider_name")
+            provider_name = raw.get("provider_name") or ""
+            # Aliases may be either a JSON list of strings, a single
+            # comma-separated string, or a tuple of strings (the
+            # shape :func:`dataclasses.asdict` produces from the
+            # dataclass default). All three round-trip; we
+            # normalise to a tuple of stripped, deduped strings.
+            aliases_raw = raw.get("aliases")
+            if isinstance(aliases_raw, (list, tuple)):
+                aliases = tuple(
+                    dict.fromkeys(
+                        str(a).strip() for a in aliases_raw if str(a).strip()
+                    )
+                )
+            elif isinstance(aliases_raw, str):
+                aliases = tuple(
+                    dict.fromkeys(
+                        s.strip() for s in aliases_raw.split(",") if s.strip()
+                    )
+                )
+            else:
+                aliases = ()
             if provider_name:
                 endpoints[str(model)] = ModelEndpoint(
                     provider_name=str(provider_name),
-                    key_ref=(str(key_ref) if key_ref is not None else None),
+                    aliases=aliases,
                 )
             else:
                 url = raw.get("url")
@@ -600,7 +671,7 @@ def _deserialize_profile(d: dict) -> ClaudeProfile:
                 # the endpoint to a named provider on first edit.
                 endpoints[str(model)] = ModelEndpoint(
                     provider_name="",
-                    key_ref=(str(key_ref) if key_ref is not None else None),
+                    aliases=aliases,
                 )
         elif raw:
             # Legacy flat-string: bare URL. Same shape as above — the

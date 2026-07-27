@@ -244,8 +244,31 @@ class SubagentRouter:
             if decision is not None:
                 return decision
 
-        # Default: route by model-name prefix.
-        provider_name = provider_for_model(model)
+        # User-defined endpoint routing (highest priority). The
+        # desktop app populates ``model_endpoints.endpoints`` from
+        # the active profile's ``model_endpoints`` map, so a
+        # ``MiniMax-M3 → MiniMax`` entry there routes ``MiniMax-M3``
+        # to the user's ``MiniMax`` provider — *not* to the
+        # hardcoded default ``anthropic`` provider at api.anthropic.com.
+        # Without this check, every unknown-model request would
+        # silently land on api.anthropic.com and Anthropic would
+        # reject it as "model not found".
+        endpoints_cfg = self._settings.model_endpoints
+        provider_name = (
+            (endpoints_cfg.endpoints.get(model) or "")
+            if endpoints_cfg
+            else ""
+        )
+        if not provider_name and endpoints_cfg:
+            provider_name = endpoints_cfg.default_provider or ""
+
+        # Fall back to prefix-based routing for models the user
+        # hasn't explicitly mapped (e.g. ``claude-opus-4-8`` →
+        # anthropic, ``gpt-5`` → openai). ``provider_for_model``
+        # returns ``"anthropic"`` as the catch-all for unknown
+        # prefixes.
+        if not provider_name:
+            provider_name = provider_for_model(model)
         provider = self._providers.get(provider_name)
         if provider is None:
             # Last-ditch fallback: anthropic.

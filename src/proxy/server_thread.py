@@ -76,6 +76,8 @@ class ProxyServerThread(QThread):
         config_dir: Path | None = None,
         model_endpoints: dict[str, str] | None = None,
         default_endpoint: str | None = None,
+        model_aliases: dict[str, str] | None = None,
+        providers_cfg: dict | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -83,11 +85,23 @@ class ProxyServerThread(QThread):
         self._port = port
         self._storage_path = Path(storage_path)
         self._config_dir = config_dir
-        # ``model_endpoints`` and ``default_endpoint`` come from the
-        # user's settings dialog; they're applied on top of any
-        # existing config via a custom Settings instance.
+        # ``model_endpoints``, ``default_endpoint``, ``providers_cfg``
+        # and ``model_aliases`` come from the user's settings dialog;
+        # they're applied on top of any existing config via a custom
+        # Settings instance.
+        # - ``model_endpoints`` is now ``model_name → provider_name``
+        #   (post-refactor); previously it was URL.
+        # - ``providers_cfg`` is a ``dict[name, ProviderCfg]``-shaped
+        #   structure built by ``MainWindow._start_server`` from the
+        #   active profile. Each entry carries ``url``, ``api_key``
+        #   (resolved plaintext), and ``available_models``.
+        # - ``model_aliases`` is a flat ``alias → real_model_name`` map;
+        #   the proxy rewrites ``req.model`` through it before
+        #   routing / URL resolution.
         self._model_endpoints = dict(model_endpoints or {})
         self._default_endpoint = default_endpoint or None
+        self._model_aliases = dict(model_aliases or {})
+        self._providers_cfg = providers_cfg or {}
         self._server: uvicorn.Server | None = None
 
     # -- QThread entry point ----------------------------------------------
@@ -209,16 +223,40 @@ class ProxyServerThread(QThread):
         # ``model_endpoints`` field wholesale because the user explicitly
         # configured this in the desktop's settings dialog — it should
         # not be silently merged with anything the YAML happens to have.
-        if settings is not None and (self._model_endpoints or self._default_endpoint):
-            from ccproxy.app.config import ModelEndpointsCfg
+        if settings is not None and (
+            self._model_endpoints
+            or self._default_endpoint
+            or self._model_aliases
+            or self._providers_cfg
+        ):
+            from ccproxy.app.config import ModelEndpointsCfg, ProviderCfg
 
+            providers = {}
+            for name, raw in self._providers_cfg.items():
+                try:
+                    providers[str(name)] = ProviderCfg(
+                        url=str(raw.get("url", "") or ""),
+                        api_key=(
+                            str(raw["api_key"])
+                            if raw.get("api_key") is not None
+                            else None
+                        ),
+                        available_models=list(raw.get("available_models") or []),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "dropping malformed provider override %r: %s", name, exc
+                    )
             settings.model_endpoints = ModelEndpointsCfg(
                 default_endpoint=self._default_endpoint,
                 endpoints=dict(self._model_endpoints),
+                providers=providers,
+                model_aliases=dict(self._model_aliases),
             )
             logger.info(
-                "applied per-model endpoint overrides: %d model(s), default=%s",
+                "applied per-model endpoint overrides: %d model(s), %d provider(s), default=%s",
                 len(self._model_endpoints),
+                len(providers),
                 self._default_endpoint or "(none)",
             )
         return settings

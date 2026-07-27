@@ -888,35 +888,66 @@ class MainWindow(QMainWindow):
             default_endpoint = str(
                 active.claude_settings.get("proxy_default_endpoint", "") or ""
             )
-        # Flatten ``model_endpoints`` (``dict[str, ModelEndpoint]``) into
-        # ``dict[str, str]`` for the proxy thread — the proxy only
-        # needs upstream URLs at routing time. Each endpoint names
-        # a provider (``provider_name``); the URL is resolved
-        # through ``active.providers`` here. Per-endpoint credential
-        # selection lives on the profile; the session launcher
-        # resolves the right key via ``resolve_api_key``.
-        proxy_endpoints: dict[str, str] = {}
+
+        # ---- Build proxy-side inputs ---------------------------------
+        # ``proxy_providers``: dict[provider_name, {url, api_key, available_models}].
+        # The credential is resolved from the profile's
+        # ``CredentialStore`` here so the proxy thread never needs to
+        # touch the store. ``api_key`` is ``None`` when the provider
+        # has no key_ref (or its ref doesn't resolve), in which case
+        # the proxy's per-provider forward falls back to the client's
+        # auth header.
+        proxy_providers: dict[str, dict] = {}
         providers_map: dict[str, object] = dict(active.providers or {})
+        credential_store = self._profile_store().credential_store
+        for name, prov in providers_map.items():
+            key_ref = getattr(prov, "key_ref", None)
+            api_key: str | None = None
+            if isinstance(key_ref, str) and key_ref:
+                api_key = credential_store.get(key_ref)
+            proxy_providers[str(name)] = {
+                "url": str(getattr(prov, "url", "") or ""),
+                "api_key": api_key,
+                "available_models": list(
+                    getattr(prov, "available_models", ()) or ()
+                ),
+            }
+
+        # ``proxy_endpoints``: dict[model_name, provider_name].
+        # Post-refactor each endpoint carries just a provider_name;
+        # the URL and key come from ``proxy_providers[name]`` at the
+        # proxy's request-time resolver. Legacy on-disk profiles that
+        # had bare URL strings (``ModelEndpoint`` pre-revision)
+        # produce endpoints entries that point at the *default*
+        # provider (the legacy shape had no provider identity, so
+        # falling through to ``default`` keeps the route alive
+        # until the user re-attaches via the editor).
+        proxy_endpoints: dict[str, str] = {}
+        # Per-endpoint aliases flatten to ``alias → real_model_name``.
+        # ``ModelEndpoint.aliases`` is the source of truth; uniqueness
+        # was already enforced by the editor so duplicate keys
+        # shouldn't occur in practice (last-writer-wins as a
+        # defensive default).
+        proxy_aliases: dict[str, str] = {}
         for model, ep in (active.model_endpoints or {}).items():
-            url: str = ""
+            provider_name = ""
             if isinstance(ep, str):
-                # Legacy: bare URL strings (older profiles pre-dating
-                # the ModelEndpoint/Provider split).
-                url = ep
+                # Legacy bare URL — fall through to "default"
+                # provider if it exists, otherwise drop the entry.
+                provider_name = "default"
             else:
-                provider_name = getattr(ep, "provider_name", None) or ""
-                if provider_name and provider_name in providers_map:
-                    provider = providers_map[provider_name]
-                    url = getattr(provider, "url", "") or ""
-                else:
-                    # ``ep.url`` is a backward-compat fallback — newer
-                    # profiles store ``provider_name`` only, but if
-                    # an endpoint somehow still carries a literal URL
-                    # (e.g. from a half-migrated on-disk file) we
-                    # honour it instead of dropping the route.
-                    url = getattr(ep, "url", "") or ""
-            if url:
-                proxy_endpoints[str(model)] = str(url)
+                provider_name = str(getattr(ep, "provider_name", "") or "")
+            if provider_name and provider_name in proxy_providers:
+                proxy_endpoints[str(model)] = provider_name
+            elif provider_name:
+                # Endpoint names a provider that no longer exists —
+                # silently drop; the editor's stale-provider warning
+                # would have caught this on save.
+                pass
+            if not isinstance(ep, str):
+                for alias in (getattr(ep, "aliases", ()) or ()):
+                    if isinstance(alias, str) and alias.strip():
+                        proxy_aliases[alias.strip()] = str(model)
 
         self.proxy_host = host
         self.proxy_port = port
@@ -934,6 +965,8 @@ class MainWindow(QMainWindow):
             config_dir=config_dir_path,
             model_endpoints=proxy_endpoints,
             default_endpoint=default_endpoint or None,
+            model_aliases=proxy_aliases,
+            providers_cfg=proxy_providers,
             parent=self,
         )
         thread.started_ok.connect(self._on_proxy_started)

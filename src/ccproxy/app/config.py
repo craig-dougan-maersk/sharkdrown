@@ -187,21 +187,59 @@ class ServerCfg(BaseModel):
     timeouts: Timeouts = Timeouts()
 
 
-class ModelEndpointsCfg(BaseModel):
-    """Per-model upstream endpoint overrides.
+class ProviderCfg(BaseModel):
+    """One upstream provider — name → URL + plaintext api_key + catalog.
 
-    ``default_endpoint`` is used when a request's model isn't in
-    ``endpoints``. Both may be ``None`` to fall back to the provider's
-    configured ``base_url`` (the original behaviour).
+    Populated by the embedded desktop app from the user's ``Provider``
+    record. The ``api_key`` is the *resolved* plaintext value
+    (CredentialStore ref materialised at proxy boot) — this avoids
+    carrying ref-name strings across threads.
 
-    Populated by the embedded desktop app so that each model name can
-    be routed to a different upstream URL.
+    ``available_models`` is a read-only catalog the proxy exposes via
+    ``GET /v1/models`` (future work) and uses internally to validate
+    that a routed request names a model the provider actually hosts.
     """
 
     model_config = ConfigDict(extra="ignore")
 
-    default_endpoint: str | None = None
+    url: str
+    api_key: str | None = None
+    available_models: list[str] = Field(default_factory=list)
+
+
+class ModelEndpointsCfg(BaseModel):
+    """Per-model upstream endpoint + provider overrides.
+
+    Resolution order (in
+    :func:`ccproxy.app.api.proxy._resolve_request_target`):
+
+    1. ``endpoints[model]`` → ``provider_name``
+    2. ``providers[provider_name]`` → ``(url, api_key)``
+
+    If a model isn't in ``endpoints`` we fall back to
+    ``default_provider``. ``default_endpoint`` is a final backstop
+    URL (used only when *neither* mapping resolves, for legacy
+    configs that didn't migrate to the providers dict).
+
+    ``model_aliases`` is a flat ``alias → real_model_name`` map. The
+    proxy rewrites an incoming ``req.model`` through this map before
+    routing / URL resolution runs, so a client can pass ``"opus"``
+    and the proxy forwards the request under ``"claude-opus-4-8"``.
+
+    Populated by the embedded desktop app from the active profile.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    default_provider: str | None = None
+    providers: dict[str, ProviderCfg] = Field(default_factory=dict)
     endpoints: dict[str, str] = Field(default_factory=dict)
+    # ``endpoints`` is ``model_name → provider_name`` in the new
+    # shape (the value used to be a URL — older reads of legacy
+    # YAML may still surface strings that look like URLs; the
+    # resolver rejects them with a clear failure mode).
+    default_endpoint: str | None = None
+    model_aliases: dict[str, str] = Field(default_factory=dict)
 
 
 class Settings(BaseSettings):

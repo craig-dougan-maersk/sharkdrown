@@ -33,6 +33,7 @@ class Provider(ABC):
         headers: dict[str, str],
         stream: bool = False,
         target_url: str | None = None,
+        target_api_key: str | None = None,
     ) -> httpx.Response:
         """Send ``body`` to the upstream LLM and return the raw response.
 
@@ -49,5 +50,14 @@ class Provider(ABC):
         ``base_url`` for this single request, used by the per-model
         endpoint resolver in the desktop app. When ``None``, the
         provider uses its own ``base_url`` (the original behaviour).
+
+        ``target_api_key`` optionally overrides the provider's
+        configured API key for this single request, used by the
+        per-model provider resolver in the desktop app. When
+        ``None``, the provider uses its own configured key (the
+        original behaviour). When set, the outbound auth header is
+        rewritten so the upstream sees the provider-specific key —
+        which lets one process route to multiple upstreams with
+        distinct credentials.
         """
         raise NotImplementedError

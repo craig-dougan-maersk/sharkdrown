@@ -26,6 +26,7 @@ the store is only updated on OK, mirroring ``ProxySettingsDialog``'s
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 from pathlib import Path
 
@@ -224,9 +225,25 @@ class ProfileEditorDialog(QDialog):
         self.name_edit.setPlaceholderText("e.g. Default")
         general_layout.addRow("Name:", self.name_edit)
 
-        self.default_model_edit = QLineEdit()
-        self.default_model_edit.setPlaceholderText("model name from the table below")
-        general_layout.addRow("Default model:", self.default_model_edit)
+        # Default model — a ``QComboBox`` populated from the alias list,
+        # never free-text. Aliases are the user-facing identity of a
+        # model (the real upstream IDs like ``MiniMax-M3`` stay
+        # hidden in the Model Configuration table); the proxy's
+        # alias-rewrite layer translates the chosen alias back to
+        # the real name at request time.
+        #
+        # Items added at populate-time:
+        #   - ``(no default)``  — when ``default_model`` is unset
+        #     (``userData = None``).
+        #   - every deduped alias across all endpoint rows
+        #     (``userData = alias_string``).
+        #   - ``(real model: X)`` — fallback for legacy profiles whose
+        #     ``default_model`` was a real upstream ID; selecting
+        #     this preserves the verbatim value through save (the
+        #     proxy still accepts a real name if the user prefers).
+        self.default_model_combo = QComboBox()
+        self.default_model_combo.setEditable(False)
+        general_layout.addRow("Default model:", self.default_model_combo)
 
         # ---- Proxy / network settings ----------------------------------
         # Bind address + port + config_dir moved off ``ProxyConfig``
@@ -291,20 +308,30 @@ class ProfileEditorDialog(QDialog):
         tab_layout.setContentsMargins(8, 8, 8, 8)
 
         ep_help = QLabel(
-            "Select a row to edit it in the form below. "
-            "Use <b>Add…</b> for new rows and <b>Remove Selected</b> "
-            "to delete. The proxy routes requests for each model "
-            "to its configured endpoint. Models not listed fall "
-            "through to the proxy's <em>default endpoint</em> if "
-            "one is configured in the proxy settings."
+            "Select a row to edit it in the form below. The table "
+            "is read-only — the form's <b>Apply</b> button commits "
+            "your typed values to the row. Pressing <b>OK</b> also "
+            "commits any pending form edits automatically, so a "
+            "forgotten Apply never costs you data. Use <b>Add…</b> "
+            "for new rows and <b>Remove Selected</b> to delete. "
+            "Aliases you add here are exposed as Claude Code's "
+            "<em>availableModels</em> — pick one with "
+            "<code>/model</code> to use it. The proxy's alias "
+            "rewrite translates the alias back to the real model "
+            "name at request time."
         )
         ep_help.setWordWrap(True)
         ep_help.setStyleSheet("color: gray; font-size: 11px;")
         tab_layout.addWidget(ep_help)
 
         self.endpoints_table = QTableWidget(0, 3)
+        # Aliases-first column order. Aliases are the user-facing
+        # identity of the row (the real upstream model ID is the
+        # ``Model`` column at the far right). ``UserRole`` on the
+        # Provider cell still carries ``provider_name`` as the
+        # stable identity; aliases are read back via cell text.
         self.endpoints_table.setHorizontalHeaderLabels(
-            ["Model", "Endpoint URL", "API Key"]
+            ["Aliases", "Provider", "Model"]
         )
         self.endpoints_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
@@ -313,7 +340,7 @@ class ProfileEditorDialog(QDialog):
             1, QHeaderView.ResizeMode.Stretch
         )
         self.endpoints_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.ResizeToContents
+            2, QHeaderView.ResizeMode.Stretch
         )
         self.endpoints_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         # Read-only: no in-place editing of any column. The form
@@ -383,26 +410,32 @@ class ProfileEditorDialog(QDialog):
         # Snapshot of the row's values at form-load time, so we
         # can detect divergence quickly without reparsing the
         # ``QTableWidgetItem``. ``None`` means "no row selected".
-        # Tuple is ``(model, provider_name, key_ref)`` — the URL
-        # itself is *not* stored; it's resolved from the provider
-        # name at write time (and is mutable: editing the provider
-        # on the Providers tab propagates without touching the
-        # endpoint row).
-        self._endpoint_row_snapshot: tuple[str, str, str | None] | None = None
+        # Post-refactor tuple is ``(model, provider_name, aliases)``
+        # — the URL and auth come from the named provider at
+        # write time, so neither lives on the endpoint row.
+        self._endpoint_row_snapshot: (
+            tuple[str, str, tuple[str, ...]] | None
+        ) = None
 
         editor_box = QGroupBox("Edit selected row")
         editor_layout = QFormLayout(editor_box)
         editor_layout.setContentsMargins(8, 8, 8, 8)
 
-        self.endpoint_model_edit = QLineEdit()
-        self.endpoint_model_edit.setPlaceholderText("claude-opus-4-8")
-        editor_layout.addRow("Model:", self.endpoint_model_edit)
+        # The Model field is now a ``QComboBox``, not a free-text
+        # ``QLineEdit``. Items are populated from the selected
+        # provider's ``available_models``; switching the Provider
+        # below triggers a model combo rebuild via
+        # ``_refresh_endpoint_model_combo``. ``userData`` carries
+        # the model name (same as the display text — kept for
+        # symmetry with the other combos).
+        self.endpoint_model_combo = QComboBox()
+        editor_layout.addRow("Model:", self.endpoint_model_combo)
 
         # The endpoint's URL is no longer free-text — it's a
         # ``QComboBox`` populated from the Providers tab. The
         # display label is the provider's *name*; the ``userData``
         # carries the URL (resolved at combo-rebuild time) so the
-        # applied ``ModelEndpoint`` knows which URL to persist.
+        # URL hint label below can show the resolved URL.
         self.endpoint_provider_combo = QComboBox()
         # ``(no provider)`` is the empty / pre-addition state.
         self.endpoint_provider_combo.addItem("(no provider)", "")
@@ -416,24 +449,34 @@ class ProfileEditorDialog(QDialog):
         self.endpoint_url_hint.setWordWrap(True)
         editor_layout.addRow("Provider URL:", self.endpoint_url_hint)
 
-        self.endpoint_key_combo = QComboBox()
-        self.endpoint_key_combo.addItem("(no key)", None)
-        editor_layout.addRow("API Key:", self.endpoint_key_combo)
+        # Aliases — short names clients can use in place of the real
+        # model name. The proxy rewrites ``req.model = alias`` to
+        # the real name before routing. Comma-separated in the
+        # form; persisted as a tuple on ``ModelEndpoint.aliases``.
+        self.endpoint_aliases_edit = QLineEdit()
+        self.endpoint_aliases_edit.setPlaceholderText(
+            "comma-separated, e.g. opus, team-pro"
+        )
+        editor_layout.addRow("Aliases:", self.endpoint_aliases_edit)
 
         # ``editingFinished`` fires on F2/Enter/blur; ``textChanged``
         # / ``currentIndexChanged`` fire continuously — the latter
         # drive the Apply enable logic in real time.
-        self.endpoint_model_edit.textChanged.connect(
+        self.endpoint_model_combo.currentIndexChanged.connect(
             self._on_endpoint_form_changed
         )
         self.endpoint_provider_combo.currentIndexChanged.connect(
             self._on_endpoint_form_changed
         )
-        # Update the URL hint on every provider selection change.
+        # Update the URL hint + repopulate the model combo on
+        # every provider selection change.
         self.endpoint_provider_combo.currentIndexChanged.connect(
             lambda _i: self._refresh_endpoint_url_hint()
         )
-        self.endpoint_key_combo.currentIndexChanged.connect(
+        self.endpoint_provider_combo.currentIndexChanged.connect(
+            lambda _i: self._refresh_endpoint_model_combo()
+        )
+        self.endpoint_aliases_edit.textChanged.connect(
             self._on_endpoint_form_changed
         )
 
@@ -504,13 +547,21 @@ class ProfileEditorDialog(QDialog):
         prov_help.setStyleSheet("color: gray; font-size: 11px;")
         tab_layout.addWidget(prov_help)
 
-        self.providers_table = QTableWidget(0, 2)
-        self.providers_table.setHorizontalHeaderLabels(["Name", "URL"])
+        self.providers_table = QTableWidget(0, 4)
+        self.providers_table.setHorizontalHeaderLabels(
+            ["Name", "URL", "API Key", "Available Models"]
+        )
         self.providers_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
         )
         self.providers_table.horizontalHeader().setSectionResizeMode(
             1, QHeaderView.ResizeMode.Stretch
+        )
+        self.providers_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.providers_table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Stretch
         )
         self.providers_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.providers_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -546,7 +597,16 @@ class ProfileEditorDialog(QDialog):
         editor_layout.setContentsMargins(8, 8, 8, 8)
 
         self._selected_provider_row: int = -1
-        self._provider_row_snapshot: tuple[str, str, bool] | None = None
+        # Snapshot of the row's values at form-load time so we can
+        # detect divergence cheaply. Tuple shape:
+        # ``(name, url, key_ref, available_models, is_default)``.
+        # ``key_ref`` is the CredentialStore ref the proxy will use
+        # to authenticate requests routed through this provider;
+        # ``available_models`` is a tuple of model-name strings the
+        # Model Configuration dropdown constrains itself to.
+        self._provider_row_snapshot: (
+            tuple[str, str, str | None, tuple[str, ...], bool] | None
+        ) = None
 
         self.provider_name_edit = QLineEdit()
         self.provider_name_edit.setPlaceholderText("e.g. MiniMax")
@@ -556,8 +616,34 @@ class ProfileEditorDialog(QDialog):
         self.provider_url_edit.setPlaceholderText("https://api.example.com")
         editor_layout.addRow("Endpoint URL:", self.provider_url_edit)
 
+        # API Key — combo populated from the CredentialStore. The
+        # ``currentData()`` carries the ref string (or ``None`` for
+        # the "(no key)" entry). The plain-text value lives in
+        # CredentialStore, never on the profile, so the editor
+        # displays a friendlier name (or the warning "(no key)")
+        # without leaking the secret.
+        self.provider_key_combo = QComboBox()
+        self.provider_key_combo.addItem("(no key)", None)
+        editor_layout.addRow("API Key:", self.provider_key_combo)
+
+        # Available Models — comma-separated text, parsed by the
+        # same ``_parse_aliases`` helper (it's the same shape:
+        # strip / drop empties / dedupe). The form's value is the
+        # *editor representation*; the row's column-3 cell renders
+        # the canonical form too, so reading either side gives the
+        # same normalised tuple.
+        self.provider_models_edit = QLineEdit()
+        self.provider_models_edit.setPlaceholderText(
+            "comma-separated, e.g. claude-opus-4-8, claude-sonnet-4-6"
+        )
+        editor_layout.addRow("Available Models:", self.provider_models_edit)
+
         self.provider_name_edit.textChanged.connect(self._on_provider_form_changed)
         self.provider_url_edit.textChanged.connect(self._on_provider_form_changed)
+        self.provider_key_combo.currentIndexChanged.connect(
+            self._on_provider_form_changed
+        )
+        self.provider_models_edit.textChanged.connect(self._on_provider_form_changed)
 
         btn_row = QHBoxLayout()
         self.provider_apply_btn = QPushButton("Apply")
@@ -924,7 +1010,18 @@ class ProfileEditorDialog(QDialog):
         self._populating = True
         try:
             self.name_edit.setText(self._profile.name)
-            self.default_model_edit.setText(self._profile.default_model or "")
+            # Repopulate the default-model dropdown from the
+            # alias catalog — ``_populate_default_model_combo``
+            # adds the (no default) entry plus every deduped alias
+            # across all endpoint rows, and pre-selects the
+            # current ``profile.default_model`` if it's still in
+            # the list.
+            self.default_model_combo.blockSignals(True)
+            try:
+                self.default_model_combo.clear()
+                self._populate_default_model_combo()
+            finally:
+                self.default_model_combo.blockSignals(False)
             self.cwd_edit.setText(self._profile.session_cwd or "")
             # Proxy / network fields. The spinbox shows the special
             # "auto" text when ``port == 0`` so the user can pick a
@@ -944,6 +1041,17 @@ class ProfileEditorDialog(QDialog):
             # can resolve its ``provider_name`` to a URL on open.
             self._populate_providers_table()
             # ---- endpoints tab ---------------------------------------
+            # If the on-disk profile has no ``model_endpoints`` but
+            # the providers expose catalogs of models, auto-seed one
+            # row per ``(provider, model)`` pair so the user doesn't
+            # have to remember to repeat each model from the
+            # Providers tab in the Model Configuration tab too.
+            # Without this seed step, a profile whose Providers tab
+            # has a catalog but no Model Configuration rows would
+            # surface an empty ``availableModels`` to Claude Code
+            # (only built-in / hardcoded defaults show up in
+            # ``/model``).
+            self._maybe_seed_endpoints_from_provider_catalog()
             self.endpoints_table.setRowCount(0)
             for model_name, endpoint in self._profile.model_endpoints.items():
                 self._append_endpoint_row(model_name, endpoint)
@@ -1018,14 +1126,23 @@ class ProfileEditorDialog(QDialog):
         self.keys_table.setItem(row, 1, value_item)
 
     def _append_provider_row(
-        self, name: str, url: str, *, is_default: bool
+        self,
+        name: str,
+        url: str,
+        key_ref: str | None = None,
+        available_models: tuple[str, ...] = (),
+        *,
+        is_default: bool,
     ) -> None:
         """Insert one read-only provider row.
 
-        The row carries two ``QTableWidgetItem``s — Name and URL —
-        both read-only. ``UserRole`` on the name cell carries the
-        ``is_default`` flag so the form's Apply / Remove logic can
-        cheaply identify the pinned row.
+        The row carries four ``QTableWidgetItem``s — Name, URL,
+        API Key, Available Models — all read-only. ``UserRole``
+        on the name cell carries the ``is_default`` flag so the
+        form's Apply / Remove logic can cheaply identify the
+        pinned row. The API Key column's ``UserRole`` carries the
+        raw ``key_ref`` so selection-changed logic can rebuild
+        the form's combo.
         """
         row = self.providers_table.rowCount()
         self.providers_table.insertRow(row)
@@ -1036,6 +1153,69 @@ class ProfileEditorDialog(QDialog):
         url_item = QTableWidgetItem(url)
         url_item.setFlags(url_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.providers_table.setItem(row, 1, url_item)
+        # API Key cell — display name via the shared helper, with
+        # ``UserRole`` carrying the ref string.
+        key_item = self._make_provider_key_item(key_ref)
+        key_item.setFlags(key_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.providers_table.setItem(row, 2, key_item)
+        # Available Models cell — comma-separated text. The
+        # canonical tuple lives on ``Provider.available_models``;
+        # the cell text is the display form (parsed back to a
+        # tuple on read by ``_collect_providers``).
+        models_item = QTableWidgetItem(self._format_aliases(available_models))
+        models_item.setFlags(models_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.providers_table.setItem(row, 3, models_item)
+
+    def _make_provider_key_item(self, ref: str | None) -> QTableWidgetItem:
+        """Build the Providers-tab API Key column cell.
+
+        Mirror of ``_make_endpoint_key_item`` for the providers
+        table — display text is the friendly key name (or
+        ``"(no key)"``); the ``UserRole`` userData holds the
+        actual ``key_ref`` (or ``None``). Stale refs are flagged
+        with a yellow background so the user notices them on the
+        provider row.
+        """
+        item = QTableWidgetItem()
+        if ref is None:
+            item.setText("(no key)")
+            item.setData(Qt.ItemDataRole.UserRole, None)
+        else:
+            names = self._current_key_names()
+            if ref in names:
+                item.setText(ref)
+            else:
+                item.setText(f"{ref} (missing)")
+                item.setBackground(Qt.GlobalColor.yellow)
+            item.setData(Qt.ItemDataRole.UserRole, ref)
+        return item
+
+    def _repopulate_provider_key_combo_for_ref(
+        self, ref: str | None
+    ) -> None:
+        """Repopulate the Providers-tab API Key ``QComboBox``.
+
+        Clears and refills with ``(no key)`` + every defined
+        credential name, then selects the entry whose
+        ``currentData()`` matches ``ref``. If no such entry
+        exists, falls back to index 0 (``(no key)``).
+        """
+        if not hasattr(self, "provider_key_combo"):
+            return
+        self.provider_key_combo.blockSignals(True)
+        try:
+            self.provider_key_combo.clear()
+            self.provider_key_combo.addItem("(no key)", None)
+            for name in self._current_key_names():
+                self.provider_key_combo.addItem(name, name)
+            target_idx = 0
+            for i in range(self.provider_key_combo.count()):
+                if self.provider_key_combo.itemData(i) == ref:
+                    target_idx = i
+                    break
+            self.provider_key_combo.setCurrentIndex(target_idx)
+        finally:
+            self.provider_key_combo.blockSignals(False)
 
     def _populate_providers_table(self) -> None:
         """Fill the providers table from ``self._profile.providers``.
@@ -1055,11 +1235,83 @@ class ProfileEditorDialog(QDialog):
             if default_provider and default_provider.url
             else "https://api.example.com"
         )
-        self._append_provider_row("default", default_url, is_default=True)
+        default_key = (
+            default_provider.key_ref
+            if default_provider is not None
+            else None
+        )
+        default_models = (
+            tuple(default_provider.available_models)
+            if default_provider is not None and default_provider.available_models
+            else ()
+        )
+        self._append_provider_row(
+            "default",
+            default_url,
+            key_ref=default_key,
+            available_models=default_models,
+            is_default=True,
+        )
         for name, provider in self._profile.providers.items():
             if name == "default":
                 continue
-            self._append_provider_row(name, provider.url, is_default=False)
+            self._append_provider_row(
+                name,
+                provider.url,
+                key_ref=provider.key_ref,
+                available_models=tuple(provider.available_models or ()),
+                is_default=False,
+            )
+
+    def _maybe_seed_endpoints_from_provider_catalog(self) -> None:
+        """Auto-seed ``model_endpoints`` from provider catalogs.
+
+        A common pitfall: the user fills out a Provider on the
+        Providers tab (URL + API key + Available Models catalog)
+        but never adds the matching rows on the Model Configuration
+        tab. The result is a profile with zero routable endpoints —
+        and ``settings.json.availableModels`` ends up empty, so
+        Claude Code's ``/model`` shows only the hardcoded built-in
+        default rather than anything from the user's profile.
+
+        Closing this gap at dialog-open time is cheaper than trying
+        to teach users the two-step workflow explicitly: when the
+        in-memory profile has empty ``model_endpoints`` *and* at
+        least one provider exposes a non-empty ``available_models``
+        catalog, fill in one ``ModelEndpoint(provider_name=p,
+        aliases=())`` row per ``(provider, model)`` pair.
+
+        Idempotent: if the user already has rows, this is a no-op.
+        Mutates ``self._profile.model_endpoints`` (a deepcopy of the
+        caller's profile, so the original on-disk record isn't
+        touched — the seeded rows become real only when ``OK``
+        commits via ``_on_accept``).
+        """
+        # Idempotent: only seed when the profile has zero endpoints.
+        if self._profile.model_endpoints:
+            return
+        seeded: dict[str, ModelEndpoint] = {}
+        for prov_name, provider in self._profile.providers.items():
+            catalog = tuple(getattr(provider, "available_models", ()) or ())
+            if not catalog:
+                continue
+            for model in catalog:
+                if not isinstance(model, str) or not model.strip():
+                    continue
+                # If two providers each host the same model name,
+                # the first wins (the editor's ``_on_accept`` doesn't
+                # enforce catalog uniqueness today, so we mirror the
+                # existing tolerance rather than rejecting here).
+                if model in seeded:
+                    continue
+                seeded[str(model)] = ModelEndpoint(
+                    provider_name=str(prov_name),
+                    aliases=(),
+                )
+        if seeded:
+            self._profile = dataclasses.replace(
+                self._profile, model_endpoints=seeded
+            )
 
     def _current_provider_names(self) -> list[str]:
         """Snapshot of provider names currently in the providers table.
@@ -1148,6 +1400,28 @@ class ProfileEditorDialog(QDialog):
         """
         self._refresh_endpoint_provider_combo()
 
+    @staticmethod
+    def _parse_aliases(text: str) -> tuple[str, ...]:
+        """Parse the comma-separated aliases field into a deduped tuple.
+
+        ``"opus, team-pro, opus"`` → ``("opus", "team-pro")``. Empty
+        strings (from trailing commas or whitespace runs) are dropped.
+        Order is preserved (left-to-right after dedup).
+        """
+        if not text:
+            return ()
+        parts = [s.strip() for s in text.split(",")]
+        return tuple(dict.fromkeys(p for p in parts if p))
+
+    @staticmethod
+    def _format_aliases(aliases: tuple[str, ...]) -> str:
+        """Inverse of ``_parse_aliases``: tuple → comma-separated string.
+
+        ``("opus", "team-pro")`` → ``"opus, team-pro"``. Empty tuple
+        → ``""``.
+        """
+        return ", ".join(aliases) if aliases else ""
+
     def _append_endpoint_row(
         self,
         model_name: str,
@@ -1155,131 +1429,59 @@ class ProfileEditorDialog(QDialog):
     ) -> None:
         """Insert one read-only row into the endpoints table.
 
-        The table is read-only (no Qt cell editors). The ``Model``
-        and ``Endpoint URL`` columns are ``QTableWidgetItem``s; the
-        ``API Key`` column is a plain text item whose text is the
-        *display name* of the key (or ``"(no key)"``), with
-        ``UserRole`` storing the actual ``key_ref``. The combo
-        selectors live in the editor form below the table, not in
-        the row.
+        Three-column table: Aliases | Provider | Model. Aliases
+        are first (the user-facing identity of the row); the real
+        upstream model ID is the last column. ``UserRole`` on the
+        Provider cell carries the stable ``provider_name``.
 
-        The ``Endpoint URL`` cell carries the *resolved* URL (looked
-        up via ``provider_name``) so the row is human-readable at a
-        glance. The persistent identity is the provider name — that
-        lives on the ``ModelEndpoint.provider_name`` field and is
-        written back on Apply.
+        Brand-new rows (no endpoint) default the provider to the
+        first defined provider (almost always ``"default"``). Legacy
+        rows with a missing ``provider_name`` leave the cell empty;
+        the form falls back to ``"(no provider)"`` so the user is
+        forced to make a choice.
         """
         row = self.endpoints_table.rowCount()
         self.endpoints_table.insertRow(row)
-        model_item = QTableWidgetItem(model_name)
-        model_item.setFlags(model_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.endpoints_table.setItem(row, 0, model_item)
-        # Resolve provider_name → URL for the row's display text.
-        # Brand-new rows (no endpoint) default to the first defined
-        # provider — that's almost always "default" and gives the
-        # form a sensible starting point. Legacy rows with a missing
-        # provider_name leave the cell empty (the form falls back to
-        # ``(no provider)`` so the user is forced to make a choice).
+        # Aliases column — comma-separated text. The canonical
+        # tuple lives on ``ModelEndpoint.aliases``; the cell's text
+        # is parsed back into a tuple on read
+        # (``_collect_endpoints``).
+        aliases = endpoint.aliases if endpoint is not None else ()
+        aliases_item = QTableWidgetItem(self._format_aliases(aliases))
+        aliases_item.setFlags(aliases_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.endpoints_table.setItem(row, 0, aliases_item)
         provider_name = endpoint.provider_name if endpoint is not None else ""
         if not provider_name:
             providers = self._current_provider_names()
             provider_name = providers[0] if providers else ""
-        url_text = self._current_provider_url(provider_name) or ""
-        url_item = QTableWidgetItem(url_text)
-        url_item.setFlags(url_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.endpoints_table.setItem(row, 1, url_item)
-        # Stash the provider_name on the URL cell's UserRole so the
-        # selection handler can re-find the right combo entry even
-        # after a provider rename has drifted the displayed URL.
-        url_item.setData(Qt.ItemDataRole.UserRole, provider_name)
-        # API Key column — text label only; the userData (Qt.UserRole)
-        # carries the ref string so the form's combo can pick the
-        # right item when the row is selected.
-        ref: str | None = endpoint.key_ref if endpoint is not None else None
-        key_item = self._make_endpoint_key_item(ref)
-        key_item.setFlags(key_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.endpoints_table.setItem(row, 2, key_item)
-
-    def _make_endpoint_key_item(self, ref: str | None) -> QTableWidgetItem:
-        """Build the API Key column cell as a read-only text item.
-
-        The item's display text is the friendly key name (or
-        ``"(no key)"``); the ``UserRole`` userData holds the actual
-        ``key_ref`` (or ``None``). Stale refs (where the key name
-        no longer exists in the keys table) are flagged with a
-        yellow background.
-        """
-        item = QTableWidgetItem()
-        if ref is None:
-            item.setText("(no key)")
-            item.setData(Qt.ItemDataRole.UserRole, None)
-        else:
-            # Resolve ref → friendly name. If it's not in the keys
-            # table, we still display the raw ref so the user can
-            # see *what* was referenced, but flag the row yellow.
-            names = self._current_key_names()
-            if ref in names:
-                item.setText(ref)
-            else:
-                item.setText(f"{ref} (missing)")
-                item.setBackground(Qt.GlobalColor.yellow)
-            item.setData(Qt.ItemDataRole.UserRole, ref)
-        return item
+        provider_item = QTableWidgetItem(provider_name)
+        provider_item.setFlags(provider_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        # ``UserRole`` carries the stable provider_name. The URL
+        # is rendered as a hint line under the form's Provider
+        # field, since the URL belongs to the provider and can
+        # change without touching this row.
+        provider_item.setData(Qt.ItemDataRole.UserRole, provider_name)
+        self.endpoints_table.setItem(row, 1, provider_item)
+        # Model column — the real upstream ID (hidden by the
+        # Aliases column upstream of it).
+        model_item = QTableWidgetItem(model_name)
+        model_item.setFlags(model_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.endpoints_table.setItem(row, 2, model_item)
 
     def _refresh_endpoint_key_columns(self) -> None:
-        """Re-render the API Key column of every row in the table.
+        """No-op stub kept for backwards compatibility.
 
-        Called after the keys table changes (Add / Remove / Rename)
-        so the row's display text tracks the keys that exist. The
-        ``UserRole``-stored ref is unchanged; only the visible
-        label + yellow stale-ref hint are refreshed.
-
-        If the form's selected row happens to be one of the
-        affected rows, the combo list is rebuilt too so the form
-        still reflects the latest keys.
+        Pre-refactor the API Key column on the Model Configuration
+        tab reflected per-endpoint ``key_ref`` references into the
+        global ``CredentialStore``. After the refactor, keys live
+        on the *provider* — the endpoints table no longer carries
+        a key column. Any stale callers (e.g. ``_on_key_add`` /
+        ``_on_key_remove`` invoke this after the keys table changes)
+        become no-ops; the model combo on the endpoint form already
+        rebuilds itself when the underlying providers table changes
+        via ``_refresh_endpoint_model_combo``.
         """
-        key_table_refs: dict[int, str | None] = {}
-        for row in range(self.endpoints_table.rowCount()):
-            item = self.endpoints_table.item(row, 2)
-            if item is None:
-                continue
-            ref = item.data(Qt.ItemDataRole.UserRole)
-            key_table_refs[row] = ref
-            # Rebuild display label based on the latest key names.
-            new_item = self._make_endpoint_key_item(ref)
-            new_item.setFlags(new_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.endpoints_table.setItem(row, 2, new_item)
-        # Refresh the form's combo so the user picks from the
-        # current set of keys.
-        self._repopulate_endpoint_key_combo()
-
-    def _repopulate_endpoint_key_combo(self) -> None:
-        """Rebuild the editor form's API Key ``QComboBox`` items.
-
-        Re-selects the previously-selected key (by ``userData``) if
-        it's still in the list — otherwise falls back to the
-        ``"(no key)"`` entry. The form's divergence check runs at
-        the end so Apply enable/disable stays correct.
-        """
-        previous_key = self.endpoint_key_combo.currentData()
-        self.endpoint_key_combo.blockSignals(True)
-        try:
-            self.endpoint_key_combo.clear()
-            self.endpoint_key_combo.addItem("(no key)", None)
-            for name in self._current_key_names():
-                self.endpoint_key_combo.addItem(name, name)
-            # Re-select prior value, default to "(no key)" if it
-            # no longer exists.
-            target_idx = 0
-            for i in range(self.endpoint_key_combo.count()):
-                if self.endpoint_key_combo.itemData(i) == previous_key:
-                    target_idx = i
-                    break
-            self.endpoint_key_combo.setCurrentIndex(target_idx)
-        finally:
-            self.endpoint_key_combo.blockSignals(False)
-        # Re-evaluate the form's divergence after the repopulate.
-        self._refresh_endpoint_apply_state()
+        return None
 
     def _current_key_names(self) -> list[str]:
         """Snapshot of names currently in the keys table.
@@ -1577,6 +1779,11 @@ class ProfileEditorDialog(QDialog):
         disable the form. Apply is reset to disabled on every
         selection change (the form is freshly populated so it
         matches the row, hence not "divergent").
+
+        Three columns: Aliases (col 0), Provider (col 1),
+        Model (col 2). The Model field is a ``QComboBox`` whose
+        items are rebuilt from the selected provider's
+        ``available_models`` once the Provider combo settles.
         """
         sel = self.endpoints_table.selectionModel()
         if sel is None:
@@ -1591,54 +1798,53 @@ class ProfileEditorDialog(QDialog):
             self.endpoint_form_status.setText("Select a row to edit")
             self._refresh_endpoint_apply_state()
             return
-        # Pull the row's values into the form.
-        model_item = self.endpoints_table.item(row, 0)
+        # Pull the row's values into the form. Columns are now
+        # reordered: Aliases first, Provider, Model.
+        aliases_item = self.endpoints_table.item(row, 0)
         provider_item = self.endpoints_table.item(row, 1)
-        key_item = self.endpoints_table.item(row, 2)
-        model_text = model_item.text() if model_item is not None else ""
-        # The URL cell's ``UserRole`` carries the *provider_name*
-        # (the stable identity), not the URL. Using the URL for
-        # lookup would drift if a provider rename keeps the URL
-        # the same; using the name is invariant under URL edits.
+        model_item = self.endpoints_table.item(row, 2)
+        # Aliases — read from col 0's text (parsed back to a
+        # tuple). Empty text → empty tuple.
+        aliases = self._parse_aliases(
+            aliases_item.text() if aliases_item is not None else ""
+        )
+        # The Provider cell's ``UserRole`` carries the *provider_name*
+        # (the stable identity).
         provider_name = ""
         if provider_item is not None:
             stored = provider_item.data(Qt.ItemDataRole.UserRole)
             if isinstance(stored, str):
                 provider_name = stored
-        # ``provider_item``'s text is the URL (resolved from the
-        # provider at the time the row was written). We still need
-        # it as a fallback for legacy rows whose UserRole is empty
-        # (older profiles without ``provider_name``).
-        url_text = provider_item.text() if provider_item is not None else ""
-        ref: str | None = (
-            key_item.data(Qt.ItemDataRole.UserRole)
-            if key_item is not None
-            else None
-        )
+        # Model — read from col 2's text. If the cell is empty
+        # (e.g. the user just typed in the form without clicking
+        # Apply), the form's model combo will fall back to its
+        # first valid item, which is fine.
+        model_text = model_item.text() if model_item is not None else ""
         self._set_endpoint_form_enabled(True)
         # Block signals so we don't run the divergence check
         # mid-population.
-        self.endpoint_model_edit.blockSignals(True)
+        self.endpoint_model_combo.blockSignals(True)
         self.endpoint_provider_combo.blockSignals(True)
-        self.endpoint_key_combo.blockSignals(True)
+        self.endpoint_aliases_edit.blockSignals(True)
         try:
-            self.endpoint_model_edit.setText(model_text)
             # Rebuild the provider combo so it's in sync with the
             # current providers table — then pick the provider by
-            # its stable *name* (preferred) or fall back to matching
-            # by URL for legacy rows whose ``UserRole`` is empty.
+            # its stable *name*.
             self._repopulate_endpoint_provider_combo_for_name_and_url(
-                provider_name, url_text
+                provider_name, ""
             )
-            # The key combo's selection is restored by
-            # ``_repopulate_endpoint_key_combo_for_ref``.
-            self._repopulate_endpoint_key_combo_for_ref(ref)
+            # Model combo — populated from the *current* selected
+            # provider's ``available_models``. Keep the previous
+            # model selected if it's still in the list.
+            self._refresh_endpoint_model_combo(model_text)
+            # Aliases — display as comma-separated text in the form.
+            self.endpoint_aliases_edit.setText(self._format_aliases(aliases))
             # Update the URL hint with the resolved URL.
             self._refresh_endpoint_url_hint()
         finally:
-            self.endpoint_model_edit.blockSignals(False)
+            self.endpoint_model_combo.blockSignals(False)
             self.endpoint_provider_combo.blockSignals(False)
-            self.endpoint_key_combo.blockSignals(False)
+            self.endpoint_aliases_edit.blockSignals(False)
         # Snapshot form values so divergence is straightforward to
         # detect on each ``_on_endpoint_form_changed`` tick.
         selected_provider_name = (
@@ -1646,11 +1852,58 @@ class ProfileEditorDialog(QDialog):
             if self.endpoint_provider_combo.currentIndex() >= 0
             else ""
         )
-        self._endpoint_row_snapshot = (model_text, selected_provider_name, ref)
+        selected_model = (
+            self.endpoint_model_combo.currentText()
+            if self.endpoint_model_combo.currentIndex() >= 0
+            else ""
+        )
+        self._endpoint_row_snapshot = (
+            model_text, selected_provider_name, aliases
+        )
         self.endpoint_form_status.setText(
             f"Editing row {row + 1} of {self.endpoints_table.rowCount()}"
         )
         self._refresh_endpoint_apply_state()
+
+    def _refresh_endpoint_model_combo(
+        self, prefer_model: str = ""
+    ) -> None:
+        """Rebuild the Model ``QComboBox`` from the selected provider's catalog.
+
+        Items: ``(no model)`` + the provider's ``available_models``
+        tuple. ``(no model)`` is the fallback entry used when the
+        provider has no catalog (e.g. ``"(no provider)"`` is
+        selected, or a brand-new provider the user hasn't populated
+        yet) AND when the row's stored model is empty (so a new
+        row's snapshot doesn't accidentally pin itself to the first
+        catalog item and trigger spurious divergence).
+
+        Selection: ``prefer_model`` if it appears in the fresh
+        list; otherwise index 0 (``(no model)``) — *not* the first
+        catalog item. This is the bit that makes Apply correctly
+        detect a divergent state on a new row: by defaulting to
+        ``(no model)`` the snapshot matches the empty cell, so the
+        user picking a real model becomes a divergence event.
+        """
+        if not hasattr(self, "endpoint_model_combo"):
+            return
+        self.endpoint_model_combo.blockSignals(True)
+        try:
+            self.endpoint_model_combo.clear()
+            self.endpoint_model_combo.addItem("(no model)", "")
+            provider_name = self.endpoint_provider_combo.currentText()
+            models = self._current_provider_models(provider_name)
+            for m in models:
+                self.endpoint_model_combo.addItem(m, m)
+            target_idx = 0  # default to "(no model)"
+            if prefer_model:
+                for i in range(self.endpoint_model_combo.count()):
+                    if self.endpoint_model_combo.itemText(i) == prefer_model:
+                        target_idx = i
+                        break
+            self.endpoint_model_combo.setCurrentIndex(target_idx)
+        finally:
+            self.endpoint_model_combo.blockSignals(False)
 
     def _repopulate_endpoint_provider_combo_for_name_and_url(
         self, name: str, url: str
@@ -1702,29 +1955,77 @@ class ProfileEditorDialog(QDialog):
         else:
             self.endpoint_url_hint.setText(url)
 
-    def _repopulate_endpoint_key_combo_for_ref(self, ref: str | None) -> None:
-        """Populate the editor combo with the current keys + select ``ref``.
+    def _populate_default_model_combo(self) -> None:
+        """Fill the General tab's ``default_model_combo`` dropdown.
 
-        Internal helper that *differs* from
-        ``_repopulate_endpoint_key_combo`` in that it doesn't try to
-        preserve the previously-selected value — it just makes sure
-        ``ref`` is the selection. Used immediately after a row
-        selection change.
+        Items, in display order:
+          1. ``(no default)`` — sentinel; ``userData`` is ``None``.
+             Picked when ``profile.default_model`` is unset.
+          2. Every deduped alias across all endpoint rows, in
+             sorted order. ``userData`` is the alias string.
+             These are the *preferred* choices — what Claude Code
+             surfaces in ``/model``.
+          3. ``(real model: X)`` fallback — when the profile has a
+             ``default_model`` value that's a real upstream ID
+             (e.g. a legacy profile from before this redesign),
+             surface it as a labeled entry so the user's existing
+             choice still round-trips through save verbatim. The
+             dropdown's ``currentData()`` reads back the real name;
+             the proxy still accepts a real model name on the
+             wire (it skips the alias-rewrite layer for known
+             names).
+
+        Pre-selection: the current ``profile.default_model`` if
+        present in the list, otherwise index 0 (``(no default)``).
         """
-        self.endpoint_key_combo.blockSignals(True)
-        try:
-            self.endpoint_key_combo.clear()
-            self.endpoint_key_combo.addItem("(no key)", None)
-            for name in self._current_key_names():
-                self.endpoint_key_combo.addItem(name, name)
-            target_idx = 0
-            for i in range(self.endpoint_key_combo.count()):
-                if self.endpoint_key_combo.itemData(i) == ref:
+        # Sorted + deduped alias catalog across every endpoint.
+        all_aliases: list[str] = []
+        for endpoint in self._profile.model_endpoints.values():
+            if endpoint is None:
+                continue
+            for alias in (getattr(endpoint, "aliases", ()) or ()):
+                if isinstance(alias, str) and alias.strip():
+                    all_aliases.append(alias)
+        self.default_model_combo.addItem("(no default)", None)
+        for alias in sorted(dict.fromkeys(all_aliases)):
+            self.default_model_combo.addItem(alias, alias)
+        # Legacy fallback: ``default_model`` set to a real name
+        # but no matching alias. Render it as a labeled last-resort
+        # entry so save doesn't silently drop the user's choice.
+        legacy_real = self._profile.default_model
+        if (
+            legacy_real
+            and not any(
+                self.default_model_combo.itemData(i) == legacy_real
+                for i in range(self.default_model_combo.count())
+            )
+        ):
+            self.default_model_combo.addItem(
+                f"(real model: {legacy_real})", legacy_real
+            )
+        # Pre-select the matching entry.
+        target_idx = 0
+        if legacy_real:
+            for i in range(self.default_model_combo.count()):
+                if self.default_model_combo.itemData(i) == legacy_real:
                     target_idx = i
                     break
-            self.endpoint_key_combo.setCurrentIndex(target_idx)
-        finally:
-            self.endpoint_key_combo.blockSignals(False)
+        if self.default_model_combo.count() > 0:
+            self.default_model_combo.setCurrentIndex(target_idx)
+
+    def _repopulate_endpoint_key_combo_for_ref(self, ref: str | None) -> None:
+        """Dead-code stub kept for any leftover callers in test mocks.
+
+        Pre-refactor this helper populated a per-endpoint API Key
+        ``QComboBox``. After the refactor, authentication lives on
+        the provider — ``endpoint_key_combo`` no longer exists on
+        this dialog. The endpoint Model Configuration tab now uses
+        ``_refresh_endpoint_key_columns`` / ``_refresh_endpoint_model_combo``
+        for the equivalent refresh flow. This stub ensures any
+        historical ``self._repopulate_endpoint_key_combo_for_ref(...)``
+        call sites are no-ops rather than raising ``AttributeError``.
+        """
+        return None
 
     def _set_endpoint_form_enabled(self, enabled: bool) -> None:
         """Enable / disable every widget in the editor form.
@@ -1734,9 +2035,9 @@ class ProfileEditorDialog(QDialog):
         ``_refresh_endpoint_apply_state`` and reflect the divergence
         check, not the selection.
         """
-        self.endpoint_model_edit.setEnabled(enabled)
+        self.endpoint_model_combo.setEnabled(enabled)
         self.endpoint_provider_combo.setEnabled(enabled)
-        self.endpoint_key_combo.setEnabled(enabled)
+        self.endpoint_aliases_edit.setEnabled(enabled)
         if not enabled:
             self.endpoint_apply_btn.setEnabled(False)
             self.endpoint_revert_btn.setEnabled(False)
@@ -1775,69 +2076,81 @@ class ProfileEditorDialog(QDialog):
     def _endpoint_form_values_diverge_from_row(self) -> bool:
         """Compare the form's values to the selected row's snapshot.
 
-        Returns True when any of (model, provider_name, key_ref)
-        differs from the snapshot taken when the row was selected.
-        The form is only considered divergent when at least one of
-        the values has been edited; empty-string values are
-        normalised so a cleared field doesn't masquerade as
-        different from a row that was already empty.
+        Post-refactor tuple is ``(model, provider_name, aliases)`` —
+        key_ref + URL are *not* form values anymore (they live on
+        the provider, not the endpoint). Returns True when any of
+        those three differs from the snapshot.
+
+        Model values are normalised so ``"(no model)"`` (the combo
+        sentinel displayed when the cell is empty) compares equal
+        to ``""`` (the literal cell text on an empty row). This
+        way a freshly-created row reads as non-divergent.
         """
         if self._selected_endpoint_row < 0:
             return False
         snapshot = self._endpoint_row_snapshot
         if snapshot is None:
             return False
+        cur_model = self.endpoint_model_combo.currentText().strip()
+        if cur_model == "(no model)":
+            cur_model = ""
         cur = (
-            self.endpoint_model_edit.text().strip(),
+            cur_model,
             self.endpoint_provider_combo.currentText().strip(),
-            self.endpoint_key_combo.currentData(),
+            self._parse_aliases(self.endpoint_aliases_edit.text()),
         )
-        # ``None`` userData on the key combo means "(no key)" —
-        # both sides use the same ``None`` representation, so
-        # equality is meaningful directly. Provider-name matches
-        # by *name* (string equality); the URL is resolved at write
-        # time and can drift without us noticing here, which is
-        # fine — it's a one-way render.
         return cur != snapshot
 
     def _on_endpoint_apply(self) -> None:
         """Commit the form's current values back to the selected row.
 
-        Updates the model name, the *resolved* provider URL, and
-        the key-ref of the selected row. The provider URL is
-        looked up via ``endpoint_provider_combo.currentData()`` —
-        the actual source of truth is the provider name on the
-        Providers tab, but we render the URL into the row's
-        ``Endpoint URL`` column for human readability.
+        Writes the model name (from the Model combo), the
+        provider_name (from the Provider combo), and the parsed
+        aliases tuple to the row's three cells.
 
         Re-snapshots the row so subsequent form edits re-derive
         from the new baseline. Apply is disabled until the form
         drifts again.
+
+        Validation lives in ``_on_accept`` — the model dropdown is
+        already constrained to the selected provider's catalog at
+        build-time, but the dialog rejects any Apply whose model
+        has somehow drifted (e.g. the provider's catalog changed
+        in another window before save).
         """
         row = self._selected_endpoint_row
         if row < 0:
             return
         if not self._endpoint_form_values_diverge_from_row():
-            # Nothing to apply; defensive — shouldn't normally
-            # fire because Apply is disabled when not divergent.
             return
-        new_model = self.endpoint_model_edit.text().strip()
+        new_model = self.endpoint_model_combo.currentText().strip()
+        # ``(no model)`` sentinel → empty cell text. Pre-refactor
+        # we had a free-text field so ``""`` was already valid;
+        # after the refactor we constrain to a dropdown, so the
+        # sentinel maps to the equivalent on-disk value.
+        if new_model == "(no model)":
+            new_model = ""
         new_provider_name = self.endpoint_provider_combo.currentText().strip()
+        # Pull URL from the Provider combo's UserRole for the cell
+        # display — the actual source of truth is the provider
+        # name; the URL is rendered for human readability.
         new_provider_url = (
             self.endpoint_provider_combo.currentData() or ""
         )
-        new_ref: str | None = self.endpoint_key_combo.currentData()
-        # Don't accept empty model name or empty provider URL —
-        # a row with an empty model or URL is filtered out by
-        # ``_collect_endpoints``.
         if not new_model:
             QMessageBox.warning(
                 self,
-                "Missing fields",
-                "Model name is required.",
+                "Missing model",
+                "Model is required. Pick a model from the dropdown "
+                "(the list comes from the selected provider's "
+                "Available Models).",
             )
             return
-        if not new_provider_url or new_provider_name == "(no provider)":
+        if (
+            not new_provider_name
+            or new_provider_name == "(no provider)"
+            or new_provider_url == ""
+        ):
             QMessageBox.warning(
                 self,
                 "Missing provider",
@@ -1846,30 +2159,46 @@ class ProfileEditorDialog(QDialog):
             )
             return
         # Replace the row's QTableWidgetItems in-place (preserving
-        # the read-only flag and any styling).
-        model_item = self.endpoints_table.item(row, 0)
+        # the read-only flag and any styling). New column order:
+        # Aliases | Provider | Model.
+        new_aliases = self._parse_aliases(self.endpoint_aliases_edit.text())
+        aliases_item = self.endpoints_table.item(row, 0)
+        if aliases_item is None:
+            aliases_item = QTableWidgetItem()
+            aliases_item.setFlags(
+                aliases_item.flags() & ~Qt.ItemFlag.ItemIsEditable
+            )
+            self.endpoints_table.setItem(row, 0, aliases_item)
+        aliases_item.setText(self._format_aliases(new_aliases))
+        provider_item = self.endpoints_table.item(row, 1)
+        if provider_item is None:
+            provider_item = QTableWidgetItem()
+            provider_item.setFlags(provider_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.endpoints_table.setItem(row, 1, provider_item)
+        provider_item.setText(new_provider_name)
+        # ``UserRole`` carries the provider_name — the stable
+        # identity used by ``_collect_endpoints`` on save.
+        provider_item.setData(Qt.ItemDataRole.UserRole, new_provider_name)
+        # Replace the Model cell (col 2 — the real upstream ID).
+        model_item = self.endpoints_table.item(row, 2)
         if model_item is None:
             model_item = QTableWidgetItem()
             model_item.setFlags(model_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.endpoints_table.setItem(row, 0, model_item)
+            self.endpoints_table.setItem(row, 2, model_item)
         model_item.setText(new_model)
-        url_item = self.endpoints_table.item(row, 1)
-        if url_item is None:
-            url_item = QTableWidgetItem()
-            url_item.setFlags(url_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.endpoints_table.setItem(row, 1, url_item)
-        url_item.setText(new_provider_url)
-        # ``UserRole`` carries the provider_name — without this
-        # update, ``_collect_endpoints`` would persist the *old*
-        # provider name even though the URL cell shows the new one.
-        url_item.setData(Qt.ItemDataRole.UserRole, new_provider_name)
-        # Replace the API Key cell with a refreshed item so the
-        # display text tracks whether the new ref is still valid.
-        key_item = self._make_endpoint_key_item(new_ref)
-        key_item.setFlags(key_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.endpoints_table.setItem(row, 2, key_item)
+        # Reflect the canonical aliases text back into the form so the user
+        # sees the deduped/trimmed version they just persisted.
+        self.endpoint_aliases_edit.blockSignals(True)
+        try:
+            self.endpoint_aliases_edit.setText(
+                self._format_aliases(new_aliases)
+            )
+        finally:
+            self.endpoint_aliases_edit.blockSignals(False)
         # Refresh the baseline so the form is once again non-divergent.
-        self._endpoint_row_snapshot = (new_model, new_provider_name, new_ref)
+        self._endpoint_row_snapshot = (
+            new_model, new_provider_name, new_aliases
+        )
         self._refresh_endpoint_apply_state()
 
     def _on_endpoint_revert(self) -> None:
@@ -1877,42 +2206,39 @@ class ProfileEditorDialog(QDialog):
         snapshot = self._endpoint_row_snapshot
         if snapshot is None:
             return
-        model_text, provider_name, ref = snapshot
-        self.endpoint_model_edit.blockSignals(True)
+        model_text, provider_name, aliases = snapshot
+        self.endpoint_model_combo.blockSignals(True)
         self.endpoint_provider_combo.blockSignals(True)
-        self.endpoint_key_combo.blockSignals(True)
+        self.endpoint_aliases_edit.blockSignals(True)
         try:
-            self.endpoint_model_edit.setText(model_text)
-            # Re-select the corresponding provider combo item by
-            # *name*. ``(no provider)`` falls back to index 0.
-            target_idx = 0
-            for i in range(self.endpoint_provider_combo.count()):
-                if self.endpoint_provider_combo.itemText(i) == provider_name:
-                    target_idx = i
-                    break
-            self.endpoint_provider_combo.setCurrentIndex(target_idx)
-            # Re-select the corresponding key combo item by ref.
-            target_idx = 0
-            for i in range(self.endpoint_key_combo.count()):
-                if self.endpoint_key_combo.itemData(i) == ref:
-                    target_idx = i
-                    break
-            self.endpoint_key_combo.setCurrentIndex(target_idx)
+            # Re-select the Provider combo by name; then re-populate
+            # the Model combo from that provider's catalog and pick
+            # ``model_text`` if it's still present.
+            self._repopulate_endpoint_provider_combo_for_name_and_url(
+                provider_name, ""
+            )
+            self._refresh_endpoint_model_combo(model_text)
+            # Restore aliases text.
+            self.endpoint_aliases_edit.setText(self._format_aliases(aliases))
             self._refresh_endpoint_url_hint()
         finally:
-            self.endpoint_model_edit.blockSignals(False)
+            self.endpoint_model_combo.blockSignals(False)
             self.endpoint_provider_combo.blockSignals(False)
-            self.endpoint_key_combo.blockSignals(False)
+            self.endpoint_aliases_edit.blockSignals(False)
         self._refresh_endpoint_apply_state()
     # ---- Providers tab: row selection + form editor --------------------
 
     def _on_provider_selection_changed(self) -> None:
-        """Mirror the currently-selected provider's name + URL into the form.
+        """Mirror the currently-selected provider's row into the form.
 
-        Triggered by ``itemSelectionChanged``. The ``default`` row's
-        name is structurally fixed (refused at Apply) but its URL is
-        editable. Apply/Revert start disabled — the form freshly
-        mirrors the row, so divergence is zero.
+        Triggered by ``itemSelectionChanged``. Reads the four row
+        cells — Name, URL, API Key (ref via ``UserRole``),
+        Available Models (comma-joined text) — and mirrors them into
+        the form's four fields. The ``default`` row's name is
+        structurally fixed (refused at Apply) but its URL and the
+        rest of the form fields remain editable. Apply/Revert start
+        disabled — the form freshly mirrors the row, so divergence
+        is zero.
         """
         sel = self.providers_table.selectionModel()
         row = sel.selectedRows()[0].row() if sel and sel.selectedRows() else -1
@@ -1927,8 +2253,22 @@ class ProfileEditorDialog(QDialog):
             return
         name_item = self.providers_table.item(row, 0)
         url_item = self.providers_table.item(row, 1)
+        key_item = self.providers_table.item(row, 2)
+        models_item = self.providers_table.item(row, 3)
         name_text = name_item.text() if name_item is not None else ""
         url_text = url_item.text() if url_item is not None else ""
+        key_ref: str | None = (
+            key_item.data(Qt.ItemDataRole.UserRole)
+            if key_item is not None
+            else None
+        )
+        # Available Models — comma-separated text on disk, parsed
+        # to a tuple here so the form's snapshot carries the
+        # canonical form. The form's ``provider_models_edit``
+        # re-renders the tuple back to comma-separated text so the
+        # user sees the same view either side.
+        models_text = models_item.text() if models_item is not None else ""
+        models = self._parse_aliases(models_text)
         is_default = bool(
             name_item.data(Qt.ItemDataRole.UserRole)
             if name_item is not None else False
@@ -1936,13 +2276,25 @@ class ProfileEditorDialog(QDialog):
         self._set_provider_form_enabled(True)
         self.provider_name_edit.blockSignals(True)
         self.provider_url_edit.blockSignals(True)
+        self.provider_key_combo.blockSignals(True)
+        self.provider_models_edit.blockSignals(True)
         try:
             self.provider_name_edit.setText(name_text)
             self.provider_url_edit.setText(url_text)
+            # Repopulate the API Key combo with the *current* keys
+            # then select the row's stored ref — combo contents
+            # can change between selections (Add/Remove on the API
+            # Keys tab), so a stale index would mis-display.
+            self._repopulate_provider_key_combo_for_ref(key_ref)
+            self.provider_models_edit.setText(self._format_aliases(models))
         finally:
             self.provider_name_edit.blockSignals(False)
             self.provider_url_edit.blockSignals(False)
-        self._provider_row_snapshot = (name_text, url_text, is_default)
+            self.provider_key_combo.blockSignals(False)
+            self.provider_models_edit.blockSignals(False)
+        self._provider_row_snapshot = (
+            name_text, url_text, key_ref, models, is_default
+        )
         self.provider_form_status.setText(
             f"Editing row {row + 1} of {self.providers_table.rowCount()}"
         )
@@ -1952,9 +2304,36 @@ class ProfileEditorDialog(QDialog):
             self.providers_remove_btn.setEnabled(not is_default)
         self._refresh_provider_apply_state()
 
+    def _current_provider_models(self, name: str) -> tuple[str, ...]:
+        """Return the ``available_models`` tuple for the named provider.
+
+        Reads the column-3 cell text on the providers table and
+        parses it back to a tuple via ``_parse_aliases`` (same
+        dedupe / trim rules). Returns ``()`` if the provider can't
+        be found — the caller can decide whether ``()`` should
+        prompt a warning or fall through.
+
+        Used by the Model Configuration tab to populate its
+        per-row Model dropdown when the user picks a provider.
+        """
+        target = name.strip()
+        if not target:
+            return ()
+        for row in range(self.providers_table.rowCount()):
+            item = self.providers_table.item(row, 0)
+            if item is None or item.text().strip() != target:
+                continue
+            models_item = self.providers_table.item(row, 3)
+            if models_item is None:
+                return ()
+            return self._parse_aliases(models_item.text())
+        return ()
+
     def _set_provider_form_enabled(self, enabled: bool) -> None:
         self.provider_name_edit.setEnabled(enabled)
         self.provider_url_edit.setEnabled(enabled)
+        self.provider_key_combo.setEnabled(enabled)
+        self.provider_models_edit.setEnabled(enabled)
         if not enabled:
             self.provider_apply_btn.setEnabled(False)
             self.provider_revert_btn.setEnabled(False)
@@ -1986,8 +2365,13 @@ class ProfileEditorDialog(QDialog):
         cur = (
             self.provider_name_edit.text().strip(),
             self.provider_url_edit.text().strip(),
+            self.provider_key_combo.currentData(),
+            self._parse_aliases(self.provider_models_edit.text()),
         )
-        return cur != (snapshot[0].strip(), snapshot[1].strip())
+        # Snapshot is ``(name, url, key_ref, available_models,
+        # is_default)``; the trailing ``is_default`` flag doesn't
+        # participate in the divergence check (it's structural).
+        return cur != (snapshot[0], snapshot[1], snapshot[2], snapshot[3])
 
     def _on_provider_apply(self) -> None:
         """Commit the form's values back to the selected provider row.
@@ -1998,12 +2382,20 @@ class ProfileEditorDialog(QDialog):
         record. Renames are not separately tracked; ``_on_accept``
         re-reads the providers table directly, so the displayed row
         text is what gets persisted.
+
+        Available Models parses + dedupes via ``_parse_aliases``;
+        the canonical comma-joined form is reflected back into both
+        the cell and the form so the user sees the normalised
+        version they just persisted (mirrors the alias flow on the
+        Model Configuration tab).
         """
         row = self._selected_provider_row
         if row < 0:
             return
         new_name = self.provider_name_edit.text().strip()
         new_url = self.provider_url_edit.text().strip()
+        new_models = self._parse_aliases(self.provider_models_edit.text())
+        new_key: str | None = self.provider_key_combo.currentData()
         if not new_name:
             QMessageBox.warning(
                 self, "Missing name", "Provider name cannot be empty."
@@ -2035,10 +2427,31 @@ class ProfileEditorDialog(QDialog):
             name_item.setText(new_name)
         if url_item is not None:
             url_item.setText(new_url)
-        self._provider_row_snapshot = (new_name, new_url, is_default)
+        # API Key column: re-render via the shared helper so the
+        # display name + yellow stale-ref hint refresh.
+        key_item = self._make_provider_key_item(new_key)
+        key_item.setFlags(key_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.providers_table.setItem(row, 2, key_item)
+        # Available Models column: comma-separated text.
+        models_item = self.providers_table.item(row, 3)
+        if models_item is None:
+            models_item = QTableWidgetItem()
+            models_item.setFlags(models_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.providers_table.setItem(row, 3, models_item)
+        models_item.setText(self._format_aliases(new_models))
+        # Reflect the canonical models text back into the form so the
+        # user sees the deduped/trimmed version.
+        self.provider_models_edit.blockSignals(True)
+        try:
+            self.provider_models_edit.setText(self._format_aliases(new_models))
+        finally:
+            self.provider_models_edit.blockSignals(False)
+        self._provider_row_snapshot = (
+            new_name, new_url, new_key, new_models, is_default,
+        )
         # Provider changes invalidate the Model Configuration tab's
-        # per-row provider combo — rebuild it so any selected
-        # endpoint picks the renamed provider by its new name.
+        # per-row provider combo AND its model combo (which depends
+        # on the provider's available_models). Rebuild both.
         self._refresh_endpoint_provider_combo_for_provider_name(new_name)
         self._refresh_provider_apply_state()
 
@@ -2046,15 +2459,26 @@ class ProfileEditorDialog(QDialog):
         snapshot = self._provider_row_snapshot
         if snapshot is None:
             return
-        name_text, url_text, _ = snapshot
+        name_text, url_text, key_ref, models, _ = snapshot
         self.provider_name_edit.blockSignals(True)
         self.provider_url_edit.blockSignals(True)
+        self.provider_key_combo.blockSignals(True)
+        self.provider_models_edit.blockSignals(True)
         try:
             self.provider_name_edit.setText(name_text)
             self.provider_url_edit.setText(url_text)
+            # Re-populate the API Key combo with the *current* keys
+            # and select the snapshot's ref. The combo's contents
+            # can change between selection and revert (Add/Remove
+            # on the API Keys tab), so a stale ``setCurrentIndex``
+            # by name would leave the combo on a wrong entry.
+            self._repopulate_provider_key_combo_for_ref(key_ref)
+            self.provider_models_edit.setText(self._format_aliases(models))
         finally:
             self.provider_name_edit.blockSignals(False)
             self.provider_url_edit.blockSignals(False)
+            self.provider_key_combo.blockSignals(False)
+            self.provider_models_edit.blockSignals(False)
         self._refresh_provider_apply_state()
 
     def _on_provider_add(self) -> None:
@@ -2289,6 +2713,36 @@ class ProfileEditorDialog(QDialog):
         return False
 
     def _on_accept(self) -> None:
+        # ---- snap-apply pending form edits ---------------------------
+        # The form-below-editor pattern requires a separate Apply
+        # click to commit. If the user types in the form and clicks OK
+        # without Apply, their typed values are read from the table
+        # cells (not the form) — which are still the row's old
+        # values, and the typed text is silently lost. Snap-apply
+        # any divergent form state just before reading the table so
+        # the user's last-typed text is always saved. Disabled when
+        # there's no selection or no divergence.
+        if (
+            getattr(self, "_selected_endpoint_row", -1) >= 0
+            and self._endpoint_form_values_diverge_from_row()
+        ):
+            self._on_endpoint_apply()
+        if (
+            getattr(self, "_selected_provider_row", -1) >= 0
+            and self._provider_form_values_diverge_from_row()
+        ):
+            self._on_provider_apply()
+        if (
+            getattr(self, "_selected_key_row", -1) >= 0
+            and self._key_form_values_diverge_from_row()
+        ):
+            self._on_key_apply()
+        if (
+            getattr(self, "_selected_env_row", -1) >= 0
+            and self._env_form_values_diverge_from_row()
+        ):
+            self._on_env_apply()
+
         # ---- validate name ---------------------------------------------
         name = self.name_edit.text().strip()
         if not name:
@@ -2414,34 +2868,109 @@ class ProfileEditorDialog(QDialog):
                 f"Rows: {stale_providers!r}",
             )
             return
-        # Warn about endpoints whose stored key_ref didn't match any
-        # defined key (the combo fell back to "(no key)" on open).
-        stale_keys: list[str] = []
+        # Each endpoint's model must be in its provider's
+        # ``available_models`` catalog. The form's Model combo is
+        # constrained at build time, but the user could have left
+        # a stale model in a cell before Apply (e.g. they edited
+        # the provider's catalog and an old model isn't there
+        # anymore), or migrated from a profile written under the
+        # old "free-text model" shape. Refuse to save and surface
+        # every offender.
+        stale_models: list[str] = []
         for model, ep in endpoints.items():
-            if ep.key_ref is not None and ep.key_ref not in key_names:
-                stale_keys.append(f"{model} -> {ep.key_ref}")
-        if stale_keys:
+            provider = providers.get(ep.provider_name)
+            if provider is None:
+                continue
+            catalog = tuple(provider.available_models or ())
+            if catalog and model not in catalog:
+                stale_models.append(
+                    f"{model!r} not in {ep.provider_name!r}.available_models"
+                )
+        if stale_models:
             QMessageBox.warning(
                 self,
-                "Missing API key references",
-                "These model/endpoint rows reference an API key that "
-                "no longer exists. The row's API Key dropdown has been "
-                "reset to '(no key)' — re-add the key on the API Keys "
-                "tab or pick another key, then save again.\n\n"
-                f"Rows: {stale_keys!r}",
+                "Model not in provider catalog",
+                "Each model must appear in the catalog of the "
+                "provider that hosts it. Add the model to the "
+                "provider's Available Models field on the "
+                "Providers tab, or pick a different provider.\n\n"
+                f"Models: {stale_models!r}",
             )
             return
+        # Aliases — validate uniqueness across the profile. Two real
+        # models claiming the same alias would silently shadow each
+        # other at request time, so refuse to save and let the user
+        # pick one. Alias-vs-real-name collisions (an alias that
+        # matches a different real model) are flagged as a soft
+        # warning so the user can confirm the intent.
+        alias_owner: dict[str, str] = {}
+        # ``alias_conflicts`` is a dict of ``alias -> [all models
+        # claiming it]``. Walking the dict in stable insertion order
+        # is enough for the warning message — we don't care which
+        # model "won" the first claim, only that multiple models
+        # claim the same alias.
+        alias_conflicts: dict[str, list[str]] = {}
+        for model, ep in endpoints.items():
+            for alias in ep.aliases:
+                if not isinstance(alias, str) or not alias:
+                    continue
+                if alias in alias_owner:
+                    if alias not in alias_conflicts:
+                        alias_conflicts[alias] = [alias_owner[alias]]
+                    alias_conflicts[alias].append(model)
+                else:
+                    alias_owner[alias] = model
+        if alias_conflicts:
+            pretty_parts: list[str] = []
+            for a, models in alias_conflicts.items():
+                claimed_by = ", ".join(repr(m) for m in models)
+                pretty_parts.append(f"{a!r} (claimed by {claimed_by})")
+            pretty = ", ".join(pretty_parts)
+            QMessageBox.warning(
+                self,
+                "Duplicate model aliases",
+                "Each alias must be claimed by exactly one model. "
+                "Two or more models list the same alias — pick "
+                "one to keep it on, or rename the others.\n\n"
+                f"Conflicts: {pretty}",
+            )
+            return
+        # Soft warning when an alias collides with a real model name.
+        alias_real_collisions: list[str] = []
+        for model in endpoints:
+            for alias in endpoints[model].aliases:
+                if alias in endpoints and alias != model:
+                    alias_real_collisions.append(
+                        f"{alias!r} (alias of {model!r}) shadows real model"
+                    )
+        if alias_real_collisions:
+            answer = QMessageBox.warning(
+                self,
+                "Alias shadows a real model",
+                "One or more aliases have the same name as a different "
+                "real model in this profile. Requests for that name will "
+                "route to the alias's target, not the real model — that's "
+                "probably what you want, but worth confirming.\n\n"
+                f"Collisions: {alias_real_collisions!r}\n\n"
+                "Save anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
         self._profile.model_endpoints = endpoints
 
-        # ---- default_model validation ----------------------------------
-        default_model = self.default_model_edit.text().strip() or None
-        if default_model and default_model not in endpoints:
-            QMessageBox.warning(
-                self,
-                "Unknown default model",
-                f"Default model {default_model!r} is not in the model endpoints table.",
-            )
-            return
+        # ---- default_model ----------------------------------------
+        # The General tab's dropdown is populated from aliases
+        # (preferred) plus a ``(real model: X)`` fallback for
+        # legacy profiles. Both choices are routable: an alias
+        # flows through the proxy's alias-rewrite layer at request
+        # time; a real model name resolves directly through
+        # ``model_endpoints`` lookup. We accept either; ``(no
+        # default)`` → ``None`` clears the field.
+        default_model: str | None = self.default_model_combo.currentData()
+        if default_model is not None:
+            default_model = str(default_model).strip() or None
         self._profile.default_model = default_model
 
         # ---- session_cwd ------------------------------------------------
@@ -2490,64 +3019,94 @@ class ProfileEditorDialog(QDialog):
         self.accept()
 
     def _collect_endpoints(self) -> dict[str, ModelEndpoint]:
-        """Read the endpoints table into ``{model: ModelEndpoint(provider_name, key_ref)}``.
+        """Read the endpoints table into ``{model: ModelEndpoint(provider_name, aliases)}``.
+
+        Column order: Aliases (col 0), Provider (col 1), Model
+        (col 2). ``key_ref`` and URL no longer live on the
+        endpoint — they belong to the provider — so the dataclass
+        is constructed from just two fields.
 
         Skips rows whose model name is empty or whose provider_name
         is empty (a row with no provider is filtered out — Apply
         rejects the row before the user reaches ``_on_accept`` so
         this should be defensive only).
 
-        The provider_name is read from the URL cell's ``UserRole``
-        (set in ``_append_endpoint_row``) — that's the stable
-        identity endpoints carry; the URL cell's text is just the
-        *resolved* URL rendered for human readability.
+        The provider_name is read from the Provider cell's
+        ``UserRole`` (set in ``_append_endpoint_row``) — that's
+        the stable identity endpoints carry; the cell's display
+        text *is* the provider name (the URL belongs to the
+        provider, not the endpoint).
+
+        Aliases come from column 0's text, parsed back into a
+        tuple. Empty / malformed text → empty tuple.
         """
         out: dict[str, ModelEndpoint] = {}
         for row in range(self.endpoints_table.rowCount()):
-            model_item = self.endpoints_table.item(row, 0)
-            url_item = self.endpoints_table.item(row, 1)
-            key_item = self.endpoints_table.item(row, 2)
+            aliases_item = self.endpoints_table.item(row, 0)
+            provider_item = self.endpoints_table.item(row, 1)
+            model_item = self.endpoints_table.item(row, 2)
             model = (model_item.text().strip() if model_item else "")
             if not model:
                 continue
             provider_name = ""
-            if url_item is not None:
-                stored = url_item.data(Qt.ItemDataRole.UserRole)
+            if provider_item is not None:
+                stored = provider_item.data(Qt.ItemDataRole.UserRole)
                 if isinstance(stored, str):
                     provider_name = stored
             if not provider_name:
                 continue
-            key_ref: str | None = None
-            if key_item is not None:
-                key_ref = key_item.data(Qt.ItemDataRole.UserRole)
+            aliases = self._parse_aliases(
+                aliases_item.text() if aliases_item is not None else ""
+            )
             out[model] = ModelEndpoint(
-                provider_name=provider_name, key_ref=key_ref
+                provider_name=provider_name,
+                aliases=aliases,
             )
         return out
 
     def _collect_providers(self) -> dict[str, Provider]:
-        """Read the providers table into ``{name: Provider(name, url)}``.
+        """Read the providers table into ``{name: Provider(name, url, key_ref, available_models)}``.
 
         Skips rows whose name or URL is empty. The ``default``
         provider is always present at row 0 (created in
         ``_populate_providers_table`` if missing); the rest follow
         in their current table order.
+
+        The ``key_ref`` is read from the API Key cell's
+        ``UserRole``; ``None`` means no proxy-side auth (the cell
+        text reads ``"(no key)"``). The ``available_models`` tuple
+        is parsed back from the column-3 cell text via
+        ``_parse_aliases`` — same dedupe / trim rules used on
+        write.
         """
         out: dict[str, Provider] = {}
         for row in range(self.providers_table.rowCount()):
             name_item = self.providers_table.item(row, 0)
             url_item = self.providers_table.item(row, 1)
+            key_item = self.providers_table.item(row, 2)
+            models_item = self.providers_table.item(row, 3)
             if name_item is None or url_item is None:
                 continue
             name = name_item.text().strip()
             url = url_item.text().strip()
             if not name or not url:
                 continue
-            # Strip stale whitespace and avoid empty-string provider
-            # names sneaking in as keys.
             if name in out:
                 continue
-            out[name] = Provider(name=name, url=url)
+            key_ref: str | None = None
+            if key_item is not None:
+                stored = key_item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(stored, str) and stored:
+                    key_ref = stored
+            available_models = self._parse_aliases(
+                models_item.text() if models_item is not None else ""
+            )
+            out[name] = Provider(
+                name=name,
+                url=url,
+                key_ref=key_ref,
+                available_models=available_models,
+            )
         return out
 
     # ---- public API --------------------------------------------------------

@@ -17,6 +17,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -26,6 +27,26 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 _PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
+
+
+# ``QMessageBox.warning`` is a *modal* dialog. Under the offscreen
+# Qt platform plugin it blocks indefinitely waiting for a click that
+# never comes — which silently wedges the test suite whenever a
+# validation path surfaces a popup. Stub it at import time so
+# validation failures are silent (rather than fatal) and the test
+# runner still observes the post-validation state to detect the
+# regression (e.g. ``dlg._on_accept`` not raising + button
+# remaining enabled when the user wants to confirm).
+from PySide6.QtWidgets import QMessageBox
+
+_original_warning = QMessageBox.warning
+
+
+def _silent_warning(*_args, **_kwargs):
+    return QMessageBox.StandardButton.Yes
+
+
+QMessageBox.warning = staticmethod(_silent_warning)
 
 
 def _qapp():
@@ -233,8 +254,9 @@ def test_profile_editor_has_bind_port_config_dir_widgets() -> None:
         dlg.name_edit.setText(default.name)
         # ``_populate`` already pre-adds an empty endpoint row so the
         # user has somewhere to type. Fill it in.
-        dlg.endpoints_table.item(0, 0).setText("claude-opus-4-8")
-        dlg.endpoints_table.item(0, 1).setText("https://x")
+        dlg.endpoints_table.item(0, 0).setText("")  # Aliases col
+        # Provider col already pre-populated as "default"
+        dlg.endpoints_table.item(0, 2).setText("claude-opus-4-8")  # Model col
         dlg._on_accept()
         edited = dlg.to_profile()
         assert edited.bind_address == "0.0.0.0"
@@ -532,9 +554,22 @@ def test_active_profile_drives_proxy_start() -> None:
             f"expected bind_address from active profile, got {captured.get('host')!r}"
         )
         assert captured.get("port") == 8765
+        # Post-refactor: endpoints map model → provider_name (the URL
+        # + auth come from ``providers_cfg``).
         assert captured.get("model_endpoints") == {
-            "claude-opus-4-8": "https://example.org"
-        }
+            "claude-opus-4-8": "default"
+        }, (
+            f"unexpected model_endpoints: {captured.get('model_endpoints')!r}"
+        )
+        assert captured.get("providers_cfg") == {
+            "default": {
+                "url": "https://example.org",
+                "api_key": None,
+                "available_models": [],
+            }
+        }, (
+            f"unexpected providers_cfg: {captured.get('providers_cfg')!r}"
+        )
     finally:
         w.close()
     print("✓ Active profile drives proxy start (host/port/model_endpoints)")
@@ -1011,7 +1046,7 @@ def test_profile_editor_widgets_live_in_their_expected_tabs() -> None:
     try:
         expected_tab = {
             "name_edit": "General",
-            "default_model_edit": "General",
+            "default_model_combo": "General",
             "bind_edit": "General",
             "port_edit": "General",
             "config_dir_edit": "General",
@@ -1187,6 +1222,7 @@ def test_api_key_value_persists_to_credential_store_on_save() -> None:
     """Editing a key's value via the form + clicking Apply persists
     the value to the global CredentialStore on the next OK."""
     from src.profiles import ProfileStore
+    from src.profiles.models import Provider
     from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
 
     _qapp()
@@ -1194,6 +1230,15 @@ def test_api_key_value_persists_to_credential_store_on_save() -> None:
     store = ProfileStore(path=base / "profiles.json")
     store.credential_store.set("default", "old-default-value")
     default = store.ensure_default()
+    # Seed the default provider with a model catalog so the
+    # endpoint Model combo has something to select (post-refactor
+    # the dropdown is constrained to provider.available_models).
+    default.providers = {
+        "default": Provider(
+            name="default", url="https://example.com",
+            available_models=("claude-opus-4-8",),
+        ),
+    }
     dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
     try:
         # The default row is auto-selected on open.
@@ -1212,7 +1257,7 @@ def test_api_key_value_persists_to_credential_store_on_save() -> None:
         # auto-seeds a ``default`` provider (and the auto-populated
         # row points at it), so we just type the model name and
         # click Apply.
-        dlg.endpoint_model_edit.setText("claude-opus-4-8")
+        dlg.endpoint_model_combo.setCurrentText("claude-opus-4-8")
         dlg.endpoint_apply_btn.click()
         assert not dlg.endpoint_apply_btn.isEnabled()
         dlg._on_accept()
@@ -1231,8 +1276,10 @@ def test_api_key_value_persists_to_credential_store_on_save() -> None:
 
 def test_endpoints_table_is_read_only_three_columns() -> None:
     """The endpoints table is read-only (no Qt cell editors) and has
-    3 columns: Model | Endpoint URL | API Key. The API Key column is
-    a plain text item whose UserRole carries the key_ref."""
+    3 columns: Aliases | Provider | Model. Aliases are the
+    user-facing identity (col 0); the real upstream model ID is
+    the rightmost column. The Provider column's ``UserRole``
+    carries ``provider_name``."""
     from src.profiles import ProfileStore
     from src.profiles.models import ModelEndpoint, Provider
     from PySide6.QtCore import Qt
@@ -1245,7 +1292,10 @@ def test_endpoints_table_is_read_only_three_columns() -> None:
     store.credential_store.set("default", "x")
     default = store.ensure_default()
     default.providers = {
-        "default": Provider(name="default", url="https://example.com"),
+        "default": Provider(
+            name="default", url="https://example.com",
+            available_models=("claude-opus-4-8",),
+        ),
     }
     default.model_endpoints = {
         "claude-opus-4-8": ModelEndpoint(provider_name="default"),
@@ -1258,26 +1308,28 @@ def test_endpoints_table_is_read_only_three_columns() -> None:
             dlg.endpoints_table.horizontalHeaderItem(i).text()
             for i in range(dlg.endpoints_table.columnCount())
         ]
-        assert headers == ["Model", "Endpoint URL", "API Key"], headers
+        assert headers == [
+            "Aliases", "Provider", "Model",
+        ], headers
         # Edit triggers are disabled — the form below is the editor.
         triggers = dlg.endpoints_table.editTriggers()
         assert triggers == QAbstractItemView.EditTrigger.NoEditTriggers, (
             f"expected no edit triggers, got {triggers!r}"
         )
-        # API Key column carries the key_ref via UserRole.
-        key_item = dlg.endpoints_table.item(0, 2)
-        assert key_item.data(Qt.ItemDataRole.UserRole) is None, (
-            "fresh profile has no key_ref so item userData is None"
+        # Provider column (col 1) carries the provider_name via UserRole.
+        provider_item = dlg.endpoints_table.item(0, 1)
+        assert provider_item.data(Qt.ItemDataRole.UserRole) == "default", (
+            "Provider cell UserRole should be the provider_name"
         )
     finally:
         dlg.deleteLater()
-    print("✓ Endpoints table: 3 columns, read-only, ref via UserRole")
+    print("✓ Endpoints table: 3 columns [Aliases|Provider|Model], read-only")
 
 
-def test_endpoints_form_list_keys_plus_no_key_option() -> None:
-    """The form's API Key ``QComboBox`` lists ``(no key)`` + every
-    defined key. The first row (claude-opus-4-8) is auto-selected on
-    open and the form mirrors its current values."""
+def test_endpoints_form_model_combo_constrained_to_provider_models() -> None:
+    """The form's Model ``QComboBox`` lists the selected provider's
+    ``available_models``. The first row (claude-opus-4-8) is
+    auto-selected on open and the form mirrors its current values."""
     from src.profiles import ProfileStore
     from src.profiles.models import ModelEndpoint, Provider
     from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
@@ -1286,10 +1338,12 @@ def test_endpoints_form_list_keys_plus_no_key_option() -> None:
     base = _tmp_dir()
     store = ProfileStore(path=base / "profiles.json")
     store.credential_store.set("default", "x")
-    store.credential_store.set("work", "y")
     default = store.ensure_default()
     default.providers = {
-        "default": Provider(name="default", url="https://example.com"),
+        "default": Provider(
+            name="default", url="https://example.com",
+            available_models=("claude-opus-4-8", "claude-sonnet-4-6"),
+        ),
     }
     default.model_endpoints = {
         "claude-opus-4-8": ModelEndpoint(provider_name="default"),
@@ -1299,19 +1353,25 @@ def test_endpoints_form_list_keys_plus_no_key_option() -> None:
     try:
         # Form is enabled because row 0 is auto-selected on open.
         assert dlg._selected_endpoint_row == 0
-        labels = [dlg.endpoint_key_combo.itemText(i) for i in range(dlg.endpoint_key_combo.count())]
-        assert "(no key)" in labels
-        assert "default" in labels
-        assert "work" in labels
+        labels = [
+            dlg.endpoint_model_combo.itemText(i)
+            for i in range(dlg.endpoint_model_combo.count())
+        ]
+        assert "claude-opus-4-8" in labels
+        assert "claude-sonnet-4-6" in labels
+        # The current model row's value should be auto-selected.
+        assert dlg.endpoint_model_combo.currentText() == "claude-opus-4-8"
     finally:
         dlg.deleteLater()
-    print("✓ Endpoint form combo lists '(no key)' + every defined key")
+    print("✓ Endpoint form model combo lists provider's available_models")
 
 
-def test_endpoints_row_apply_persists_key_ref_on_save() -> None:
-    """Picking a key in the form's combo + Apply commits the row's
-    new ``key_ref``; ``_on_accept`` then surfaces that ref on the
-    profile's ``ModelEndpoint``."""
+def test_endpoints_row_apply_persists_provider_name_on_save() -> None:
+    """Picking a provider in the form's combo + Apply commits the row's
+    new ``provider_name``; ``_on_accept`` then surfaces that ref on
+    the profile's ``ModelEndpoint``. ``key_ref`` no longer lives on
+    the endpoint after the refactor — it's a property of the
+    provider."""
     from src.profiles import ProfileStore
     from src.profiles.models import ModelEndpoint, Provider
     from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
@@ -1320,27 +1380,32 @@ def test_endpoints_row_apply_persists_key_ref_on_save() -> None:
     base = _tmp_dir()
     store = ProfileStore(path=base / "profiles.json")
     store.credential_store.set("default", "x")
-    store.credential_store.set("work", "y")
     default = store.ensure_default()
-    # Seed a non-default provider so the form's provider combo has
-    # something to pick. ``default`` is auto-seeded by the dialog.
+    # Two providers with non-overlapping model catalogs so the
+    # model combo actually rebuilds.
     default.providers = {
-        "default": Provider(name="default", url="https://example.com"),
-        "work": Provider(name="work", url="https://work.example.com"),
+        "default": Provider(
+            name="default", url="https://example.com",
+            available_models=("claude-opus-4-8",),
+        ),
+        "work": Provider(
+            name="work", url="https://work.example.com",
+            available_models=("claude-opus-4-8", "claude-sonnet-4-6"),
+        ),
     }
     dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
     try:
         # The form mirrors the empty pre-populated row.
         assert dlg._selected_endpoint_row == 0
-        # Type a new model name, pick the ``work`` provider + key.
-        dlg.endpoint_model_edit.setText("claude-opus-4-8")
+        # Pick the ``work`` provider via combo.
         for i in range(dlg.endpoint_provider_combo.count()):
             if dlg.endpoint_provider_combo.itemText(i) == "work":
                 dlg.endpoint_provider_combo.setCurrentIndex(i)
                 break
-        for i in range(dlg.endpoint_key_combo.count()):
-            if dlg.endpoint_key_combo.itemText(i) == "work":
-                dlg.endpoint_key_combo.setCurrentIndex(i)
+        # Pick claude-opus-4-8 from the work provider's catalog.
+        for i in range(dlg.endpoint_model_combo.count()):
+            if dlg.endpoint_model_combo.itemText(i) == "claude-opus-4-8":
+                dlg.endpoint_model_combo.setCurrentIndex(i)
                 break
         assert dlg.endpoint_apply_btn.isEnabled()
         dlg.endpoint_apply_btn.click()
@@ -1353,12 +1418,13 @@ def test_endpoints_row_apply_persists_key_ref_on_save() -> None:
         assert ep.provider_name == "work", (
             f"expected provider_name='work', got {ep.provider_name!r}"
         )
-        assert ep.key_ref == "work", (
-            f"expected key_ref='work', got {ep.key_ref!r}"
+        # ModelEndpoint no longer carries key_ref.
+        assert not hasattr(ep, "key_ref") or ep.key_ref is None, (
+            "ModelEndpoint.key_ref was dropped in the refactor"
         )
     finally:
         dlg.deleteLater()
-    print("✓ Endpoint row Apply persists provider_name + key_ref on save")
+    print("✓ Endpoint row Apply persists provider_name on save")
 
 
 def test_endpoints_form_apply_disabled_until_divergence() -> None:
@@ -1374,22 +1440,23 @@ def test_endpoints_form_apply_disabled_until_divergence() -> None:
     store.credential_store.set("default", "x")
     default = store.ensure_default()
     default.providers = {
-        "default": Provider(name="default", url="https://x"),
+        "default": Provider(
+            name="default", url="https://x",
+            available_models=("claude-opus-4-8", "claude-sonnet-4-6"),
+        ),
     }
     default.model_endpoints = {
-        "claude-opus-4-8": ModelEndpoint(
-            provider_name="default", key_ref="default",
-        ),
+        "claude-opus-4-8": ModelEndpoint(provider_name="default"),
     }
     store.upsert(default)
     dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
     try:
         assert not dlg.endpoint_apply_btn.isEnabled()
-        # Mutate the provider combo (pick a different provider) →
+        # Mutate the model combo (pick a different model) →
         # Apply enables.
-        for i in range(dlg.endpoint_provider_combo.count()):
-            if dlg.endpoint_provider_combo.itemText(i) == "(no provider)":
-                dlg.endpoint_provider_combo.setCurrentIndex(i)
+        for i in range(dlg.endpoint_model_combo.count()):
+            if dlg.endpoint_model_combo.itemText(i) == "claude-sonnet-4-6":
+                dlg.endpoint_model_combo.setCurrentIndex(i)
                 break
         assert dlg.endpoint_apply_btn.isEnabled()
         # Revert → Apply disables.
@@ -1404,9 +1471,10 @@ def test_endpoints_form_apply_disabled_until_divergence() -> None:
     print("✓ Endpoint form Apply enables on divergence, Revert disables")
 
 
-def test_endpoints_stale_ref_falls_back_to_no_key_in_form() -> None:
-    """If a profile's stored ``key_ref`` no longer matches any key,
-    the form's combo falls back to ``(no key)`` on row select."""
+def test_provider_stale_key_ref_falls_back_to_no_key_in_form() -> None:
+    """If a provider's stored ``key_ref`` no longer matches any key,
+    the form's combo falls back to ``(no key)`` on row select. Post-
+    refactor the key lives on the *provider*, not the endpoint."""
     from src.profiles import ProfileStore
     from src.profiles.models import ModelEndpoint, Provider
     from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
@@ -1417,17 +1485,21 @@ def test_endpoints_stale_ref_falls_back_to_no_key_in_form() -> None:
     store.credential_store.set("default", "x")
     default = store.ensure_default()
     default.providers = {
-        "default": Provider(name="default", url="https://x"),
+        "default": Provider(
+            name="default", url="https://x", key_ref="stale",
+            available_models=("claude-opus-4-8",),
+        ),
     }
     default.model_endpoints = {
-        "claude-opus-4-8": ModelEndpoint(provider_name="default", key_ref="stale"),
+        "claude-opus-4-8": ModelEndpoint(provider_name="default"),
     }
     store.upsert(default)
     dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
     try:
-        # Row 0 is auto-selected → the form's combo falls back.
-        assert dlg.endpoint_key_combo.currentText() == "(no key)", (
-            "stale ref should fall back to '(no key)' in the form"
+        # Row 0 (the "default" provider) is auto-selected → the
+        # form's combo falls back.
+        assert dlg.provider_key_combo.currentText() == "(no key)", (
+            "stale provider key_ref should fall back to '(no key)'"
         )
     finally:
         dlg.deleteLater()
@@ -1470,42 +1542,66 @@ def test_api_keys_form_supports_rename_on_default() -> None:
     the value is editable. Typing a new value + Apply + OK
     persists it to the global CredentialStore."""
     from src.profiles import ProfileStore
+    from src.profiles.models import Provider
     from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+    from PySide6.QtWidgets import QMessageBox
 
     _qapp()
     base = _tmp_dir()
     store = ProfileStore(path=base / "profiles.json")
     store.credential_store.set("default", "old-value")
     default = store.ensure_default()
-    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    # Seed the default provider with a model catalog so the
+    # endpoint Model combo has something to pick (dropdown is
+    # constrained post-refactor).
+    default.providers = {
+        "default": Provider(
+            name="default", url="https://example.com",
+            available_models=("claude-opus-4-8",),
+        ),
+    }
+    # ``_on_accept`` raises ``QMessageBox.warning`` for any
+    # validation failure. The offscreen Qt platform happily
+    # *blocks* on those modals waiting for a click that never
+    # comes — replace with a silent logger so the test isn't a
+    # 60-second hang on the first failure.
+    orig_warning = QMessageBox.warning
+
+    def _silent_warning(*_a, **_kw):
+        return QMessageBox.StandardButton.Yes
+
+    QMessageBox.warning = staticmethod(_silent_warning)
     try:
-        assert dlg._selected_key_row == 0
-        # The default row's value column shows 'old-value' as a
-        # masked dot string. Edit the form's value + Apply.
-        dlg.key_value_edit.setText("new-value")
-        assert dlg.key_apply_btn.isEnabled()
-        dlg.key_apply_btn.click()
-        # After Apply, the form is reset (Apply disabled).
-        assert not dlg.key_apply_btn.isEnabled()
-        # Also need an endpoint row to satisfy _on_accept. The dialog
-        # auto-seeds a ``default`` provider on open, so the row's
-        # pre-populated provider combo is already valid; we just
-        # type a model name and Apply.
-        dlg.endpoint_model_edit.setText("claude-opus-4-8")
-        dlg.endpoint_apply_btn.click()
-        assert not dlg.endpoint_apply_btn.isEnabled()
-        dlg._on_accept()
-        assert store.credential_store.get("default") == "new-value", (
-            f"expected new default value, got {store.credential_store.get('default')!r}"
-        )
+        dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+        try:
+            assert dlg._selected_key_row == 0
+            # The default row's value column shows 'old-value' as a
+            # masked dot string. Edit the form's value + Apply.
+            dlg.key_value_edit.setText("new-value")
+            assert dlg.key_apply_btn.isEnabled()
+            dlg.key_apply_btn.click()
+            # After Apply, the form is reset (Apply disabled).
+            assert not dlg.key_apply_btn.isEnabled()
+            # Also need an endpoint row to satisfy _on_accept. Pick
+            # the only model in the catalog.
+            dlg.endpoint_model_combo.setCurrentText("claude-opus-4-8")
+            dlg.endpoint_apply_btn.click()
+            assert not dlg.endpoint_apply_btn.isEnabled()
+            dlg._on_accept()
+            assert store.credential_store.get("default") == "new-value", (
+                f"expected new default value, got "
+                f"{store.credential_store.get('default')!r}"
+            )
+        finally:
+            dlg.deleteLater()
     finally:
-        dlg.deleteLater()
+        QMessageBox.warning = orig_warning
     print("✓ API Keys form supports editing Default row's value")
 
 
-def test_resolve_api_key_returns_endpoint_key_value() -> None:
-    """``resolve_api_key`` walks default_model → endpoint → key_ref
-    → CredentialStore."""
+def test_resolve_api_key_walks_provider_chain() -> None:
+    """``resolve_api_key`` walks default_model → endpoint →
+    provider → key_ref → CredentialStore (post-refactor)."""
     from src.profiles import ClaudeProfile, CredentialStore, ModelEndpoint, Provider
     from src.profiles.env_builder import resolve_api_key
 
@@ -1517,19 +1613,19 @@ def test_resolve_api_key_returns_endpoint_key_value() -> None:
         name="P",
         slug="p",
         providers={
-            "default": Provider(name="default", url="https://x"),
+            "default": Provider(name="default", url="https://x", key_ref="work"),
         },
         model_endpoints={
-            "claude-opus-4-8": ModelEndpoint(provider_name="default", key_ref="work"),
+            "claude-opus-4-8": ModelEndpoint(provider_name="default"),
         },
         default_model="claude-opus-4-8",
     )
     assert resolve_api_key(profile, store) == "sk-work-12345"
-    print("✓ resolve_api_key returns the resolved key value")
+    print("✓ resolve_api_key walks default_model → provider → key_ref")
 
 
 def test_resolve_api_key_returns_none_when_no_key_ref() -> None:
-    """``resolve_api_key`` returns ``None`` when the endpoint has no
+    """``resolve_api_key`` returns ``None`` when the provider has no
     key_ref — the env builder will substitute the sentinel."""
     from src.profiles import ClaudeProfile, CredentialStore, ModelEndpoint, Provider
     from src.profiles.env_builder import resolve_api_key
@@ -1541,7 +1637,10 @@ def test_resolve_api_key_returns_none_when_no_key_ref() -> None:
         name="P",
         slug="p",
         providers={
-            "default": Provider(name="default", url="https://x"),
+            "default": Provider(
+                name="default", url="https://x",
+                available_models=("claude-opus-4-8",),
+            ),
         },
         model_endpoints={
             "claude-opus-4-8": ModelEndpoint(provider_name="default"),
@@ -1586,6 +1685,7 @@ def test_env_vars_form_apply_persists_value() -> None:
     """Editing an env var via the form + Apply persists on OK so
     ``_on_accept`` picks it up via ``_table_pairs``."""
     from src.profiles import ProfileStore
+    from src.profiles.models import Provider
     from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
 
     _qapp()
@@ -1593,6 +1693,14 @@ def test_env_vars_form_apply_persists_value() -> None:
     store = ProfileStore(path=base / "profiles.json")
     store.credential_store.set("default", "x")
     default = store.ensure_default()
+    # Need a Provider with a catalog containing claude-opus-4-8 so
+    # the constrained Model combo has a selectable entry.
+    default.providers = {
+        "default": Provider(
+            name="default", url="https://example.com",
+            available_models=("claude-opus-4-8",),
+        ),
+    }
     dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
     try:
         # Need an env row + an endpoint row first.
@@ -1614,7 +1722,7 @@ def test_env_vars_form_apply_persists_value() -> None:
         # Need an endpoint row for _on_accept. The dialog auto-seeds a
         # ``default`` provider on open, so the form's pre-populated
         # combo is valid; we just type a model name and Apply.
-        dlg.endpoint_model_edit.setText("claude-opus-4-8")
+        dlg.endpoint_model_combo.setCurrentText("claude-opus-4-8")
         dlg.endpoint_apply_btn.click()
         dlg._on_accept()
         edited = dlg.to_profile()
@@ -1648,10 +1756,13 @@ def test_clicks_endpoints_tab_does_not_corrupt_state() -> None:
     store.credential_store.set("work", "y")
     default = store.ensure_default()
     default.providers = {
-        "default": Provider(name="default", url="https://example.com"),
+        "default": Provider(
+            name="default", url="https://example.com",
+            available_models=("claude-opus-4-8",),
+        ),
     }
     default.model_endpoints = {
-        "claude-opus-4-8": ModelEndpoint(provider_name="default", key_ref="work"),
+        "claude-opus-4-8": ModelEndpoint(provider_name="default"),
     }
     store.upsert(default)
     dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
@@ -1785,7 +1896,7 @@ def test_providers_form_apply_persists_url_on_save() -> None:
     commits the URL to the table; ``_on_accept`` writes it to the
     profile."""
     from src.profiles import ProfileStore
-    from src.profiles.models import ModelEndpoint, Provider
+    from src.profiles.models import Provider
     from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
 
     _qapp()
@@ -1793,6 +1904,15 @@ def test_providers_form_apply_persists_url_on_save() -> None:
     store = ProfileStore(path=base / "profiles.json")
     store.credential_store.set("default", "x")
     default = store.ensure_default()
+    # Seed the default provider with a model catalog so the
+    # endpoint Model combo has something selectable (post-refactor
+    # the dropdown is constrained to provider.available_models).
+    default.providers = {
+        "default": Provider(
+            name="default", url="https://api.example.com",
+            available_models=("claude-opus-4-8",),
+        ),
+    }
     dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
     try:
         # Row 0 (default) is auto-selected. Form is populated.
@@ -1805,7 +1925,7 @@ def test_providers_form_apply_persists_url_on_save() -> None:
         assert not dlg.provider_apply_btn.isEnabled()
         # Add an endpoint row that references the default provider
         # so _on_accept has something to commit.
-        dlg.endpoint_model_edit.setText("claude-opus-4-8")
+        dlg.endpoint_model_combo.setCurrentText("claude-opus-4-8")
         dlg.endpoint_apply_btn.click()
         dlg._on_accept()
         edited = dlg.to_profile()
@@ -1996,10 +2116,11 @@ def test_model_config_form_url_hint_reflects_selection() -> None:
     print("✓ URL hint updates with provider selection")
 
 
-def test_model_config_endpoint_table_displays_resolved_url() -> None:
-    """The Model Configuration table's ``Endpoint URL`` column shows
-    the *resolved* URL (looked up via the named provider), so the
-    user can see what they're routing through at a glance."""
+def test_model_config_endpoint_table_displays_provider_name() -> None:
+    """The Model Configuration table's ``Provider`` column shows the
+    *provider name* (not the URL). The URL is exposed via the
+    form's URL hint label so the user can still see it without
+    switching back to the Providers tab."""
     from src.profiles import ProfileStore
     from src.profiles.models import ModelEndpoint, Provider
     from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
@@ -2010,7 +2131,10 @@ def test_model_config_endpoint_table_displays_resolved_url() -> None:
     store.credential_store.set("default", "x")
     default = store.ensure_default()
     default.providers = {
-        "default": Provider(name="default", url="https://api.anthropic.com"),
+        "default": Provider(
+            name="default", url="https://api.anthropic.com",
+            available_models=("claude-opus-4-8",),
+        ),
     }
     default.model_endpoints = {
         "claude-opus-4-8": ModelEndpoint(provider_name="default"),
@@ -2018,13 +2142,1174 @@ def test_model_config_endpoint_table_displays_resolved_url() -> None:
     store.upsert(default)
     dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
     try:
-        url_text = dlg.endpoints_table.item(0, 1).text()
-        assert url_text == "https://api.anthropic.com", (
-            f"endpoint URL cell should be the resolved URL, got {url_text!r}"
+        # Column 1 (post-refactor) is the provider *name*;
+        # UserRole carries the same name as a stable identity.
+        provider_text = dlg.endpoints_table.item(0, 1).text()
+        assert provider_text == "default", (
+            f"endpoint row should display the provider name, got "
+            f"{provider_text!r}"
+        )
+        # The URL is on the hint label below the form's Provider
+        # combo, rendered when a row is selected.
+        dlg.endpoints_table.selectRow(0)
+        assert "api.anthropic.com" in dlg.endpoint_url_hint.text(), (
+            f"URL hint should reflect the selected provider's URL, got "
+            f"{dlg.endpoint_url_hint.text()!r}"
         )
     finally:
         dlg.deleteLater()
     print("✓ Model Configuration table shows resolved URL")
+
+
+# ---- Model Configuration: aliases ----------------------------------------
+
+
+def test_endpoint_aliases_form_apply_persists_aliases_on_save() -> None:
+    """Type a comma-separated alias list in the form + Apply + Save
+    persists the parsed tuple on the profile's ``ModelEndpoint.aliases``."""
+    from src.profiles import ProfileStore
+    from src.profiles.models import ModelEndpoint, Provider
+    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+
+    _qapp()
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    store.credential_store.set("default", "x")
+    default = store.ensure_default()
+    default.providers = {
+        "default": Provider(
+            name="default", url="https://api.anthropic.com",
+            available_models=("claude-opus-4-8",),
+        ),
+    }
+    store.upsert(default)
+    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    try:
+        # Row 0 is the auto-populated empty row.
+        assert dlg._selected_endpoint_row == 0
+        # Pick the model + type aliases + click Apply.
+        dlg.endpoint_model_combo.setCurrentText("claude-opus-4-8")
+        dlg.endpoint_aliases_edit.setText("opus, team-pro")
+        assert dlg.endpoint_apply_btn.isEnabled(), (
+            "Apply should enable once form diverges from row"
+        )
+        dlg.endpoint_apply_btn.click()
+        assert not dlg.endpoint_apply_btn.isEnabled(), (
+            "Apply should disable after commit"
+        )
+        # The Aliases cell (col 0 — alias-first column order)
+        # shows the canonical form.
+        assert dlg.endpoints_table.item(0, 0).text() == "opus, team-pro"
+        dlg._on_accept()
+        edited = dlg.to_profile()
+        ep = edited.model_endpoints["claude-opus-4-8"]
+        assert ep.aliases == ("opus", "team-pro"), (
+            f"expected aliases=('opus', 'team-pro'), got {ep.aliases!r}"
+        )
+    finally:
+        dlg.deleteLater()
+    print("✓ Endpoint aliases form Apply persists aliases on save")
+
+
+def test_endpoint_aliases_parse_dedupes_and_trims() -> None:
+    """``_parse_aliases`` strips whitespace, drops empties, dedupes,
+    preserves order. Trailing commas and repeated entries collapse."""
+    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+
+    # Static helper — no QApplication needed.
+    assert ProfileEditorDialog._parse_aliases("") == ()
+    assert ProfileEditorDialog._parse_aliases("opus") == ("opus",)
+    assert ProfileEditorDialog._parse_aliases("opus,team-pro") == (
+        "opus",
+        "team-pro",
+    )
+    assert ProfileEditorDialog._parse_aliases(
+        "opus, team-pro,opus,,"
+    ) == ("opus", "team-pro")
+    assert ProfileEditorDialog._parse_aliases("  opus  ,  team-pro  ") == (
+        "opus",
+        "team-pro",
+    )
+    assert ProfileEditorDialog._parse_aliases(",,, ,") == ()
+    print("✓ Alias parser trims, dedupes, drops empties")
+
+
+def test_endpoint_aliases_form_persists_after_row_reselect() -> None:
+    """After Apply, switching to another row + back to the original
+    row leaves the aliases text intact in the form."""
+    from src.profiles import ProfileStore
+    from src.profiles.models import ModelEndpoint, Provider
+    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+
+    _qapp()
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    store.credential_store.set("default", "x")
+    default = store.ensure_default()
+    default.providers = {
+        "default": Provider(
+            name="default", url="https://api.anthropic.com",
+            available_models=("claude-opus-4-8", "claude-haiku-4-5"),
+        ),
+    }
+    store.upsert(default)
+    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    try:
+        # Set up two rows: row 0 with aliases, row 1 empty.
+        dlg.endpoint_model_combo.setCurrentText("claude-opus-4-8")
+        dlg.endpoint_aliases_edit.setText("opus, team-pro")
+        dlg.endpoint_apply_btn.click()
+        dlg._on_endpoint_add()
+        dlg.endpoint_model_combo.setCurrentText("claude-haiku-4-5")
+        dlg.endpoint_apply_btn.click()
+        # Now select row 0 again — the form mirrors the saved aliases.
+        dlg.endpoints_table.selectRow(0)
+        assert dlg.endpoint_aliases_edit.text() == "opus, team-pro"
+        # Select row 1 — form shows empty aliases.
+        dlg.endpoints_table.selectRow(1)
+        assert dlg.endpoint_aliases_edit.text() == ""
+    finally:
+        dlg.deleteLater()
+    print("✓ Aliases survive row reselection")
+
+
+def test_endpoint_snap_apply_on_accept_commits_typed_aliases() -> None:
+    """Users on autopilot sometimes type in the form, then click OK
+    straight away without Apply. Without a snap-apply, the typed
+    text is read from the *table cells* (still empty) and silently
+    dropped. Verify ``_on_accept`` commits any divergent form
+    state just-in-time."""
+    from src.profiles import ProfileStore
+    from src.profiles.models import Provider
+    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+
+    _qapp()
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    store.credential_store.set("default", "x")
+    default = store.ensure_default()
+    default.providers = {
+        "default": Provider(
+            name="default", url="https://api.anthropic.com",
+            available_models=("claude-opus-4-8",),
+        ),
+    }
+    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    try:
+        # Type a model name + aliases in the form but DO NOT click
+        # Apply. The intent: clicking OK should still commit.
+        dlg.endpoint_model_combo.setCurrentText("claude-opus-4-8")
+        dlg.endpoint_aliases_edit.setText("mm-m3, team")
+        # Sanity: Apply is *enabled* (form diverges from row), but
+        # we explicitly skip the click.
+        assert dlg.endpoint_apply_btn.isEnabled(), (
+            "form should be divergent — typing without Apply"
+        )
+        dlg._on_accept()
+        edited = dlg.to_profile()
+        ep = edited.model_endpoints["claude-opus-4-8"]
+        assert ep.aliases == ("mm-m3", "team"), (
+            f"snap-apply should have committed the typed aliases, got "
+            f"{ep.aliases!r}"
+        )
+    finally:
+        dlg.deleteLater()
+    print("✓ Snap-apply on OK commits typed-but-not-Apply'd form edits")
+
+
+def test_endpoints_auto_seeded_from_provider_catalog() -> None:
+    """A profile with providers exposing ``available_models`` but
+    zero ``model_endpoints`` should auto-seed one row per
+    ``(provider, model)`` pair on dialog open. Otherwise the
+    user-facing ``settings.json.availableModels`` would be empty
+    and Claude Code's ``/model`` would only show the hardcoded
+    built-in default."""
+    from src.profiles import ProfileStore
+    from src.profiles.models import Provider
+    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+    import json
+
+    _qapp()
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    store.credential_store.set("default", "x")
+    default = store.ensure_default()
+    # Providers with catalogs but no endpoints at all. This is the
+    # real-world failure mode the user just hit.
+    default.providers = {
+        "MiniMax": Provider(
+            name="MiniMax", url="https://api.MiniMax.io", key_ref="default",
+            available_models=("MiniMax-M3", "minimax-text-01"),
+        ),
+    }
+    # Original on-disk profile is empty on ``model_endpoints``.
+    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    try:
+        # Two seeded rows for the two catalog entries.
+        assert dlg.endpoints_table.rowCount() == 2, (
+            f"expected 2 auto-seeded rows, got {dlg.endpoints_table.rowCount()}"
+        )
+        rows = []
+        for r in range(dlg.endpoints_table.rowCount()):
+            # New column order: Aliases | Provider | Model.
+            # Seed rows have empty aliases (left column blank).
+            aliases_text = dlg.endpoints_table.item(r, 0).text()
+            provider = dlg.endpoints_table.item(r, 1).text()
+            model = dlg.endpoints_table.item(r, 2).text()
+            rows.append((model, provider, aliases_text))
+        assert sorted(rows) == sorted([
+            ("MiniMax-M3", "MiniMax", ""),
+            ("minimax-text-01", "MiniMax", ""),
+        ]), rows
+    finally:
+        dlg.deleteLater()
+    print("✓ Dialog auto-seeds endpoints from provider catalogs")
+
+
+def test_default_model_combo_lists_aliases_with_legacy_fallback() -> None:
+    """The General tab's Default model field is a ``QComboBox`` whose
+    items are ``(no default)`` + every alias across endpoint rows,
+    plus a ``(real model: X)`` fallback for legacy profiles whose
+    ``default_model`` was a real upstream ID.
+
+    Pre-selects the matching entry when the profile already has a
+    ``default_model`` set.
+    """
+    from src.profiles import ProfileStore, Provider, ModelEndpoint
+    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+
+    _qapp()
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    store.credential_store.set("default", "x")
+    default = store.ensure_default()
+    default.providers = {
+        "default": Provider(
+            name="default", url="https://api.anthropic.com",
+            available_models=("claude-opus-4-8",),
+        ),
+    }
+    default.model_endpoints = {
+        "claude-opus-4-8": ModelEndpoint(
+            provider_name="default",
+            aliases=("opus", "team-pro"),
+        ),
+    }
+    # Start with a *legacy* default — a real model name (post-refactor
+    # the user is expected to use aliases via the dropdown, but
+    # legacy profiles must keep round-tripping).
+    default.default_model = "claude-opus-4-8"
+    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    try:
+        items = [
+            (dlg.default_model_combo.itemText(i), dlg.default_model_combo.itemData(i))
+            for i in range(dlg.default_model_combo.count())
+        ]
+        # ``(no default)`` first; aliases (sorted); legacy real-model
+        # entry tagged with its real name as userData.
+        labels = [label for label, _ in items]
+        assert labels[0] == "(no default)"
+        assert "opus" in labels
+        assert "team-pro" in labels
+        # Legacy real-model entry surfaces as a labeled fallback.
+        assert any(
+            label.startswith("(real model:") for label, _ in items
+        )
+        # The matching entry is pre-selected (legacy ``claude-opus-4-8``
+        # matches the real-model fallback).
+        assert dlg.default_model_combo.currentData() == "claude-opus-4-8"
+    finally:
+        dlg.deleteLater()
+    print("✓ Default model combo lists aliases + (real model: X) fallback")
+
+
+def test_default_model_combo_persists_alias_choice() -> None:
+    """Picking an alias from the Default model dropdown + clicking OK
+    saves the alias verbatim as ``profile.default_model``. The proxy
+    rewrites it to the real model name at request time."""
+    from src.profiles import ProfileStore, Provider, ModelEndpoint
+    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+
+    _qapp()
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    store.credential_store.set("default", "x")
+    default = store.ensure_default()
+    default.providers = {
+        "default": Provider(
+            name="default", url="https://api.anthropic.com",
+            available_models=("claude-opus-4-8",),
+        ),
+    }
+    default.model_endpoints = {
+        "claude-opus-4-8": ModelEndpoint(
+            provider_name="default",
+            aliases=("opus", "team-pro"),
+        ),
+    }
+    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    try:
+        # Pick the "opus" alias.
+        for i in range(dlg.default_model_combo.count()):
+            if dlg.default_model_combo.itemData(i) == "opus":
+                dlg.default_model_combo.setCurrentIndex(i)
+                break
+        dlg._on_accept()
+        edited = dlg.to_profile()
+        # Real model name *not* stored — exactly the alias the
+        # user picked in the dropdown.
+        assert edited.default_model == "opus", (
+            f"expected default_model='opus', got {edited.default_model!r}"
+        )
+    finally:
+        dlg.deleteLater()
+    print("✓ Default model persists the chosen alias verbatim")
+
+
+def test_endpoints_table_columns_are_aliases_provider_model() -> None:
+    """The Model Configuration table is laid out as
+    [Aliases | Provider | Model] — aliases are the user-facing
+    identity, the real upstream model ID is the rightmost column."""
+    from src.profiles import ProfileStore, Provider, ModelEndpoint
+    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+
+    _qapp()
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    store.credential_store.set("default", "x")
+    default = store.ensure_default()
+    default.providers = {
+        "default": Provider(
+            name="default", url="https://api.anthropic.com",
+            available_models=("claude-opus-4-8",),
+        ),
+    }
+    default.model_endpoints = {
+        "claude-opus-4-8": ModelEndpoint(
+            provider_name="default",
+            aliases=("opus", "team-pro"),
+        ),
+    }
+    store.upsert(default)
+    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    try:
+        headers = [
+            dlg.endpoints_table.horizontalHeaderItem(i).text()
+            for i in range(dlg.endpoints_table.columnCount())
+        ]
+        assert headers == ["Aliases", "Provider", "Model"], headers
+        # Cell contents validate the column-to-meaning mapping.
+        assert dlg.endpoints_table.item(0, 0).text() == "opus, team-pro"
+        assert dlg.endpoints_table.item(0, 1).text() == "default"
+        assert dlg.endpoints_table.item(0, 2).text() == "claude-opus-4-8"
+    finally:
+        dlg.deleteLater()
+    print("✓ Model Configuration table columns: Aliases | Provider | Model")
+
+
+def test_endpoint_aliases_round_trip_through_store() -> None:
+    """A profile with ``ModelEndpoint.aliases`` survives
+    ``ProfileStore.upsert``/``load``."""
+    from src.profiles import ProfileStore, Provider, ModelEndpoint
+
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    default = store.ensure_default()
+    default.providers = {
+        "default": Provider(name="default", url="https://api.anthropic.com"),
+    }
+    default.model_endpoints = {
+        "claude-opus-4-8": ModelEndpoint(
+            provider_name="default",
+            aliases=("opus", "team-pro"),
+        ),
+    }
+    store.upsert(default)
+    loaded = store.load()
+    loaded_default = next(p for p in loaded if p.name == "Default")
+    ep = loaded_default.model_endpoints["claude-opus-4-8"]
+    assert ep.aliases == ("opus", "team-pro"), (
+        f"expected aliases=('opus', 'team-pro'), got {ep.aliases!r}"
+    )
+    print("✓ Endpoint aliases round-trip through ProfileStore")
+
+
+def test_endpoint_aliases_unique_across_profile_on_save() -> None:
+    """Two endpoints both claiming the same alias is refused by
+    ``_on_accept`` (the editor surfaces a warning instead of
+    silently shadowing)."""
+    from src.profiles import ProfileStore
+    from src.profiles.models import ModelEndpoint, Provider
+    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+    from PySide6.QtWidgets import QMessageBox
+
+    _qapp()
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    store.credential_store.set("default", "x")
+    default = store.ensure_default()
+    # Available Models needs to contain both claude-opus-4-8 and
+    # claude-haiku-4-5 so the dialog's constrained dropdown has
+    # something to select for each row.
+    default.providers = {
+        "default": Provider(
+            name="default", url="https://api.anthropic.com",
+            available_models=("claude-opus-4-8", "claude-haiku-4-5"),
+        ),
+    }
+    store.upsert(default)
+    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    try:
+        # Build two rows both claiming alias "opus".
+        dlg.endpoint_model_combo.setCurrentText("claude-opus-4-8")
+        dlg.endpoint_aliases_edit.setText("opus")
+        dlg.endpoint_apply_btn.click()
+        dlg._on_endpoint_add()
+        dlg.endpoint_model_combo.setCurrentText("claude-haiku-4-5")
+        dlg.endpoint_aliases_edit.setText("opus")
+        dlg.endpoint_apply_btn.click()
+        # Suppress the modal — replace QMessageBox.warning with a stub.
+        captured: dict[str, object] = {}
+        original_warning = QMessageBox.warning
+
+        def _capture(*args, **kwargs):
+            captured["title"] = args[1] if len(args) > 1 else kwargs.get("title")
+            captured["text"] = args[2] if len(args) > 2 else kwargs.get("text")
+            return QMessageBox.StandardButton.Ok
+
+        QMessageBox.warning = _capture
+        try:
+            dlg._on_accept()
+        finally:
+            QMessageBox.warning = original_warning
+        assert "Duplicate" in str(captured.get("title", "")), (
+            f"expected a duplicate-alias warning, got {captured!r}"
+        )
+        # The save was refused — the profile's model_endpoints still
+        # reflect the *last* applied state on the table, but the
+        # ``_on_accept`` returned early without assigning to
+        # ``self._profile``. In headless tests the table state is
+        # the source of truth; we just confirm _on_accept didn't
+        # proceed past the warning.
+    finally:
+        dlg.deleteLater()
+    print("✓ Two rows with same alias are refused on save")
+
+
+# ---- Proxy alias rewrite (unit-level, no FastAPI) -----------------------
+
+
+def test_proxy_alias_rewrites_req_model_before_router() -> None:
+    """A request with ``model: \"opus\"`` is rewritten to
+    ``\"claude-opus-4-8\"`` by the alias-rewrite block before the
+    router sees it. We exercise the rewrite logic by constructing
+    an ``AnthropicRequest`` and an alias map.
+    """
+    from ccproxy.app.models.anthropic import AnthropicRequest
+    from ccproxy.app.api.proxy import _apply_alias_rewrite
+
+    req = AnthropicRequest.model_validate(
+        {
+            "model": "opus",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    alias_map = {"opus": "claude-opus-4-8", "haiku": "claude-haiku-4-5"}
+    new_req, alias_seen = _apply_alias_rewrite(req, alias_map)
+    assert new_req.model == "claude-opus-4-8"
+    assert alias_seen == "opus"
+
+    # Real name passes through unchanged.
+    req2 = AnthropicRequest.model_validate(
+        {
+            "model": "claude-opus-4-8",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    new_req2, alias_seen2 = _apply_alias_rewrite(req2, alias_map)
+    assert new_req2.model == "claude-opus-4-8"
+    assert alias_seen2 is None
+
+    # Empty alias map is a no-op.
+    req3, alias_seen3 = _apply_alias_rewrite(req, {})
+    assert req3.model == "opus"
+    assert alias_seen3 is None
+    print("✓ Alias rewrite translates model name before router")
+
+
+def test_proxy_alias_rewrite_reserializes_wire_body() -> None:
+    """When the alias rewrite changes ``req.model`` in memory, the
+    wire body sent to the upstream must also be re-marshalled —
+    otherwise OpenRouter (and similar) reject the request with
+    "``freestuff`` is not a valid model ID" because the alias, not
+    the rewritten name, is what reaches the upstream.
+
+    Regression test for the case where the upstream returned 400
+    even though the alias-rewrite logic correctly produced a valid
+    model name internally. The wire body had the alias; the in-memory
+    request had the real name; the proxy forwarded the wire body
+    unchanged because ``decision.target_model == req.model`` after
+    the rewrite, so the re-marshal branch never fired.
+    """
+    import asyncio
+    import json as _json
+    import tempfile
+    from pathlib import Path as _P
+
+    import httpx
+    from ccproxy.app.config import (
+        ModelEndpointsCfg,
+        ProviderCfg,
+        Settings,
+    )
+    from ccproxy.app.main import create_app
+    from ccproxy.app.providers.anthropic import AnthropicProvider
+
+    captured_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(
+            200,
+            content=b'{"id":"msg_1","content":[],"model":"openrouter/free"}',
+            headers={"content-type": "application/json"},
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    async def go() -> None:
+        # Build a minimal Settings with the alias map and provider.
+        cfg = Settings()
+        cfg.model_endpoints = ModelEndpointsCfg(
+            endpoints={"openrouter/free": "openrouter"},
+            providers={
+                "openrouter": ProviderCfg(
+                    url="https://openrouter.ai/api/v1",
+                    api_key="sk-or-v1-test-key",
+                    available_models=["openrouter/free"],
+                ),
+            },
+            model_aliases={"freestuff": "openrouter/free"},
+        )
+
+        # Build the provider with the mock transport injected.
+        mock_client = httpx.AsyncClient(transport=transport, timeout=10)
+        provider = AnthropicProvider(
+            base_url="https://openrouter.ai/api/v1",
+            client=mock_client,
+        )
+
+        app = create_app(
+            settings=cfg,
+            providers={"openrouter": provider, "anthropic": provider},
+            storage_path=str(_P(tempfile.mkdtemp()) / "test.db"),
+        )
+
+        # TestClient drives the lifespan startup so app.state.router
+        # is set before we issue requests.
+        from fastapi.testclient import TestClient
+        with TestClient(app) as tc:
+            r = tc.post(
+                "/v1/messages",
+                json={
+                    "model": "freestuff",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={"anthropic-version": "2023-06-01"},
+            )
+            assert r.status_code == 200, (
+                f"proxy should accept the request, got {r.status_code}: {r.text}"
+            )
+        # Close the mock client we injected (lifespan doesn't own it).
+        await mock_client.aclose()
+
+    asyncio.run(go())
+
+    # Verify the upstream got the rewritten model name, NOT the alias.
+    assert len(captured_requests) == 1, (
+        f"expected 1 upstream call, got {len(captured_requests)}"
+    )
+    upstream_body = _json.loads(captured_requests[0].content)
+    assert upstream_body["model"] == "openrouter/free", (
+        f"upstream should see the rewritten model 'openrouter/free', "
+        f"got {upstream_body['model']!r} (alias 'freestuff' would mean "
+        f"the wire body wasn't re-marshalled after the alias rewrite)"
+    )
+    print("✓ Proxy re-marshals wire body after alias rewrite")
+
+
+def test_credential_store_strips_whitespace_on_set() -> None:
+    """Pasting an API key from a key-management page often lands
+    with a trailing newline (or NBSP). OpenRouter's format validator
+    rejects those with a 401 "Missing Authentication header" before
+    the auth path even runs. ``CredentialStore.set`` strips the
+    whitespace so the key retrieved by the proxy is the clean
+    verifier-expected shape.
+    """
+    from src.profiles.credential_store import CredentialStore
+
+    base = _tmp_dir()
+    cs = CredentialStore(base / "creds.json")
+
+    # Trailing newline (the typical paste-from-web artefact).
+    cs.set("openrouter", "sk-or-v1-abc123\n")
+    assert cs.get("openrouter") == "sk-or-v1-abc123", (
+        "trailing newline should be stripped"
+    )
+
+    # Leading + trailing whitespace.
+    cs.set("anthropic", "  sk-ant-AAA  \t")
+    assert cs.get("anthropic") == "sk-ant-AAA", (
+        "leading/trailing whitespace should be stripped"
+    )
+
+    # Internal whitespace (a paste that landed with a literal newline
+    # mid-string would still be malformed).
+    cs.set("openai", "sk-proj-AAA\nBBB")
+    assert cs.get("openai") == "sk-proj-AAABBB", (
+        "internal whitespace should be collapsed"
+    )
+
+    # Whitespace-only value is treated as empty (deletion).
+    cs.set("to_delete", "   \n  ")
+    assert cs.get("to_delete") is None, (
+        "whitespace-only value should delete the entry"
+    )
+
+    # Idempotent: re-setting with the same clean value is a no-op.
+    cs.set("openrouter", "sk-or-v1-abc123")
+    assert cs.get("openrouter") == "sk-or-v1-abc123"
+
+    # The on-disk file persisted the cleaned value, not the raw input.
+    raw = (base / "creds.json").read_text()
+    assert "sk-or-v1-abc123" in raw
+    assert "sk-or-v1-abc123\n" not in raw
+    print("✓ CredentialStore strips whitespace on set")
+
+
+def test_anthropic_provider_logs_key_prefix_diagnostic() -> None:
+    """When ``target_api_key`` is set, ``AnthropicProvider.forward``
+    emits a stderr line with the key's first 4 chars, last 4 chars,
+    and length. This lets a 401 "Missing Authentication header" be
+    attributed to a known prefix vs. a silently corrupted key.
+    """
+    import asyncio
+    import io
+    import sys as _sys
+
+    import httpx
+    from ccproxy.app.providers.anthropic import AnthropicProvider
+
+    captured_stderr = io.StringIO()
+    real_stderr = _sys.stderr
+
+    class _MockTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            return httpx.Response(
+                200,
+                content=b'{"ok":true}',
+                headers={"content-type": "application/json"},
+                request=request,
+            )
+
+    try:
+        _sys.stderr = captured_stderr
+        transport = _MockTransport()
+        mock_client = httpx.AsyncClient(transport=transport, timeout=10)
+        provider = AnthropicProvider(
+            base_url="https://openrouter.ai/api",
+            client=mock_client,
+        )
+
+        async def main():
+            await provider.forward(
+                body=b'{"model":"openrouter/free","max_tokens":1,"messages":[]}',
+                headers={
+                    "x-api-key": "sk-ant-AAA",  # inbound from CLI
+                    "anthropic-version": "2023-06-01",
+                },
+                target_api_key="skorxyzABCDEF123456789",
+            )
+
+        asyncio.run(main())
+    finally:
+        _sys.stderr = real_stderr
+
+    log_text = captured_stderr.getvalue()
+    # Prefix: first 4 chars of the key
+    assert "prefix='skor'" in log_text, (
+        f"prefix should be 'skor', got: {log_text!r}"
+    )
+    assert "suffix='6789'" in log_text, (
+        f"suffix should be '6789', got: {log_text!r}"
+    )
+    assert "len=22" in log_text, (
+        f"len should be 22, got: {log_text!r}"
+    )
+    # The middle of the key is never logged.
+    assert "ABCDEF1" not in log_text, (
+        "middle characters of the key should not be logged"
+    )
+    print("✓ AnthropicProvider logs key prefix/suffix diagnostic")
+
+
+def test_anthropic_provider_logs_short_key_safely() -> None:
+    """Keys shorter than 8 chars have their entire value replaced
+    with ``***`` in the diagnostic line so a short test key or
+    placeholder doesn't leak."""
+    import asyncio
+    import io
+    import sys as _sys
+
+    import httpx
+    from ccproxy.app.providers.anthropic import AnthropicProvider
+
+    captured_stderr = io.StringIO()
+    real_stderr = _sys.stderr
+
+    class _MockTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            return httpx.Response(200, content=b'{}', request=request)
+
+    try:
+        _sys.stderr = captured_stderr
+        transport = _MockTransport()
+        mock_client = httpx.AsyncClient(transport=transport, timeout=10)
+        provider = AnthropicProvider(
+            base_url="https://example.com",
+            client=mock_client,
+        )
+
+        async def main():
+            await provider.forward(
+                body=b'{}',
+                headers={},
+                target_api_key="shortkey",
+            )
+
+        asyncio.run(main())
+    finally:
+        _sys.stderr = real_stderr
+
+    log_text = captured_stderr.getvalue()
+    assert "***" in log_text, (
+        f"short keys should be fully obscured, got: {log_text!r}"
+    )
+    assert "shortkey" not in log_text, (
+        f"short key value should not appear, got: {log_text!r}"
+    )
+    print("✓ AnthropicProvider safely obscures short keys")
+
+
+def test_anthropic_provider_retries_trailing_slash_redirect() -> None:
+    """Some nginx-fronted gateways (e.g. MiniMax) return ``301`` /
+    ``302`` with ``Location: <base>/`` (a directory URL with a
+    trailing slash but no API path). The naive follow lands on
+    a 404 because there's no ``/v1/messages`` at that URL.
+    ``AnthropicProvider`` detects this pattern and retries the
+    POST against ``<Location>/v1/messages``.
+    """
+    import asyncio
+    from ccproxy.app.providers.anthropic import AnthropicProvider
+
+    captured: list[httpx.Request] = []
+
+    class _MockTransport(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.calls = 0
+
+        async def handle_async_request(self, request):
+            self.calls += 1
+            captured.append(request)
+            if self.calls == 1:
+                # First call: 302 to a directory URL with trailing
+                # slash and no /v1/messages.
+                return httpx.Response(
+                    302,
+                    headers={"location": "https://api.example.com/anthropic/"},
+                    request=request,
+                )
+            # Second call: success with a real response.
+            return httpx.Response(
+                200,
+                content=b'{"id":"msg_1","content":[]}',
+                headers={"content-type": "application/json"},
+                request=request,
+            )
+
+    transport = _MockTransport()
+    mock_client = httpx.AsyncClient(
+        transport=transport,
+        timeout=10,
+    )
+    provider = AnthropicProvider(
+        base_url="https://api.example.com/anthropic",
+        client=mock_client,
+    )
+
+    async def main():
+        response = await provider.forward(
+            body=b'{"model":"MiniMax-M3","messages":[]}',
+            headers={"anthropic-version": "2023-06-01"},
+            target_api_key="sk-test",
+        )
+        # Verify the second call hit the retried URL.
+        assert transport.calls == 2, (
+            f"expected 2 calls (initial + retry), got {transport.calls}"
+        )
+        assert captured[1].url.path == "/anthropic/v1/messages", (
+            f"retry should hit /anthropic/v1/messages, "
+            f"got {captured[1].url.path}"
+        )
+        # Verify the response is the successful one (200), not the
+        # 302 we'd otherwise pass through.
+        assert response.status_code == 200
+        await mock_client.aclose()
+
+    asyncio.run(main())
+    print("✓ AnthropicProvider retries trailing-slash 302")
+
+
+def test_anthropic_provider_retries_protocol_downgrade_redirect() -> None:
+    """MiniMax's nginx *intentionally* 301s HTTPS → HTTP to the
+    canonical directory URL — that's the redirect we have to
+    recover from. ``AnthropicProvider`` reconstructs the API
+    URL (``<Location>/v1/messages``) and retries the POST,
+    accepting the protocol downgrade in this specific path
+    because the URL is built from the Location header plus a
+    known suffix (not a transparent follow).
+    """
+    import asyncio
+    from ccproxy.app.providers.anthropic import AnthropicProvider
+
+    captured: list[httpx.Request] = []
+
+    class _MockTransport(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.calls = 0
+
+        async def handle_async_request(self, request):
+            self.calls += 1
+            captured.append(request)
+            if self.calls == 1:
+                # First call: 301 to a directory URL with trailing
+                # slash and no /v1/messages.
+                return httpx.Response(
+                    301,
+                    headers={"location": "http://api.example.com/anthropic/"},
+                    request=request,
+                )
+            # Second call: success with a real response.
+            return httpx.Response(
+                200,
+                content=b'{"id":"msg_1","content":[]}',
+                headers={"content-type": "application/json"},
+                request=request,
+            )
+
+    transport = _MockTransport()
+    mock_client = httpx.AsyncClient(transport=transport, timeout=10)
+    provider = AnthropicProvider(
+        base_url="https://api.example.com/anthropic",
+        client=mock_client,
+    )
+
+    async def main():
+        response = await provider.forward(
+            body=b'{"model":"MiniMax-M3","messages":[]}',
+            headers={"anthropic-version": "2023-06-01"},
+            target_api_key="sk-test",
+        )
+        # Verify the retry happened despite the protocol downgrade.
+        assert transport.calls == 2, (
+            f"expected 2 calls (initial + retry), got {transport.calls}"
+        )
+        assert captured[1].url.scheme == "http", (
+            f"retry should follow the downgrade to http://, "
+            f"got scheme {captured[1].url.scheme!r}"
+        )
+        assert captured[1].url.path == "/anthropic/v1/messages", (
+            f"retry should hit /anthropic/v1/messages, "
+            f"got {captured[1].url.path}"
+        )
+        # Verify the response is the successful one (200), not the
+        # 301 we'd otherwise pass through.
+        assert response.status_code == 200
+        await mock_client.aclose()
+
+    asyncio.run(main())
+    print("✓ AnthropicProvider retries trailing-slash 302 (incl. protocol downgrade)")
+
+
+def test_router_consults_model_endpoints_map() -> None:
+    """The router picks the user-configured provider when an
+    ``endpoints`` entry maps the incoming model name. Without this
+    lookup, every request for a model the user has set up against a
+    custom provider (``MiniMax-M3 → MiniMax``, etc.) would silently
+    fall through to the hardcoded ``anthropic`` provider at
+    api.anthropic.com — which then rejects the unknown model as
+    "model not found".
+    """
+    import asyncio
+    from ccproxy.app.config import (
+        ModelEndpointsCfg,
+        ProviderCfg,
+        Settings,
+        SubagentsCfg,
+    )
+    from ccproxy.app.models.anthropic import AnthropicRequest
+    from ccproxy.app.providers.anthropic import AnthropicProvider
+    from ccproxy.app.router.subagent import SubagentRouter
+
+    class _FakeAnthropic(AnthropicProvider):
+        name = "anthropic"
+
+    class _FakeMiniMax(AnthropicProvider):
+        name = "anthropic"  # same provider class; the test is on routing
+
+    mini_max_provider = _FakeMiniMax(
+        base_url="https://api.minimax.io/anthropic"
+    )
+    anthropic_provider = _FakeAnthropic(
+        base_url="https://api.anthropic.com"
+    )
+    providers: dict = {
+        "anthropic": anthropic_provider,
+        "MiniMax": mini_max_provider,
+    }
+
+    cfg = Settings(
+        subagents=SubagentsCfg(enable=False),
+        model_endpoints=ModelEndpointsCfg(
+            default_provider="MiniMax",
+            providers={
+                "MiniMax": ProviderCfg(
+                    url="https://api.minimax.io/anthropic",
+                    api_key="sk-m",
+                ),
+            },
+            endpoints={"MiniMax-M3": "MiniMax"},
+        ),
+    )
+    router = SubagentRouter(cfg, providers)
+    req = AnthropicRequest.model_validate(
+        {"model": "MiniMax-M3", "max_tokens": 1, "messages": []}
+    )
+
+    async def main():
+        return router.determine_route(req)
+
+    decision = asyncio.run(main())
+    assert decision.target_provider_name == "MiniMax", (
+        f"expected MiniMax provider, got {decision.target_provider_name!r}"
+    )
+    assert decision.provider is mini_max_provider, (
+        "decision.provider should be the MiniMaxProvider instance"
+    )
+
+    # Fall-through path: model not in ``endpoints`` map. The
+    # router uses the user's ``default_provider`` as the next
+    # fallback before prefix-matching — a sensible default since
+    # the user has explicitly nominated one.
+    req2 = AnthropicRequest.model_validate(
+        {"model": "claude-3-5-sonnet-20241022", "max_tokens": 1, "messages": []}
+    )
+
+    async def main2():
+        return router.determine_route(req2)
+
+    decision2 = asyncio.run(main2())
+    assert decision2.target_provider_name == "MiniMax", (
+        f"expected MiniMax (default_provider), got "
+        f"{decision2.target_provider_name!r}"
+    )
+
+    # With no default_provider set and no endpoints entry, the
+    # router falls through to prefix-based routing — and finally
+    # to ``anthropic`` as the catch-all for unknown prefixes.
+    cfg_no_default = Settings(
+        subagents=SubagentsCfg(enable=False),
+        model_endpoints=ModelEndpointsCfg(
+            providers={
+                "MiniMax": ProviderCfg(
+                    url="https://api.minimax.io/anthropic",
+                    api_key="sk-m",
+                ),
+            },
+            # No default_provider; the empty ``endpoints`` map means
+            # every model falls through to prefix routing.
+            endpoints={},
+        ),
+    )
+    router2 = SubagentRouter(cfg_no_default, providers)
+    req3 = AnthropicRequest.model_validate(
+        {"model": "totally-unknown-model", "max_tokens": 1, "messages": []}
+    )
+
+    async def main3():
+        return router2.determine_route(req3)
+
+    decision3 = asyncio.run(main3())
+    assert decision3.target_provider_name == "anthropic"
+    print("✓ Router consults model_endpoints, falls back to default_provider, then prefix matching")
+
+
+def test_proxy_models_endpoint_surfaces_alias_map() -> None:
+    """``GET /v1/models`` lists each real model with its aliases in
+    an Anthropic-shaped envelope, and ``?debug=1`` adds a ``__proxy__``
+    block with the full routing config. Used to verify Claude Code
+    is reaching the proxy (and to debug why a request might
+    bypass it)."""
+    from fastapi import Request
+    from ccproxy.app.config import (
+        ModelEndpointsCfg,
+        ProviderCfg,
+        Settings,
+    )
+    from ccproxy.app.api.proxy import list_models
+
+    cfg = Settings(
+        model_endpoints=ModelEndpointsCfg(
+            default_provider="MiniMax",
+            providers={
+                "MiniMax": ProviderCfg(
+                    url="https://api.MiniMax.io",
+                    api_key="sk-test",
+                    available_models=["MiniMax-M3"],
+                ),
+            },
+            endpoints={"MiniMax-M3": "MiniMax"},
+            model_aliases={
+                "freestuff": "MiniMax-M3",
+                "mm-m3": "MiniMax-M3",
+            },
+        ),
+    )
+
+    class _FakeReq:
+        def __init__(self, qp):
+            self.query_params = qp
+            self.app = type(
+                "A",
+                (),
+                {"state": type("S", (), {"settings": cfg})()},
+            )()
+
+    import asyncio
+    # Standard Anthropic-shaped response: each model with its aliases.
+    body = asyncio.run(list_models(_FakeReq({}))).body.decode()
+    import json as _json
+
+    parsed = _json.loads(body)
+    assert parsed["object"] == "list"
+    by_id = {m["id"]: m for m in parsed["data"]}
+    assert "MiniMax-M3" in by_id
+    assert sorted(by_id["MiniMax-M3"]["aliases"]) == ["freestuff", "mm-m3"]
+    # Debug variant exposes the alias_map + endpoints explicitly so a
+    # misconfigured session can be diagnosed by curl.
+    debug_body = asyncio.run(
+        list_models(_FakeReq({"debug": "1"}))
+    ).body.decode()
+    debug = _json.loads(debug_body)
+    assert debug["__proxy__"]["alias_map"] == {
+        "freestuff": "MiniMax-M3",
+        "mm-m3": "MiniMax-M3",
+    }
+    assert debug["__proxy__"]["endpoints_map"] == {"MiniMax-M3": "MiniMax"}
+    assert debug["__proxy__"]["default_provider"] == "MiniMax"
+    print("✓ /v1/models surfaces the alias map (with ?debug=1)")
+    """``GET /v1/models`` lists each real model with its aliases in
+    an Anthropic-shaped envelope, and ``?debug=1`` adds a ``__proxy__``
+    block with the full routing config. Used to verify Claude Code
+    is reaching the proxy (and to debug why a request might
+    bypass it)."""
+    from fastapi import Request
+    from ccproxy.app.config import (
+        ModelEndpointsCfg,
+        ProviderCfg,
+        Settings,
+    )
+    from ccproxy.app.api.proxy import list_models
+
+    cfg = Settings(
+        model_endpoints=ModelEndpointsCfg(
+            default_provider="MiniMax",
+            providers={
+                "MiniMax": ProviderCfg(
+                    url="https://api.MiniMax.io",
+                    api_key="sk-test",
+                    available_models=["MiniMax-M3"],
+                ),
+            },
+            endpoints={"MiniMax-M3": "MiniMax"},
+            model_aliases={
+                "freestuff": "MiniMax-M3",
+                "mm-m3": "MiniMax-M3",
+            },
+        ),
+    )
+
+    class _FakeReq:
+        def __init__(self, qp):
+            self.query_params = qp
+            self.app = type(
+                "A",
+                (),
+                {"state": type("S", (), {"settings": cfg})()},
+            )()
+
+    import asyncio
+    # Standard Anthropic-shaped response: each model with its aliases.
+    body = asyncio.run(list_models(_FakeReq({}))).body.decode()
+    import json as _json
+
+    parsed = _json.loads(body)
+    assert parsed["object"] == "list"
+    by_id = {m["id"]: m for m in parsed["data"]}
+    assert "MiniMax-M3" in by_id
+    assert sorted(by_id["MiniMax-M3"]["aliases"]) == ["freestuff", "mm-m3"]
+    # Debug variant exposes the alias_map + endpoints explicitly so a
+    # misconfigured session can be diagnosed by curl.
+    debug_body = asyncio.run(
+        list_models(_FakeReq({"debug": "1"}))
+    ).body.decode()
+    debug = _json.loads(debug_body)
+    assert debug["__proxy__"]["alias_map"] == {
+        "freestuff": "MiniMax-M3",
+        "mm-m3": "MiniMax-M3",
+    }
+    assert debug["__proxy__"]["endpoints_map"] == {"MiniMax-M3": "MiniMax"}
+    assert debug["__proxy__"]["default_provider"] == "MiniMax"
+    print("✓ /v1/models surfaces the alias map (with ?debug=1)")
+
+
+def test_proxy_alias_preserves_alias_in_log_field() -> None:
+    """When an alias rewrites the model, ``original_model`` on the
+    request log is the alias, not the real name."""
+    from ccproxy.app.models.anthropic import AnthropicRequest
+    from ccproxy.app.api.proxy import _apply_alias_rewrite
+
+    req = AnthropicRequest.model_validate(
+        {
+            "model": "opus",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    new_req, alias_seen = _apply_alias_rewrite(
+        req, {"opus": "claude-opus-4-8"}
+    )
+    # The proxy's log line uses ``alias_seen or new_req.model`` —
+    # we mimic the same selection to verify the alias reaches the
+    # log. The proxy's `original_model` for this request is the
+    # alias, even though the router/URL lookup see the real name.
+    assert alias_seen is not None
+    assert alias_seen == "opus"
+    assert new_req.model == "claude-opus-4-8"
+    print("✓ Alias preserved as original_model for log surface")
 
 
 # ---- Runner ---------------------------------------------------------------
@@ -2069,12 +3354,13 @@ def main() -> None:
         test_api_keys_tab_add_inserts_new_row,
         test_default_row_cannot_be_removed,
         test_api_key_value_persists_to_credential_store_on_save,
+        test_credential_store_strips_whitespace_on_set,
         test_endpoints_table_is_read_only_three_columns,
-        test_endpoints_form_list_keys_plus_no_key_option,
-        test_endpoints_row_apply_persists_key_ref_on_save,
+        test_endpoints_form_model_combo_constrained_to_provider_models,
+        test_endpoints_row_apply_persists_provider_name_on_save,
         test_endpoints_form_apply_disabled_until_divergence,
-        test_endpoints_stale_ref_falls_back_to_no_key_in_form,
-        test_resolve_api_key_returns_endpoint_key_value,
+        test_provider_stale_key_ref_falls_back_to_no_key_in_form,
+        test_resolve_api_key_walks_provider_chain,
         test_resolve_api_key_returns_none_when_no_key_ref,
         test_api_keys_form_apply_disabled_until_divergence,
         test_api_keys_form_supports_rename_on_default,
@@ -2090,7 +3376,25 @@ def main() -> None:
         test_model_config_form_provider_combo_lists_provider_names,
         test_model_config_form_combo_userdata_is_url,
         test_model_config_form_url_hint_reflects_selection,
-        test_model_config_endpoint_table_displays_resolved_url,
+        test_model_config_endpoint_table_displays_provider_name,
+        test_endpoints_table_is_read_only_three_columns,
+        test_endpoint_aliases_form_apply_persists_aliases_on_save,
+        test_endpoint_aliases_parse_dedupes_and_trims,
+        test_endpoint_aliases_form_persists_after_row_reselect,
+        test_endpoint_snap_apply_on_accept_commits_typed_aliases,
+        test_endpoints_auto_seeded_from_provider_catalog,
+        test_default_model_combo_lists_aliases_with_legacy_fallback,
+        test_default_model_combo_persists_alias_choice,
+        test_endpoints_table_columns_are_aliases_provider_model,
+        test_endpoint_aliases_round_trip_through_store,
+        test_endpoint_aliases_unique_across_profile_on_save,
+        test_proxy_alias_rewrites_req_model_before_router,
+        test_proxy_alias_preserves_alias_in_log_field,
+        test_router_consults_model_endpoints_map,
+        test_proxy_models_endpoint_surfaces_alias_map,
+        test_proxy_alias_rewrite_reserializes_wire_body,
+        test_anthropic_provider_logs_key_prefix_diagnostic,
+        test_anthropic_provider_logs_short_key_safely,
     ]
     failed = 0
     for t in tests:

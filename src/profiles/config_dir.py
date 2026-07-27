@@ -74,8 +74,24 @@ def _build_settings(profile: ClaudeProfile) -> dict:
 
     Order of precedence (later wins on collision):
       1. ``profile.claude_settings`` (free-form keys the user added)
-      2. ``availableModels`` derived from ``model_endpoints`` keys
+      2. ``availableModels`` derived from each endpoint's aliases
+         (deduped, sorted; **never** real upstream IDs)
       3. ``model`` derived from ``default_model`` if set
+
+    ``availableModels`` lists only the human-friendly aliases — never
+    the upstream model IDs (``claude-opus-4-8``, ``MiniMax-M3``). The
+    ``/model`` picker in Claude Code surfaces this list, so the user
+    sees only names they'll actually type. The proxy's alias-rewrite
+    layer (``_apply_alias_rewrite`` in the proxy handler) translates
+    any incoming alias back to the real model name at request time.
+
+    Endpoints with no aliases contribute nothing — their real names
+    are still addressable (and routed correctly) by typing them
+    directly, but Claude Code won't list them under ``/model``. If a
+    profile has zero aliases across all endpoints, the
+    ``availableModels`` key is *omitted* rather than emitted as an
+    empty list (Claude Code treats an absent key and an empty list
+    identically, but the omission keeps the file diff clean).
 
     We deliberately let ``claude_settings`` set ``model`` /
     ``availableModels`` first and then overwrite — so the profile's
@@ -83,8 +99,24 @@ def _build_settings(profile: ClaudeProfile) -> dict:
     The editor UI discourages setting these in the raw settings JSON.
     """
     out: dict = dict(profile.claude_settings)
-    if profile.model_endpoints:
-        out["availableModels"] = sorted(profile.model_endpoints.keys())
+    aliases_flat: list[str] = []
+    for endpoint in profile.model_endpoints.values():
+        # Endpoints may be legacy bare-URL strings (older profiles
+        # pre-dating the ``ModelEndpoint`` dataclass). Their
+        # ``aliases`` reads as ``()`` via ``getattr`` — fine, just
+        # skipped.
+        if endpoint is None or isinstance(endpoint, str):
+            continue
+        for alias in (getattr(endpoint, "aliases", ()) or ()):
+            if isinstance(alias, str) and alias.strip():
+                aliases_flat.append(alias)
+    if aliases_flat:
+        # Dedup with ``dict.fromkeys`` so a same-named alias on two
+        # endpoints collapses to one entry (the editor's
+        # ``_on_accept`` already rejects this at save time, but a
+        # defensive dedup keeps this function safe for callers
+        # outside the editor path).
+        out["availableModels"] = sorted(dict.fromkeys(aliases_flat))
     if profile.default_model:
         out["model"] = profile.default_model
     return out

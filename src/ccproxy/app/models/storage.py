@@ -107,7 +107,7 @@ class RequestLog(BaseModel):
     content_type: str | None = None
     original_model: str | None = None
     routed_model: str | None = None
-    routed_provider: Literal["anthropic", "openai"] | None = None
+    routed_provider: str | None = None
     headers: dict[str, list[str]] = Field(default_factory=dict)
     body: dict[str, Any] = Field(default_factory=dict)
     response: ResponseLog | None = None

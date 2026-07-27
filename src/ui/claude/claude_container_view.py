@@ -26,6 +26,7 @@ thread emits ``started_ok``.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 from dataclasses import dataclass
@@ -52,6 +53,8 @@ from src.proxy.dashboard_view import DashboardView
 from src.proxy.paths import data_dir
 from src.ui.recent_activity_view import RecentActivityView
 from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+logger = logging.getLogger(__name__)
 
 
 # Number of pinned tabs at the head of the inner ``QTabWidget``. Session
@@ -360,6 +363,21 @@ class ClaudeContainerView(QWidget):
             proxy_base_url=self._get_proxy_base_url(),
             config_dir=str(config_dir_path),
             api_key=api_key,
+        )
+        # Surface the resolved proxy URL so the user can verify
+        # Claude Code will route through us. If ``ANTHROPIC_BASE_URL``
+        # is empty the session is talking to Anthropic's real API —
+        # the most common cause of "HTTP 200 / empty body / no proxy
+        # record" reports is a session launched before the proxy was
+        # running, or a stale terminal session.
+        proxy_url = env.get("ANTHROPIC_BASE_URL", "")
+        default_model = env.get("ANTHROPIC_MODEL", "")
+        logger.info(
+            "launching claude session: profile=%r default_model=%r "
+            "ANTHROPIC_BASE_URL=%r",
+            profile.name,
+            default_model or "(none)",
+            proxy_url or "(EMPTY — claude will hit api.anthropic.com)",
         )
 
         view = TerminalSessionView(

@@ -57,14 +57,20 @@ def resolve_api_key(
 
     The session launcher calls this once per session. It walks the
     profile's ``model_endpoints`` map, finds the entry for
-    ``profile.default_model``, and resolves its ``key_ref`` to a
-    plaintext value via :class:`CredentialStore`.
+    ``profile.default_model``, then resolves the *provider's*
+    ``key_ref`` to a plaintext value via :class:`CredentialStore`.
+
+    Authentication is now a property of the provider rather than
+    the endpoint (post-refactor) — so two models on the same
+    provider share the same key, and the resolver traverses the
+    ``endpoint → provider → key_ref`` chain.
 
     Returns ``None`` if the profile has no ``default_model``, the
-    model isn't in ``model_endpoints``, the endpoint has no
-    ``key_ref``, or the ref doesn't resolve to a stored value. In all
-    of these cases :func:`build_claude_session_env` substitutes the
-    labeled sentinel so Claude Code still launches.
+    model isn't in ``model_endpoints``, the provider can't be
+    looked up, the provider has no ``key_ref``, or the ref doesn't
+    resolve to a stored value. In all of these cases
+    :func:`build_claude_session_env` substitutes the labeled
+    sentinel so Claude Code still launches.
 
     Parameters
     ----------
@@ -80,9 +86,10 @@ def resolve_api_key(
     endpoint = profile.model_endpoints.get(profile.default_model)
     if endpoint is None:
         return None
-    if not endpoint.key_ref:
+    provider = profile.providers.get(endpoint.provider_name)
+    if provider is None or not provider.key_ref:
         return None
-    return credential_store.get(endpoint.key_ref)
+    return credential_store.get(provider.key_ref)
 
 
 def build_claude_session_env(

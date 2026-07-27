@@ -292,6 +292,10 @@ def test_profile_store_chmod_600():
 
 
 def test_write_profile_config_writes_settings_json():
+    """The ``model`` and free-form ``claude_settings`` keys round-trip;
+    ``availableModels`` is omitted when no endpoint has aliases.
+    Real upstream IDs (``claude-opus-4-8``) are deliberately *not*
+    surfaced — only human-friendly aliases."""
     from src.profiles import ClaudeProfile, write_profile_config
 
     base = _tmp_dir()
@@ -310,15 +314,85 @@ def test_write_profile_config_writes_settings_json():
     assert settings_path.is_file()
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
     assert settings["model"] == "claude-opus-4-8"
-    assert sorted(settings["availableModels"]) == [
-        "claude-opus-4-8",
-        "claude-sonnet-4-6",
-    ]
-    # Free-form keys preserved (and "model" from default_model overrode
-    # the same key in claude_settings — verify by removing it from the
-    # expected set).
+    # No aliases declared → ``availableModels`` key is omitted from
+    # the file (vs. emitted as an empty list). The real names
+    # ``claude-opus-4-8`` / ``claude-sonnet-4-6`` are not exposed.
+    assert "availableModels" not in settings
     assert settings["permissions"] == {"allow": ["Edit"]}
-    print("✓ write_profile_config emits settings.json with model + availableModels")
+    print("✓ write_profile_config emits settings.json with model + free-form keys")
+
+
+def test_write_profile_config_exposes_aliases_in_available_models():
+    """Per-endpoint aliases land in ``settings.json.availableModels`` so
+    Claude Code's ``/model`` picker offers them. Real upstream IDs
+    (``claude-opus-4-8``) stay hidden — only human-friendly aliases
+    are surfaced. The proxy's alias-rewrite layer handles substitution
+    on the wire."""
+    from src.profiles import ClaudeProfile, ModelEndpoint, Provider, write_profile_config
+
+    base = _tmp_dir()
+    p = ClaudeProfile(
+        name="Demo",
+        slug="demo",
+        providers={
+            "default": Provider(
+                name="default", url="https://api.anthropic.com",
+            ),
+        },
+        model_endpoints={
+            "claude-opus-4-8": ModelEndpoint(
+                provider_name="default",
+                aliases=("opus", "team-pro"),
+            ),
+            "claude-sonnet-4-6": ModelEndpoint(
+                provider_name="default",
+                aliases=("sonnet",),
+            ),
+        },
+        default_model="claude-opus-4-8",
+    )
+    config_dir = write_profile_config(p, base_dir=base)
+    settings = json.loads(
+        (config_dir / "settings.json").read_text(encoding="utf-8")
+    )
+    # Only the aliases — no real names like ``claude-opus-4-8``.
+    assert settings["availableModels"] == sorted([
+        "opus",
+        "team-pro",
+        "sonnet",
+    ])
+    assert "claude-opus-4-8" not in settings["availableModels"]
+    assert "claude-sonnet-4-6" not in settings["availableModels"]
+    print("✓ write_profile_config exposes aliases in availableModels (real names hidden)")
+
+
+def test_write_profile_config_omits_available_models_when_no_aliases():
+    """Endpoints with no aliases contribute nothing; if *no* endpoint has
+    aliases, the ``availableModels`` key is omitted from the file
+    entirely."""
+    from src.profiles import ClaudeProfile, ModelEndpoint, Provider, write_profile_config
+
+    base = _tmp_dir()
+    p = ClaudeProfile(
+        name="Demo",
+        slug="demo",
+        providers={
+            "default": Provider(
+                name="default", url="https://api.example.com",
+            ),
+        },
+        model_endpoints={
+            "claude-opus-4-8": ModelEndpoint(provider_name="default"),
+            "claude-haiku-4-5": ModelEndpoint(provider_name="default"),
+        },
+    )
+    config_dir = write_profile_config(p, base_dir=base)
+    settings = json.loads(
+        (config_dir / "settings.json").read_text(encoding="utf-8")
+    )
+    # Real names are *not* exposed; no aliases → key absent.
+    assert "availableModels" not in settings
+    print("✓ write_profile_config omits availableModels when no aliases exist")
 
 
 def test_write_profile_config_writes_agent_markdown_with_frontmatter():
@@ -718,6 +792,8 @@ def main():
         test_profile_store_dedups_duplicate_slugs,
         test_profile_store_chmod_600,
         test_write_profile_config_writes_settings_json,
+        test_write_profile_config_exposes_aliases_in_available_models,
+        test_write_profile_config_omits_available_models_when_no_aliases,
         test_write_profile_config_writes_agent_markdown_with_frontmatter,
         test_write_profile_config_prunes_stale_agents,
         test_env_builder_includes_infra_vars,

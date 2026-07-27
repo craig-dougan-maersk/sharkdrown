@@ -145,12 +145,23 @@ def main() -> None:
         assert body.get("status") == "healthy"
         print(f"✓ /health returned healthy: {body}")
 
-    # ---- Make a call against /v1/models (returns empty list per proxy) -
+    # ---- Make a call against /v1/models (returns the proxy's view of
+    # its routing config: each real model with its aliases). The
+    # current smoke-test profile has a single real model with no
+    # aliases — that's still enough to verify the Anthropic-shaped
+    # envelope shape Claude Code expects.
     with urllib.request.urlopen(f"{base}/v1/models", timeout=2) as resp:
         assert resp.status == 200
         body = json.loads(resp.read())
-        assert body == {"object": "list", "data": []}, f"unexpected: {body}"
-        print(f"✓ /v1/models returned empty list")
+        assert body.get("object") == "list", f"missing 'object' key: {body}"
+        assert isinstance(body.get("data"), list), (
+            f"'data' should be a list, got {body!r}"
+        )
+        # Every entry is ``{id, aliases}`` (Anthropic-shaped + alias
+        # array for diagnostics).
+        for entry in body["data"]:
+            assert "id" in entry and "aliases" in entry, entry
+        print(f"✓ /v1/models returned {len(body['data'])} model entries")
 
     # ---- Toggle the dashboard tab on -----------------------------------
     assert window.action_show_dashboard.isEnabled(), "Show Dashboard should be enabled"

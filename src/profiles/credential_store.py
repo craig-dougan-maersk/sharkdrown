@@ -68,16 +68,37 @@ class CredentialStore:
         return val if isinstance(val, str) else None
 
     def set(self, ref: str, value: str) -> None:
-        """Insert or update ``ref`` → ``value``. Empty string deletes."""
+        """Insert or update ``ref`` → ``value``. Empty string deletes.
+
+        Strip leading/trailing whitespace from the value before storing.
+        A copy-paste from a key-management page often lands with a
+        trailing newline; OpenRouter's format validator rejects those
+        with a 401 "Missing Authentication header" before the auth
+        path even runs, so silently dropping the newline is the
+        least-surprising fix. Whitespace-only values are treated as
+        empty (deletion).
+        """
+        # Strip all whitespace (spaces, tabs, newlines, carriage
+        # returns — the full Unicode set since some upstream
+        # dashboards use non-breaking spaces). ``.strip()`` is
+        # sufficient for our threat model: keys are a single token
+        # with no legitimate internal whitespace.
+        cleaned = value.strip()
+        # Drop any internal whitespace too: a paste that landed with
+        # a literal newline mid-string would still be rejected as
+        # malformed. ``split()`` with no args collapses any run of
+        # whitespace and rejoins with a single space, which for a
+        # key token is the same as "no whitespace at all".
+        cleaned = "".join(cleaned.split())
         data = self._read()
         creds = data.setdefault("credentials", {})
         if not isinstance(creds, dict):
             creds = {}
             data["credentials"] = creds
-        if value == "":
+        if cleaned == "":
             creds.pop(ref, None)
         else:
-            creds[ref] = value
+            creds[ref] = cleaned
         self._write(data)
 
     def delete(self, ref: str) -> None:

@@ -30,8 +30,28 @@ logger = logging.getLogger("claude_code_proxy")
 
 
 def _default_providers(settings: Settings) -> dict[str, Provider]:
-    """Construct the upstream providers from settings."""
-    return {
+    """Construct the upstream providers from settings.
+
+    Returns a dict keyed by provider name with concrete
+    ``AnthropicProvider`` / ``OpenAIProvider`` instances. The
+    router looks providers up by name (``self._providers.get(name)``),
+    so every user-defined provider in
+    ``settings.model_endpoints.providers`` must be materialised
+    here — otherwise the router's lookup returns ``None`` and falls
+    through to the hardcoded ``anthropic`` default, sending the
+    user's request to ``api.anthropic.com`` even when they
+    explicitly routed the model elsewhere.
+
+    Two layers:
+      - Built-in providers (``anthropic``, ``openai``) come from
+        ``settings.providers`` (read from YAML config).
+      - User-defined providers in
+        ``settings.model_endpoints.providers`` are added as
+        ``AnthropicProvider`` instances (all current upstream
+        gateways use Anthropic's wire format). Each one gets its
+        own HTTP client so closing one doesn't disrupt another.
+    """
+    providers: dict[str, Provider] = {
         "anthropic": AnthropicProvider(
             base_url=str(settings.providers.anthropic.base_url),
             version=settings.providers.anthropic.version,
@@ -41,6 +61,26 @@ def _default_providers(settings: Settings) -> dict[str, Provider]:
             api_key=settings.providers.openai.api_key.get_secret_value(),
         ),
     }
+    # User-defined providers (per-profile). All current AI gateways
+    # we route through (MiniMax, OpenRouter, etc.) speak
+    # Anthropic's wire format, so we instantiate AnthropicProvider
+    # for each one. If a future provider needs a different wire
+    # format, we'd key off ``provider_cfg.kind`` (or similar) here.
+    # The api_key lives on ``ProviderCfg`` and is plumbed through
+    # ``target_api_key`` per-request, not on the constructor.
+    model_endpoints_cfg = settings.model_endpoints
+    if model_endpoints_cfg and model_endpoints_cfg.providers:
+        for prov_name, prov_cfg in model_endpoints_cfg.providers.items():
+            if prov_name in providers:
+                # Don't shadow the built-in anthropic/openai with a
+                # user-defined same-named provider — first writer
+                # wins; the user can rename via the profile editor
+                # if they want a different name.
+                continue
+            providers[prov_name] = AnthropicProvider(
+                base_url=prov_cfg.url,
+            )
+    return providers
 
 
 @asynccontextmanager
