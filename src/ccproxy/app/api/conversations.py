@@ -52,6 +52,27 @@ async def list_conversations_by_project(
     )
 
 
+@router.get("/conversations/search")
+async def search_conversations(
+    request: Request,
+    q: str = Query(..., min_length=2, description="Search query (case-insensitive)"),
+    limit: int = Query(50, ge=1, le=200),
+    project: str | None = Query(None, description="Limit search to this project"),
+) -> JSONResponse:
+    """Full-text search across conversation messages.
+
+    Returns matching message snippets with session context.
+    """
+    base_path = _base_path(request)
+    reader = ConversationReader(base_path=base_path)
+    results = reader.search(q, limit=limit, project_path=project)
+    return JSONResponse({
+        "query": q,
+        "results": results,
+        "count": len(results),
+    })
+
+
 @router.get("/conversations/{session_id}")
 async def get_conversation(
     session_id: str,

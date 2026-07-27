@@ -17,30 +17,40 @@ async def stats(request: Request) -> JSONResponse:
     """Aggregate counts for the desktop status-bar tile.
 
     Lightweight: three COUNT(*) queries on indexed columns plus one
-    ``ORDER BY ... LIMIT 1`` for last-activity metadata. Designed to be
-    polled every few seconds from the main Qt thread without
-    noticeable latency. Response shape::
+    ``ORDER BY ... LIMIT 1`` for last-activity metadata. Response shape::
 
         {
-            "total":    <int>,    # all rows
-            "failed":   <int>,    # status >= 400
-            "empty":    <int>,    # total_tokens IS NULL OR 0
-            "last":     {         # most recent row, or null
+            "total":    <int>,
+            "failed":   <int>,
+            "empty":    <int>,
+            "total_cost_usd": <float>,
+            "last":     {
                 "timestamp": <iso8601 | null>,
                 "model":     <str   | null>
             }
         }
     """
+    from ccproxy.app.pricing import compute_cost
+
     storage = request.app.state.storage
     total = await storage.count_total()
     failed = await storage.count_failed()
     empty = await storage.count_no_tokens()
     last_ts, last_model = await storage.last_request_info()
+
+    token_rows = await storage.get_token_summary()
+    total_cost = 0.0
+    for row in token_rows:
+        cost = compute_cost(row["model"] or "unknown", row["input_tokens"], row["output_tokens"])
+        if cost is not None:
+            total_cost += cost
+
     return JSONResponse(
         {
             "total": total,
             "failed": failed,
             "empty": empty,
+            "total_cost_usd": round(total_cost, 6),
             "last": {"timestamp": last_ts, "model": last_model},
         }
     )
@@ -86,6 +96,52 @@ async def list_requests(
             "limit": limit,
         }
     )
+
+
+@router.get("/costs")
+async def costs(request: Request) -> JSONResponse:
+    """Per-model cost breakdown and session total.
+
+    Response shape::
+
+        {
+            "total_cost_usd": <float>,
+            "models": [
+                {
+                    "model": <str>,
+                    "input_tokens": <int>,
+                    "output_tokens": <int>,
+                    "request_count": <int>,
+                    "cost_usd": <float | null>
+                },
+                ...
+            ]
+        }
+
+    Models without known pricing return ``cost_usd: null``.
+    """
+    from ccproxy.app.pricing import compute_cost
+
+    storage = request.app.state.storage
+    rows = await storage.get_token_summary()
+    total_cost = 0.0
+    models = []
+    for row in rows:
+        model = row["model"] or "unknown"
+        cost = compute_cost(model, row["input_tokens"], row["output_tokens"])
+        if cost is not None:
+            total_cost += cost
+        models.append({
+            "model": model,
+            "input_tokens": row["input_tokens"],
+            "output_tokens": row["output_tokens"],
+            "request_count": row["request_count"],
+            "cost_usd": round(cost, 6) if cost is not None else None,
+        })
+    return JSONResponse({
+        "total_cost_usd": round(total_cost, 6),
+        "models": models,
+    })
 
 
 @router.delete("/requests")

@@ -243,13 +243,43 @@ def test_activity_tile_offline_state() -> None:
     from src.proxy.activity_tile import ActivityTile
 
     tile = ActivityTile()
-    # 127.0.0.1:1 has no service listening
+    # 127.0.0.1:1 has no service listening — set_base_url seeds from /api/stats
+    # which will fail and render the offline marker.
     tile.set_base_url("http://127.0.0.1:1")
-    # Manually call _refresh — it sets the offline text on connection error.
-    tile._refresh()
     assert "offline" in tile.text().lower(), f"expected offline marker, got {tile.text()!r}"
     tile.stop()
     print("✓ ActivityTile renders offline marker when the proxy is unreachable")
+
+
+def test_activity_tile_event_driven_updates() -> None:
+    """Push events from the EventBusBridge update counters correctly."""
+    _qapp()
+    from src.proxy.activity_tile import ActivityTile
+
+    tile = ActivityTile()
+    # Simulate the bridge pushing events directly (no HTTP needed)
+    tile.on_request_created({"type": "request_created", "id": "r1"})
+    assert "1 req" in tile.text()
+
+    # Response arrives with tokens — empty count decreases, cost accumulates
+    tile.on_response_complete({
+        "type": "response_complete", "id": "r1", "model": "claude-sonnet-4-20250514",
+        "status_code": 200, "input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500,
+    })
+    assert "$" in tile.text(), f"expected cost in tile, got {tile.text()!r}"
+    assert tile._total_cost > 0
+
+    # A second request that fails
+    tile.on_request_created({"type": "request_created", "id": "r2"})
+    tile.on_response_complete({
+        "type": "response_complete", "id": "r2", "model": "claude-sonnet-4-20250514",
+        "status_code": 500, "input_tokens": 500, "output_tokens": 200, "total_tokens": 700,
+    })
+    assert "2 req" in tile.text()
+    assert "1 err" in tile.text()
+
+    tile.stop()
+    print("✓ ActivityTile event-driven updates track counts and cost correctly")
 
 
 def main() -> None:
@@ -262,6 +292,7 @@ def main() -> None:
         test_api_stats_endpoint_returns_expected_shape,
         test_activity_tile_idle_state,
         test_activity_tile_offline_state,
+        test_activity_tile_event_driven_updates,
     ]
     failed = 0
     for t in tests:

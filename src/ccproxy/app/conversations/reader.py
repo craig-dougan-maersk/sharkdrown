@@ -130,6 +130,112 @@ class ConversationReader:
             return None
         return self._build_full(path)
 
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 50,
+        project_path: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search conversation messages for a text substring.
+
+        Returns a list of match dicts with session context:
+            {session_id, project_path, role, timestamp, snippet, line_number}
+
+        The search is case-insensitive. ``snippet`` is the matched line's
+        content truncated to ~200 chars with the match highlighted.
+        """
+        query_lower = query.lower()
+        results: list[dict[str, Any]] = []
+
+        if project_path:
+            search_dirs = [self.base / project_path]
+        else:
+            search_dirs = [d for d in self.base.iterdir() if d.is_dir()] if self.base.is_dir() else []
+
+        for proj_dir in search_dirs:
+            if not proj_dir.is_dir():
+                continue
+            for jsonl in proj_dir.glob("*.jsonl"):
+                if len(results) >= limit:
+                    break
+                self._search_file(jsonl, query_lower, results, limit)
+            if len(results) >= limit:
+                break
+
+        return results
+
+    def _search_file(
+        self,
+        path: Path,
+        query_lower: str,
+        results: list[dict[str, Any]],
+        limit: int,
+    ) -> None:
+        """Search a single JSONL file for matches."""
+        try:
+            with path.open(encoding="utf-8") as f:
+                for line_num, raw_line in enumerate(f, 1):
+                    if len(results) >= limit:
+                        return
+                    text_content = self._extract_text(raw_line)
+                    if not text_content:
+                        continue
+                    if query_lower in text_content.lower():
+                        msg = _parse_line(raw_line)
+                        snippet = self._build_snippet(text_content, query_lower)
+                        results.append({
+                            "session_id": path.stem,
+                            "project_path": path.parent.name,
+                            "role": msg.role if msg else None,
+                            "timestamp": msg.timestamp.isoformat() if msg and msg.timestamp else None,
+                            "snippet": snippet,
+                            "line_number": line_num,
+                        })
+        except OSError:
+            pass
+
+    @staticmethod
+    def _extract_text(raw_line: str) -> str | None:
+        """Extract searchable text content from a JSONL line."""
+        raw_line = raw_line.strip()
+        if not raw_line:
+            return None
+        try:
+            raw = json.loads(raw_line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(raw, dict):
+            return None
+        msg = raw.get("message") or {}
+        if not isinstance(msg, dict):
+            return None
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+            return " ".join(parts) if parts else None
+        return None
+
+    @staticmethod
+    def _build_snippet(text: str, query_lower: str, context: int = 100) -> str:
+        """Build a snippet around the first match occurrence."""
+        idx = text.lower().find(query_lower)
+        if idx == -1:
+            return text[:200]
+        start = max(0, idx - context)
+        end = min(len(text), idx + len(query_lower) + context)
+        snippet = text[start:end]
+        if start > 0:
+            snippet = "..." + snippet
+        if end < len(text):
+            snippet = snippet + "..."
+        return snippet
+
     # ---- internals --------------------------------------------------------
 
     def _build_metadata(self, path: Path) -> Conversation | None:

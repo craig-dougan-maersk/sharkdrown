@@ -122,6 +122,7 @@ class StorageService:
             if callable(publish):
                 publish(
                     {
+                        "type": "request_created",
                         "id": req.id,
                         "endpoint": req.endpoint,
                         "timestamp": req.timestamp.isoformat() if req.timestamp else None,
@@ -313,6 +314,31 @@ class StorageService:
         )
         await self.conn.commit()
 
+        if self._event_bus is not None:
+            publish = getattr(self._event_bus, "publish", None)
+            if callable(publish):
+                # Fetch routed_model for cost computation in the UI.
+                model = None
+                async with self.conn.execute(
+                    "SELECT COALESCE(routed_model, original_model) FROM requests WHERE id = ?",
+                    (request_id,),
+                ) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        model = row[0]
+                publish(
+                    {
+                        "type": "response_complete",
+                        "id": request_id,
+                        "model": model,
+                        "status_code": response.status_code,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": total_tokens,
+                        "response_time_ms": response.response_time_ms,
+                    }
+                )
+
     async def update_request_with_grading(self, request_id: str, grade: PromptGrade) -> None:
         await self.conn.execute(
             "UPDATE requests SET prompt_grade = ? WHERE id = ?",
@@ -360,6 +386,36 @@ class StorageService:
         ) as cur:
             row = await cur.fetchone()
         return int(row[0]) if row else 0
+
+    async def get_token_summary(self) -> list[dict[str, Any]]:
+        """Per-model token aggregates for cost computation.
+
+        Returns rows of {model, input_tokens, output_tokens, request_count}.
+        Only includes requests that have token data.
+        """
+        async with self.conn.execute(
+            """
+            SELECT
+                COALESCE(routed_model, original_model) AS model,
+                SUM(input_tokens)  AS input_tokens,
+                SUM(output_tokens) AS output_tokens,
+                COUNT(*)           AS request_count
+            FROM requests
+            WHERE total_tokens IS NOT NULL AND total_tokens > 0
+            GROUP BY model
+            ORDER BY SUM(total_tokens) DESC
+            """
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            {
+                "model": row[0],
+                "input_tokens": row[1] or 0,
+                "output_tokens": row[2] or 0,
+                "request_count": row[3],
+            }
+            for row in rows
+        ]
 
     async def last_request_info(self) -> tuple[str | None, str | None]:
         """Return ``(iso_timestamp, model)`` for the most recent request.

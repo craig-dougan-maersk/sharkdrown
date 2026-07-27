@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QMessageBox
 
+from src.proxy.event_bridge import EventBusBridge
 from src.proxy.paths import default_db_path
 from src.proxy.server_thread import ProxyServerThread
 
@@ -142,6 +143,9 @@ class ProxyLifecycleMixin:
         if self.claude_container is not None:
             self.claude_container.flush_pending_launch()
 
+        # Start the EventBus bridge for push-based UI updates.
+        self._start_event_bridge()
+
     def _on_proxy_failed(self, msg: str) -> None:
         """Called when the thread or uvicorn fails to start."""
         self.proxy_status_label.setText("Proxy: failed")
@@ -154,6 +158,7 @@ class ProxyLifecycleMixin:
 
     def _on_proxy_stopped(self) -> None:
         """Called after the lifespan has fully torn down."""
+        self._stop_event_bridge()
         self.proxy_status_label.setText("Proxy: stopped")
         self.action_start_proxy.setEnabled(True)
         self.action_stop_proxy.setEnabled(False)
@@ -210,3 +215,29 @@ class ProxyLifecycleMixin:
         """Start the proxy if not already running."""
         if not self._is_proxy_running():
             self._start_server()
+
+    # ------------------------------------------------------------------
+    # EventBus bridge
+    # ------------------------------------------------------------------
+    def _start_event_bridge(self) -> None:
+        """Wire up the EventBusBridge to the proxy's EventBus."""
+        thread = self.proxy_thread
+        if thread is None:
+            return
+        event_bus = thread.event_bus
+        if event_bus is None:
+            return
+
+        bridge = EventBusBridge(parent=self)
+        if self.activity_tile is not None:
+            bridge.request_created.connect(self.activity_tile.on_request_created)
+            bridge.response_complete.connect(self.activity_tile.on_response_complete)
+        bridge.start(event_bus)
+        self._event_bridge = bridge
+
+    def _stop_event_bridge(self) -> None:
+        """Shut down the EventBusBridge cleanly."""
+        bridge = getattr(self, "_event_bridge", None)
+        if bridge is not None:
+            bridge.stop()
+            self._event_bridge = None

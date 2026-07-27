@@ -103,6 +103,7 @@ class ProxyServerThread(QThread):
         self._model_aliases = dict(model_aliases or {})
         self._providers_cfg = providers_cfg or {}
         self._server: uvicorn.Server | None = None
+        self._app: object | None = None
 
     # -- QThread entry point ----------------------------------------------
     def run(self) -> None:
@@ -122,6 +123,7 @@ class ProxyServerThread(QThread):
         try:
             settings = self._build_settings()
             app = create_app(settings=settings, storage_path=self._storage_path)
+            self._app = app
         except Exception as exc:  # noqa: BLE001
             logger.exception("create_app failed")
             self.failed.emit(f"create_app failed: {exc}")
@@ -306,3 +308,11 @@ class ProxyServerThread(QThread):
     @property
     def config_dir(self) -> Path | None:
         return self._config_dir
+
+    @property
+    def event_bus(self) -> object | None:
+        """The proxy's EventBus instance, available after startup."""
+        app = self._app
+        if app is not None:
+            return getattr(getattr(app, "state", None), "event_bus", None)
+        return None
