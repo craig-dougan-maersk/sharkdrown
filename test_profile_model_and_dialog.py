@@ -2913,6 +2913,7 @@ def test_anthropic_provider_retries_trailing_slash_redirect() -> None:
     POST against ``<Location>/v1/messages``.
     """
     import asyncio
+    import httpx
     from ccproxy.app.providers.anthropic import AnthropicProvider
 
     captured: list[httpx.Request] = []
@@ -2983,6 +2984,7 @@ def test_anthropic_provider_retries_protocol_downgrade_redirect() -> None:
     known suffix (not a transparent follow).
     """
     import asyncio
+    import httpx
     from ccproxy.app.providers.anthropic import AnthropicProvider
 
     captured: list[httpx.Request] = []
@@ -3192,15 +3194,10 @@ def test_proxy_models_endpoint_surfaces_alias_map() -> None:
     class _FakeReq:
         def __init__(self, qp):
             self.query_params = qp
-            self.app = type(
-                "A",
-                (),
-                {"state": type("S", (), {"settings": cfg})()},
-            )()
 
     import asyncio
     # Standard Anthropic-shaped response: each model with its aliases.
-    body = asyncio.run(list_models(_FakeReq({}))).body.decode()
+    body = asyncio.run(list_models(_FakeReq({}), settings=cfg)).body.decode()
     import json as _json
 
     parsed = _json.loads(body)
@@ -3211,70 +3208,7 @@ def test_proxy_models_endpoint_surfaces_alias_map() -> None:
     # Debug variant exposes the alias_map + endpoints explicitly so a
     # misconfigured session can be diagnosed by curl.
     debug_body = asyncio.run(
-        list_models(_FakeReq({"debug": "1"}))
-    ).body.decode()
-    debug = _json.loads(debug_body)
-    assert debug["__proxy__"]["alias_map"] == {
-        "freestuff": "MiniMax-M3",
-        "mm-m3": "MiniMax-M3",
-    }
-    assert debug["__proxy__"]["endpoints_map"] == {"MiniMax-M3": "MiniMax"}
-    assert debug["__proxy__"]["default_provider"] == "MiniMax"
-    print("✓ /v1/models surfaces the alias map (with ?debug=1)")
-    """``GET /v1/models`` lists each real model with its aliases in
-    an Anthropic-shaped envelope, and ``?debug=1`` adds a ``__proxy__``
-    block with the full routing config. Used to verify Claude Code
-    is reaching the proxy (and to debug why a request might
-    bypass it)."""
-    from fastapi import Request
-    from ccproxy.app.config import (
-        ModelEndpointsCfg,
-        ProviderCfg,
-        Settings,
-    )
-    from ccproxy.app.api.proxy import list_models
-
-    cfg = Settings(
-        model_endpoints=ModelEndpointsCfg(
-            default_provider="MiniMax",
-            providers={
-                "MiniMax": ProviderCfg(
-                    url="https://api.MiniMax.io",
-                    api_key="sk-test",
-                    available_models=["MiniMax-M3"],
-                ),
-            },
-            endpoints={"MiniMax-M3": "MiniMax"},
-            model_aliases={
-                "freestuff": "MiniMax-M3",
-                "mm-m3": "MiniMax-M3",
-            },
-        ),
-    )
-
-    class _FakeReq:
-        def __init__(self, qp):
-            self.query_params = qp
-            self.app = type(
-                "A",
-                (),
-                {"state": type("S", (), {"settings": cfg})()},
-            )()
-
-    import asyncio
-    # Standard Anthropic-shaped response: each model with its aliases.
-    body = asyncio.run(list_models(_FakeReq({}))).body.decode()
-    import json as _json
-
-    parsed = _json.loads(body)
-    assert parsed["object"] == "list"
-    by_id = {m["id"]: m for m in parsed["data"]}
-    assert "MiniMax-M3" in by_id
-    assert sorted(by_id["MiniMax-M3"]["aliases"]) == ["freestuff", "mm-m3"]
-    # Debug variant exposes the alias_map + endpoints explicitly so a
-    # misconfigured session can be diagnosed by curl.
-    debug_body = asyncio.run(
-        list_models(_FakeReq({"debug": "1"}))
+        list_models(_FakeReq({"debug": "1"}), settings=cfg)
     ).body.decode()
     debug = _json.loads(debug_body)
     assert debug["__proxy__"]["alias_map"] == {

@@ -20,11 +20,12 @@
           </div>
           <div class="flex items-center gap-3 shrink-0 text-xs text-neutral-500">
             {% if r.total_tokens is not none %}
+              {% set cost = compute_cost(r.routed_model or r.original_model or "unknown", r.input_tokens or 0, r.output_tokens or 0) %}
               <span class="bg-emerald-50 text-emerald-800 border border-emerald-200 px-1.5 py-0.5 rounded font-mono"
-                    title="input: {{ r.input_tokens or 0 }} · output: {{ r.output_tokens or 0 }}">
+                    title="input: {{ r.input_tokens or 0 }} · output: {{ r.output_tokens or 0 }}{% if cost is not none %} · ${{ '%.4f' % cost }}{% endif %}">
                 {{ "{:,}".format(r.total_tokens) }} tok
-                {%- if r.input_tokens is not none and r.output_tokens is not none %}
-                  <span class="text-emerald-600/70">({{ "{:,}".format(r.input_tokens) }}↓/{{ "{:,}".format(r.output_tokens) }}↑)</span>
+                {%- if cost is not none %}
+                  <span class="text-emerald-600/70">${{ '%.4f' % cost }}</span>
                 {%- endif %}
               </span>
             {% endif %}

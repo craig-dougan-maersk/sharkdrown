@@ -88,6 +88,30 @@ class MenuConstructionMixin:
         self.action_stacked.triggered.connect(lambda: self._set_split_orientation(Qt.Vertical))
         view_menu.addAction(self.action_stacked)
 
+        view_menu.addSeparator()
+
+        # Theme submenu
+        from src.ui.theme import ThemeManager, ThemeMode
+
+        self.theme_manager = ThemeManager()
+        theme_menu = view_menu.addMenu("&Theme")
+        self._theme_actions: dict[ThemeMode, QAction] = {}
+        for mode in ThemeMode:
+            action = QAction(mode.value.capitalize(), self)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked, m=mode: self._apply_theme(m))
+            theme_menu.addAction(action)
+            self._theme_actions[mode] = action
+        saved = self.theme_manager.load_saved()
+        self._theme_actions[saved].setChecked(True)
+
+    def _apply_theme(self, mode) -> None:
+        from src.ui.theme import ThemeMode
+
+        self.theme_manager.apply(mode)
+        for m, action in self._theme_actions.items():
+            action.setChecked(m == mode)
+
     def _init_status_bar(self) -> None:
         """Initialize the status bar."""
         self.status = self.statusBar()
@@ -177,6 +201,13 @@ class MenuConstructionMixin:
 
         terminal_menu.addSeparator()
 
+        self.action_record_session = QAction("&Record Session", self)
+        self.action_record_session.setCheckable(True)
+        self.action_record_session.triggered.connect(self._toggle_recording)
+        terminal_menu.addAction(self.action_record_session)
+
+        terminal_menu.addSeparator()
+
         self.action_kill_all_sessions = QAction("&Kill All Sessions", self)
         self.action_kill_all_sessions.triggered.connect(self._kill_all_terminal_sessions)
         terminal_menu.addAction(self.action_kill_all_sessions)
@@ -189,6 +220,7 @@ class MenuConstructionMixin:
         # ---- Session actions ------------------------------------------
         self.action_new_claude_session = QAction("&New Claude Session", self)
         self.action_new_claude_session.setShortcut("Ctrl+Alt+C")
+        self.action_new_claude_session.setEnabled(False)  # enabled once proxy signals started_ok
         self.action_new_claude_session.triggered.connect(self._new_claude_session)
         claude_menu.addAction(self.action_new_claude_session)
 
@@ -296,6 +328,21 @@ class MenuConstructionMixin:
         if sess is None:
             return
         sess.text_edit.select_all()
+
+    def _toggle_recording(self, checked: bool) -> None:
+        """Toggle session recording on/off for the active terminal."""
+        sess = self._active_terminal_session()
+        if sess is None:
+            self.action_record_session.setChecked(False)
+            self.status.showMessage("No active terminal session.", 3000)
+            return
+        if checked:
+            path = sess.start_recording()
+            self.status.showMessage(f"Recording to {path}", 5000)
+        else:
+            path = sess.stop_recording()
+            if path:
+                self.status.showMessage(f"Recording saved: {path}", 5000)
 
     def _kill_all_terminal_sessions(self) -> None:
         """Slot for Terminal -> Kill All Sessions."""

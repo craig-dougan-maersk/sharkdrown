@@ -132,6 +132,7 @@ class ProxyLifecycleMixin:
         self.action_show_dashboard.setEnabled(True)
         self.action_show_recent.setEnabled(True)
         self.action_open_browser.setEnabled(True)
+        self.action_new_claude_session.setEnabled(True)
         if self.activity_tile is not None:
             self.activity_tile.set_base_url(f"http://{self.proxy_host}:{port}")
         if self.claude_container is not None:
@@ -154,6 +155,7 @@ class ProxyLifecycleMixin:
         self.action_show_dashboard.setEnabled(False)
         self.action_show_recent.setEnabled(False)
         self.action_open_browser.setEnabled(False)
+        self.action_new_claude_session.setEnabled(False)
         QMessageBox.critical(self, "Proxy Error", msg)
 
     def _on_proxy_stopped(self) -> None:
@@ -165,6 +167,7 @@ class ProxyLifecycleMixin:
         self.action_show_dashboard.setEnabled(False)
         self.action_show_recent.setEnabled(False)
         self.action_open_browser.setEnabled(False)
+        self.action_new_claude_session.setEnabled(False)
         if self.activity_tile is not None:
             self.activity_tile.stop()
         if self.claude_container is not None:

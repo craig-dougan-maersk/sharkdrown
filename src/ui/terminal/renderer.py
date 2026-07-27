@@ -243,7 +243,7 @@ def screen_to_html(
     if cursor is None:
         try:
             cursor = (int(screen.cursor.x), int(screen.cursor.y))
-        except Exception:  # noqa: BLE001
+        except (AttributeError, TypeError, ValueError):
             cursor = (0, 0)
 
     rows = screen.lines

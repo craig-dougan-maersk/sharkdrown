@@ -25,15 +25,29 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from ccproxy.app.config import ModelEndpointsCfg
+from ccproxy.app.config import ModelEndpointsCfg, Settings
+from ccproxy.app.db.storage import StorageService
 from ccproxy.app.models.anthropic import AnthropicRequest
 from ccproxy.app.models.storage import RequestLog, ResponseLog
 from ccproxy.app.providers.openai import transform_openai_response_to_anthropic
+from ccproxy.app.router.subagent import SubagentRouter
 from ccproxy.app.utils.headers import sanitize_headers
 from ccproxy.app.utils.ids import generate_request_id
+
+
+def get_settings(request: Request) -> Settings:
+    return request.app.state.settings
+
+
+def get_storage(request: Request) -> StorageService:
+    return request.app.state.storage
+
+
+def get_router(request: Request) -> SubagentRouter:
+    return request.app.state.router
 
 
 def sanitize_headers_dict(headers: Any) -> dict[str, list[str]]:
@@ -148,7 +162,10 @@ def _resolve_request_target(
 
 
 @router.get("/v1/models")
-async def list_models(request: Request) -> JSONResponse:
+async def list_models(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> JSONResponse:
     """Return the proxy's view of its routing config.
 
     Anthropic-shaped envelope (``{"object": "list", "data": [...]}``)
@@ -166,7 +183,6 @@ async def list_models(request: Request) -> JSONResponse:
       because Claude Code treats ``/v1/models`` as a model
       catalog and would silently drop unknown fields.
     """
-    settings = request.app.state.settings
     endpoints_cfg = settings.model_endpoints
     alias_map = endpoints_cfg.model_aliases or {}
     # Build an inverse map (real name → aliases) so the response can
@@ -207,7 +223,12 @@ async def list_models(request: Request) -> JSONResponse:
 
 
 @router.post("/v1/messages")
-async def post_v1_messages(request: Request) -> Response:
+async def post_v1_messages(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    storage: StorageService = Depends(get_storage),
+    router_obj: SubagentRouter = Depends(get_router),
+) -> Response:
     """Forward an Anthropic-format request to the configured provider.
 
     Every incoming ``POST /v1/messages`` is logged at INFO level
@@ -252,16 +273,13 @@ async def post_v1_messages(request: Request) -> Response:
             status_code=400,
         )
 
-    storage = request.app.state.storage
-    router_obj = request.app.state.router
-
     # Alias rewrite. Resolve an incoming alias (e.g. "opus") to its
     # real model name ("claude-opus-4-8") before the router runs,
     # so subagent detection and URL lookup see the real name. The
     # alias is preserved on ``request.state.incoming_alias`` so the
     # request log below can show what the user actually sent.
     alias_map: dict[str, str] = (
-        request.app.state.settings.model_endpoints.model_aliases or {}
+        settings.model_endpoints.model_aliases or {}
     )
     req, incoming_alias = _apply_alias_rewrite(req, alias_map)
     request.state.incoming_alias = incoming_alias
@@ -333,7 +351,7 @@ async def post_v1_messages(request: Request) -> Response:
     # rewrite at the top of this handler participates in routing —
     # a client sending ``"opus"`` rewrites to ``"claude-opus-4-8"``
     # which is then mapped to its provider via the same lookup.
-    endpoints_cfg = request.app.state.settings.model_endpoints
+    endpoints_cfg = settings.model_endpoints
     target_url, target_api_key = _resolve_request_target(req.model, endpoints_cfg)
     # ``default_endpoint`` is the legacy-URL backstop: when neither
     # the explicit mapping nor the default provider resolve, point

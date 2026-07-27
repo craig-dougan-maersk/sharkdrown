@@ -1,0 +1,98 @@
+{% if error %}
+<div class="p-4 bg-red-50 border border-red-200 rounded text-red-700 text-sm">{{ error }}</div>
+{% else %}
+<div class="space-y-4">
+  <h3 class="text-lg font-semibold text-neutral-800">Request Diff</h3>
+  <p class="text-xs text-neutral-500 font-mono">{{ a_id[:12] }}… vs {{ b_id[:12] }}…</p>
+
+  {# Metadata section #}
+  <details open class="border border-neutral-200 rounded">
+    <summary class="px-4 py-2 bg-neutral-50 font-medium text-sm cursor-pointer">Metadata</summary>
+    <table class="w-full text-xs font-mono">
+      <thead><tr class="bg-neutral-100"><th class="px-3 py-1 text-left">Field</th><th class="px-3 py-1 text-left">A</th><th class="px-3 py-1 text-left">B</th></tr></thead>
+      <tbody>
+        {% for key, val in metadata.items() %}
+        <tr class="{{ 'bg-yellow-50' if val.changed else '' }}">
+          <td class="px-3 py-1 text-neutral-600">{{ key }}</td>
+          <td class="px-3 py-1">{{ val.left or '—' }}</td>
+          <td class="px-3 py-1">{{ val.right or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </details>
+
+  {# System prompt #}
+  {% if system.changed %}
+  <details open class="border border-yellow-200 rounded">
+    <summary class="px-4 py-2 bg-yellow-50 font-medium text-sm cursor-pointer">System Prompt (changed)</summary>
+    <div class="grid grid-cols-2 gap-2 p-3">
+      <div class="bg-neutral-50 p-2 rounded text-xs whitespace-pre-wrap max-h-48 overflow-auto">{{ system.left or '(none)' }}</div>
+      <div class="bg-neutral-50 p-2 rounded text-xs whitespace-pre-wrap max-h-48 overflow-auto">{{ system.right or '(none)' }}</div>
+    </div>
+  </details>
+  {% else %}
+  <details class="border border-neutral-200 rounded">
+    <summary class="px-4 py-2 bg-neutral-50 font-medium text-sm cursor-pointer text-neutral-500">System Prompt (identical)</summary>
+    <div class="p-3 text-xs whitespace-pre-wrap max-h-48 overflow-auto text-neutral-600">{{ system.left or '(none)' }}</div>
+  </details>
+  {% endif %}
+
+  {# Messages #}
+  <details {% if messages.any_changed %}open{% endif %} class="border {{ 'border-yellow-200' if messages.any_changed else 'border-neutral-200' }} rounded">
+    <summary class="px-4 py-2 {{ 'bg-yellow-50' if messages.any_changed else 'bg-neutral-50' }} font-medium text-sm cursor-pointer">
+      Messages (A: {{ messages.left_count }}, B: {{ messages.right_count }}{% if messages.any_changed %}, changed{% endif %})
+    </summary>
+    <div class="divide-y divide-neutral-100 max-h-96 overflow-auto">
+      {% for pair in messages.pairs %}
+      <div class="grid grid-cols-2 gap-2 p-2 text-xs {{ 'bg-yellow-50/50' if pair.changed else '' }}">
+        <div class="font-mono whitespace-pre-wrap overflow-hidden">
+          {% if pair.left %}
+            <span class="text-neutral-500">[{{ pair.left.role }}]</span> {{ pair.left.content if pair.left.content is string else (pair.left.content | tojson)[:200] }}
+          {% else %}
+            <span class="text-neutral-400 italic">—</span>
+          {% endif %}
+        </div>
+        <div class="font-mono whitespace-pre-wrap overflow-hidden">
+          {% if pair.right %}
+            <span class="text-neutral-500">[{{ pair.right.role }}]</span> {{ pair.right.content if pair.right.content is string else (pair.right.content | tojson)[:200] }}
+          {% else %}
+            <span class="text-neutral-400 italic">—</span>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </details>
+
+  {# Parameters #}
+  {% if parameters.any_changed %}
+  <details open class="border border-yellow-200 rounded">
+    <summary class="px-4 py-2 bg-yellow-50 font-medium text-sm cursor-pointer">Parameters (changed)</summary>
+    <table class="w-full text-xs font-mono">
+      <thead><tr class="bg-neutral-100"><th class="px-3 py-1 text-left">Param</th><th class="px-3 py-1 text-left">A</th><th class="px-3 py-1 text-left">B</th></tr></thead>
+      <tbody>
+        {% for key, val in parameters.fields.items() %}
+        <tr class="{{ 'bg-yellow-50' if val.changed else '' }}">
+          <td class="px-3 py-1 text-neutral-600">{{ key }}</td>
+          <td class="px-3 py-1">{{ val.left | tojson if val.left is not none else '—' }}</td>
+          <td class="px-3 py-1">{{ val.right | tojson if val.right is not none else '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% elif parameters.fields %}
+  <details class="border border-neutral-200 rounded">
+    <summary class="px-4 py-2 bg-neutral-50 font-medium text-sm cursor-pointer text-neutral-500">Parameters (identical)</summary>
+    <table class="w-full text-xs font-mono">
+      <tbody>
+        {% for key, val in parameters.fields.items() %}
+        <tr><td class="px-3 py-1 text-neutral-600">{{ key }}</td><td class="px-3 py-1">{{ val.left | tojson }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+</div>
+{% endif %}

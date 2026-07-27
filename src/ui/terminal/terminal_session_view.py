@@ -699,7 +699,7 @@ class TerminalTextEdit(QTextEdit):
             ch = max(1, fm.lineSpacing())
             try:
                 margin = self.document().documentMargin()
-            except Exception:  # noqa: BLE001
+            except (AttributeError, RuntimeError):
                 margin = self.DOCUMENT_MARGIN
             x = int((pos.x() - margin) // cw)
             y = int((pos.y() - margin) // ch)
@@ -806,7 +806,7 @@ class TerminalTextEdit(QTextEdit):
             return
         try:
             text = cb.text(mode)
-        except Exception:  # noqa: BLE001
+        except (RuntimeError, OSError):
             return
         if not text:
             return
@@ -968,6 +968,9 @@ class TerminalSessionView(QWidget):
         self._resize_timer.setInterval(self.RESIZE_DEBOUNCE_MS)
         self._resize_timer.timeout.connect(self._on_resize_debounced)
 
+        # Session recorder — None until start_recording() is called.
+        self._recorder = None
+
         # Lazy pyte import — pyte is a runtime dep but not required to
         # construct the widget, so render-only tests can still import this
         # module.
@@ -1023,11 +1026,46 @@ class TerminalSessionView(QWidget):
             return
         self._stopped = True
         self._repaint_timer.stop()
+        if self._recorder is not None and self._recorder.is_recording:
+            self._recorder.stop()
         if self._session is not None:
             try:
                 self._session.shutdown()
             except Exception:  # noqa: BLE001
                 pass
+
+    def start_recording(self, path: str | None = None) -> str:
+        """Start recording this session to an asciicast v2 file.
+
+        Returns the path the recording is saved to.
+        """
+        from pathlib import Path
+        from src.ui.terminal.session_recorder import SessionRecorder
+
+        if path is None:
+            import time
+            recordings_dir = Path.home() / ".sharkdrown" / "recordings"
+            recordings_dir.mkdir(parents=True, exist_ok=True)
+            path = str(recordings_dir / f"session_{int(time.time())}.cast")
+
+        self._recorder = SessionRecorder(
+            path=path, cols=self._cols, rows=self._rows
+        )
+        self._recorder.start()
+        return str(self._recorder.path)
+
+    def stop_recording(self) -> str | None:
+        """Stop recording and return the path, or None if not recording."""
+        if self._recorder is None or not self._recorder.is_recording:
+            return None
+        self._recorder.stop()
+        path = str(self._recorder.path)
+        self._recorder = None
+        return path
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recorder is not None and self._recorder.is_recording
 
     def title(self) -> str:
         """Short label suitable for the tab text."""
@@ -1150,6 +1188,8 @@ class TerminalSessionView(QWidget):
     def _on_data(self, chunk: bytes) -> None:
         if self._stream is None:
             return
+        if self._recorder is not None and self._recorder.is_recording:
+            self._recorder.record(chunk)
         # Detect a scroll BEFORE feeding bytes so we know if content
         # reflowed. After the feed, if the screen scrolled (cursor at
         # top + dirty rows above), any held cell-coord selection now
@@ -1160,7 +1200,7 @@ class TerminalSessionView(QWidget):
         if self._screen is not None:
             try:
                 cursor_y_before = int(self._screen.cursor.y)
-            except Exception:  # noqa: BLE001
+            except (AttributeError, TypeError, ValueError):
                 cursor_y_before = -1
         self._stream.feed(chunk)
         if (

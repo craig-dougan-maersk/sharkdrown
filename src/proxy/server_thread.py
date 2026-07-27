@@ -27,23 +27,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 from pathlib import Path
 
 import uvicorn
 from PySide6.QtCore import QThread, Signal
 
-# Make src/ importable so ``from ccproxy.app.main import create_app`` works
-# regardless of how the desktop app is launched (entrypoint script, pytest,
-# packaged binary, etc.).
-_PROXY_PARENT = Path(__file__).resolve().parents[1]  # .../src
-if str(_PROXY_PARENT) not in sys.path:
-    sys.path.insert(0, str(_PROXY_PARENT))
-
-from ccproxy.app.config import Settings  # noqa: E402
-from ccproxy.app.main import create_app  # noqa: E402
-
-from src.proxy.paths import find_config_yaml, find_env_file  # noqa: E402
+from ccproxy.app.config import Settings
+from ccproxy.app.main import create_app
+from src.proxy.paths import find_config_yaml, find_env_file
 
 logger = logging.getLogger("sharkdrown.proxy")
 

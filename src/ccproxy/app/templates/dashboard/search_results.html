@@ -1,0 +1,34 @@
+{% import "macros.html" as ui %}
+
+{% if results %}
+  <ul class="divide-y divide-neutral-200 bg-white rounded border border-neutral-200">
+    {% for r in results %}
+      <li class="px-4 py-3 hover:bg-neutral-50 cursor-pointer"
+          hx-get="/partials/conversation/{{ r.session_id }}?project={{ r.project_path }}"
+          hx-target="#modal-root"
+          hx-swap="innerHTML"
+          hx-on::after-request="document.getElementById('modal-root').showModal()">
+        <div class="flex items-center justify-between gap-4 mb-1">
+          <div class="flex items-center gap-3 min-w-0">
+            <span class="bg-neutral-100 text-neutral-700 text-xs px-1.5 py-0.5 rounded font-mono">{{ r.project_path }}</span>
+            {% if r.role %}
+              <span class="text-xs px-1.5 py-0.5 rounded {{ 'bg-blue-50 text-blue-700' if r.role == 'assistant' else 'bg-green-50 text-green-700' }}">{{ r.role }}</span>
+            {% endif %}
+          </div>
+          <div class="flex items-center gap-3 shrink-0 text-xs text-neutral-500">
+            {% if r.timestamp %}
+              <span>{{ ui.relative_time(r.timestamp) }}</span>
+            {% endif %}
+            <span class="font-mono">L{{ r.line_number }}</span>
+          </div>
+        </div>
+        <p class="text-sm text-neutral-700 line-clamp-2 font-mono whitespace-pre-wrap">{{ r.snippet }}</p>
+      </li>
+    {% endfor %}
+  </ul>
+  <p class="text-xs text-neutral-500 mt-2">{{ results | length }} result{{ 's' if results | length != 1 else '' }} for "{{ query }}"</p>
+{% else %}
+  <div class="bg-white border border-neutral-200 rounded p-8 text-center text-neutral-500">
+    No results found for "<strong>{{ query }}</strong>".
+  </div>
+{% endif %}

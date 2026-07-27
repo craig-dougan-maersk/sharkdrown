@@ -19,7 +19,7 @@ the dashboard is shown full-window as a document tab.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QUrl, Signal
+from PySide6.QtCore import QPoint, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QDesktopServices,
@@ -96,6 +96,10 @@ class DashboardView(QWidget):
         self.open_external_action.triggered.connect(self._open_external)
         menu.addAction(self.open_external_action)
 
+        self.pop_out_action = QAction("Pop Out Window", menu)
+        self.pop_out_action.triggered.connect(self._pop_out)
+        menu.addAction(self.pop_out_action)
+
         menu.addSeparator()
 
         self.copy_url_action = QAction("Copy URL", menu)
@@ -134,8 +138,38 @@ class DashboardView(QWidget):
         if clipboard is not None:
             clipboard.setText(self._base_url)
 
+    def _pop_out(self) -> None:
+        """Detach the dashboard into a standalone window."""
+        if not self._base_url:
+            return
+        window = DetachedDashboardWindow(self._base_url, parent=None)
+        window.show()
+
     def _on_url_changed(self, url: QUrl) -> None:
         # ``urlChanged`` fires on every navigation; we only care about the
         # first successful load of the dashboard root.
         if url.toString().rstrip("/") == self._base_url:
             self.url_loaded.emit(self._base_url)
+
+
+class DetachedDashboardWindow(QWidget):
+    """Standalone dashboard window for multi-monitor workflows.
+
+    Opens its own QWebEngineView pointed at the proxy dashboard URL.
+    Closing this window does not affect the embedded view.
+    """
+
+    def __init__(self, base_url: str, parent=None) -> None:
+        super().__init__(parent)
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+
+        self.setWindowTitle(f"Dashboard — {base_url}")
+        self.resize(1200, 800)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._view = QWebEngineView()
+        self._view.load(QUrl(f"{base_url}/"))
+        layout.addWidget(self._view)

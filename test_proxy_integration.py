@@ -58,6 +58,24 @@ def _process_events_for(app: QCoreApplication, seconds: float) -> None:
     loop.exec()
 
 
+import pytest
+
+
+@pytest.fixture()
+def tmp_db(tmp_path: Path) -> Path:
+    return tmp_path / "test-requests.db"
+
+
+@pytest.fixture()
+def host() -> str:
+    return "127.0.0.1"
+
+
+@pytest.fixture()
+def port() -> int:
+    return _find_free_port()
+
+
 def test_proxy_thread_lifecycle(tmp_db: Path, host: str, port: int) -> None:
     """Boot the proxy in a QThread, hit /health, then stop cleanly."""
     app = QApplication.instance() or QApplication(sys.argv)

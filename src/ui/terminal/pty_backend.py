@@ -141,7 +141,7 @@ class PtySession(QThread):
             # controlling terminal. Set the size, then exec.
             try:
                 _set_winsize(0, self._rows, self._cols)
-            except Exception:  # noqa: BLE001 — best-effort
+            except OSError:
                 pass
             try:
                 if self._cwd is not None:
@@ -150,7 +150,7 @@ class PtySession(QThread):
                     os.execvpe(self._argv[0], self._argv, self._env)
                 else:
                     os.execvp(self._argv[0], self._argv)
-            except Exception:  # noqa: BLE001
+            except OSError:
                 os._exit(127)
             # Unreachable.
             os._exit(127)
@@ -162,7 +162,7 @@ class PtySession(QThread):
         # Match the child's reported size in case pty.fork disagreed.
         try:
             _set_winsize(self._master_fd, self._rows, self._cols)
-        except Exception:  # noqa: BLE001
+        except OSError:
             pass
 
         # Kick off the reader QThread.

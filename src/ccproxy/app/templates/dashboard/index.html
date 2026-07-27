@@ -32,7 +32,8 @@
      }">
   <header class="flex items-center justify-between mb-6">
     <h1 class="text-2xl font-semibold">Claude Code Proxy</h1>
-    <div class="flex items-center gap-2">
+    <div class="flex items-center gap-4">
+      <div hx-get="/partials/stats" hx-trigger="load, every 30s" hx-swap="innerHTML"></div>
       <span hx-ext="sse" sse-connect="/stream" sse-swap="new_request"
             class="text-xs text-neutral-500">live</span>
     </div>
@@ -53,7 +54,7 @@
     {# Local Alpine x-data so we keep the filter state when the user
        toggles the checkbox *and* persists it into "Load more" requests
        via htmx's ``config-request`` hook. #}
-    <div x-data="{ hide_empty: {{ 'true' if hide_empty else 'false' }} }">
+    <div x-data="{ hide_empty: {{ 'true' if hide_empty else 'false' }}, search_query: '' }">
       <div class="flex items-center gap-4 mb-3 text-sm flex-wrap">
         <span class="text-neutral-500">Filter:</span>
         <label class="flex items-center gap-1.5 cursor-pointer text-neutral-700 select-none">
@@ -66,6 +67,20 @@
                  class="rounded border-neutral-300 text-blue-600 focus:ring-blue-500">
           Hide 0-message
         </label>
+        <div class="ml-auto flex items-center gap-2">
+          <input type="search" x-model="search_query"
+                 placeholder="Search conversations…"
+                 name="q"
+                 hx-get="/partials/conversations/search"
+                 hx-target="#list"
+                 hx-swap="innerHTML"
+                 hx-trigger="input changed delay:300ms, search"
+                 hx-include="this"
+                 class="px-3 py-1.5 text-sm border border-neutral-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500 w-64">
+          <button @click="search_query = ''; htmx.ajax('GET', '/partials/conversations?page=1&hide_empty=' + (hide_empty ? '1' : '0'), {target: '#list', swap: 'innerHTML'})"
+                  x-show="search_query.length > 0"
+                  class="text-xs text-neutral-500 hover:text-neutral-700">&times; Clear</button>
+        </div>
       </div>
       <div id="list"
            hx-get="/partials/conversations?page=1&hide_empty={{ '1' if hide_empty else '0' }}"

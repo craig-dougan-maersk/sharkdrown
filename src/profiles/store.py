@@ -330,7 +330,7 @@ class ProfileStore:
                     port = 3001
                 config_dir = str(getattr(cfg, "config_dir", "") or "")
                 default_endpoint = str(getattr(cfg, "default_endpoint", "") or "")
-            except Exception:  # noqa: BLE001 — never let migration break startup
+            except (KeyError, TypeError, ValueError, AttributeError):
                 providers = {}
                 endpoints = {}
         default_kwargs: dict = {
@@ -369,7 +369,8 @@ class ProfileStore:
                 continue
             try:
                 out.append(_deserialize_profile(entry))
-            except Exception:  # noqa: BLE001 — skip corrupt entries, don't fail load
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("skipping corrupt profile entry: %s", exc)
                 continue
         return out
 
@@ -435,6 +436,43 @@ class ProfileStore:
         )
         return [default, *profiles]
 
+    def export_profile(self, name: str) -> dict | None:
+        """Export a profile as a shareable dict (credentials stripped).
+
+        Returns None if no profile with the given name exists.
+        """
+        profiles = self.load()
+        target = next((p for p in profiles if p.name == name), None)
+        if target is None:
+            return None
+        data = _serialize_profile(target)
+        for prov in (data.get("providers") or {}).values():
+            if isinstance(prov, dict):
+                prov.pop("key_ref", None)
+        data.pop("is_default", None)
+        return data
+
+    def import_profile(self, data: dict) -> ClaudeProfile:
+        """Import a profile from an exported dict.
+
+        Creates the profile (with a deduplicated name if needed) and
+        persists it. Credentials are NOT imported — the user must set
+        them separately via the profile editor.
+
+        Returns the imported ClaudeProfile.
+        """
+        profile = _deserialize_profile(data)
+        existing_names = {p.name for p in self.load()}
+        if profile.name in existing_names:
+            suffix = 2
+            base = profile.name
+            while f"{base} ({suffix})" in existing_names:
+                suffix += 1
+            profile.name = f"{base} ({suffix})"
+        profile.slug = slugify(profile.name)
+        self.upsert(profile)
+        return profile
+
     @property
     def path(self) -> Path:
         return self._path
@@ -462,7 +500,7 @@ def _url_to_provider_name(url: str, *, taken: set[str]) -> str:
 
     try:
         parsed = urlparse(url)
-    except Exception:  # noqa: BLE001 — defensive: bad URL shouldn't crash seed
+    except ValueError:
         parsed = None
     host = (parsed.hostname if parsed else "") or ""
     if host:

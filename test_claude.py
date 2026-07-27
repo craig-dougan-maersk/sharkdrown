@@ -734,42 +734,43 @@ def test_claude_container_flush_pending_launches():
         encoding="utf-8",
     )
     shim.chmod(0o755)
-    os.environ["PATH"] = f"{shim_dir}:{os.environ.get('PATH', '')}"
-
-    cv = _container_with_proxy_callbacks(
-        running=False, base_url="http://127.0.0.1:3001"
-    )
-    cv.new_session(profile=p)  # queues
-    # Now flip the proxy to "running" and flush.
-    cv._is_proxy_running = lambda: True
-    view = cv.flush_pending_launch()
-    assert view is not None, "flush_pending_launch didn't return a view"
-    # Spin until the shim exits and the buffer captures our marker.
-    deadline_ms = 2000
-    step_ms = 50
-    waited = 0
-    found_cwd = False
-    found_base = False
-    while waited < deadline_ms and not (found_cwd and found_base):
-        _spin(step_ms)
-        waited += step_ms
-        screen = view._screen
-        if screen is None:
-            continue
-        text = "".join(
-            screen.buffer[y][x].data
-            for y in range(screen.lines)
-            for x in range(screen.columns)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{shim_dir}:{saved_path}"
+    try:
+        cv = _container_with_proxy_callbacks(
+            running=False, base_url="http://127.0.0.1:3001"
         )
-        if f"claude-shim-cwd={tmp}" in text:
-            found_cwd = True
-        if "claude-shim-base=http://127.0.0.1:3001" in text:
-            found_base = True
-    view.shutdown()
-    assert found_cwd, f"session did not chdir to {tmp}"
-    assert found_base, "session did not see ANTHROPIC_BASE_URL"
-    # Cleanup: pop PATH back.
-    os.environ["PATH"] = os.environ["PATH"].replace(f"{shim_dir}:", "", 1)
+        cv.new_session(profile=p)  # queues
+        # Now flip the proxy to "running" and flush.
+        cv._is_proxy_running = lambda: True
+        view = cv.flush_pending_launch()
+        assert view is not None, "flush_pending_launch didn't return a view"
+        # Spin until the shim exits and the buffer captures our marker.
+        deadline_ms = 2000
+        step_ms = 50
+        waited = 0
+        found_cwd = False
+        found_base = False
+        while waited < deadline_ms and not (found_cwd and found_base):
+            _spin(step_ms)
+            waited += step_ms
+            screen = view._screen
+            if screen is None:
+                continue
+            text = "".join(
+                screen.buffer[y][x].data
+                for y in range(screen.lines)
+                for x in range(screen.columns)
+            )
+            if f"claude-shim-cwd={tmp}" in text:
+                found_cwd = True
+            if "claude-shim-base=http://127.0.0.1:3001" in text:
+                found_base = True
+        view.shutdown()
+        assert found_cwd, f"session did not chdir to {tmp}"
+        assert found_base, "session did not see ANTHROPIC_BASE_URL"
+    finally:
+        os.environ["PATH"] = saved_path
     print("✓ ClaudeContainerView.flush_pending_launch wires env + cwd correctly")
 
 

@@ -173,9 +173,7 @@ class RecentActivityView(QWidget):
         self.stop()
         try:
             self._client.close()
-        except Exception:  # noqa: BLE001
-            # httpx.Client.close() can race with an in-flight request;
-            # swallow — we're tearing down anyway.
+        except OSError:
             pass
 
     # -- Slots -----------------------------------------------------------
@@ -298,7 +296,7 @@ def _format_time(value: Any) -> str:
     try:
         # ISO strings are 'YYYY-MM-DDTHH:MM:SS[.ffffff][+TZ]' — strip the date.
         return str(value).split("T", 1)[-1][:8]
-    except Exception:  # noqa: BLE001
+    except (ValueError, IndexError, AttributeError):
         return str(value)
 
 

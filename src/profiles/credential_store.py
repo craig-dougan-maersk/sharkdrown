@@ -36,6 +36,40 @@ logger = logging.getLogger("sharkdrown.credentials")
 _IS_POSIX = sys.platform != "win32"
 _WINDOWS_CHMOD_WARNING_ISSUED = False
 
+_KEYRING_SERVICE = "sharkdrown"
+
+
+def _keyring_available() -> bool:
+    """Return True if the keyring module is importable and functional."""
+    try:
+        import keyring
+        keyring.get_credential(_KEYRING_SERVICE, "")
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class _KeyringBackend:
+    """Thin wrapper around the ``keyring`` library."""
+
+    def get(self, ref: str) -> str | None:
+        import keyring
+        return keyring.get_password(_KEYRING_SERVICE, ref)
+
+    def set(self, ref: str, value: str) -> None:
+        import keyring
+        if value:
+            keyring.set_password(_KEYRING_SERVICE, ref, value)
+        else:
+            self.delete(ref)
+
+    def delete(self, ref: str) -> None:
+        import keyring
+        try:
+            keyring.delete_password(_KEYRING_SERVICE, ref)
+        except keyring.errors.PasswordDeleteError:
+            pass
+
 
 class CredentialStore:
     """Per-user API key store backed by a chmod-600 JSON file.
@@ -58,8 +92,17 @@ class CredentialStore:
 
     SCHEMA_VERSION = 1
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, use_keyring: bool = False) -> None:
         self._path = path
+        self._keyring: _KeyringBackend | None = None
+        if use_keyring:
+            if _keyring_available():
+                self._keyring = _KeyringBackend()
+                logger.info("credential store using system keyring backend")
+            else:
+                logger.warning(
+                    "keyring requested but unavailable; falling back to file backend"
+                )
         # Ensure parent exists; we write the file lazily.
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -67,6 +110,10 @@ class CredentialStore:
 
     def get(self, ref: str) -> str | None:
         """Return the key for ``ref`` or ``None`` if absent."""
+        if self._keyring is not None:
+            val = self._keyring.get(ref)
+            if val is not None:
+                return val
         data = self._read()
         creds = data.get("credentials", {})
         if not isinstance(creds, dict):
@@ -85,18 +132,11 @@ class CredentialStore:
         least-surprising fix. Whitespace-only values are treated as
         empty (deletion).
         """
-        # Strip all whitespace (spaces, tabs, newlines, carriage
-        # returns — the full Unicode set since some upstream
-        # dashboards use non-breaking spaces). ``.strip()`` is
-        # sufficient for our threat model: keys are a single token
-        # with no legitimate internal whitespace.
         cleaned = value.strip()
-        # Drop any internal whitespace too: a paste that landed with
-        # a literal newline mid-string would still be rejected as
-        # malformed. ``split()`` with no args collapses any run of
-        # whitespace and rejoins with a single space, which for a
-        # key token is the same as "no whitespace at all".
         cleaned = "".join(cleaned.split())
+        if self._keyring is not None:
+            self._keyring.set(ref, cleaned)
+            return
         data = self._read()
         creds = data.setdefault("credentials", {})
         if not isinstance(creds, dict):
@@ -110,6 +150,9 @@ class CredentialStore:
 
     def delete(self, ref: str) -> None:
         """Remove ``ref`` if present (silent if absent)."""
+        if self._keyring is not None:
+            self._keyring.delete(ref)
+            return
         data = self._read()
         creds = data.get("credentials", {})
         if isinstance(creds, dict) and ref in creds:

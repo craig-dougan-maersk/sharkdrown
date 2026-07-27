@@ -22,7 +22,7 @@ from fastapi.templating import Jinja2Templates
 from ccproxy.app.config import Settings
 from ccproxy.app.db.storage import StorageService
 from ccproxy.app.live.bus import EventBus
-from ccproxy.app.middleware import AccessLogMiddleware, BodyCaptureMiddleware
+from ccproxy.app.middleware import AccessLogMiddleware, BodyCaptureMiddleware, RateLimitMiddleware
 from ccproxy.app.providers import AnthropicProvider, OpenAIProvider, Provider
 from ccproxy.app.router.subagent import SubagentRouter
 
@@ -80,6 +80,17 @@ def _default_providers(settings: Settings) -> dict[str, Provider]:
             providers[prov_name] = AnthropicProvider(
                 base_url=prov_cfg.url,
             )
+
+    # Discover drop-in provider plugins from the plugins directory and
+    # entry points. Plugins don't override built-in or config providers.
+    from ccproxy.app.providers.discovery import discover_plugins
+
+    plugin_dir = Path(__file__).parent / "providers" / "plugins"
+    plugins = discover_plugins(directory=plugin_dir)
+    for name, instance in plugins.items():
+        if name not in providers:
+            providers[name] = instance
+
     return providers
 
 
@@ -191,6 +202,7 @@ def create_app(
     )
     # Body capture must precede access log (so the log can mention body size).
     app.add_middleware(BodyCaptureMiddleware)
+    app.add_middleware(RateLimitMiddleware)
     app.add_middleware(AccessLogMiddleware)
 
     # Mount routes.
@@ -211,6 +223,11 @@ def create_app(
     # Templates + static assets for the dashboard.
     template_dir = Path(__file__).parent / "templates"
     app.state.templates = Jinja2Templates(directory=str(template_dir))
+
+    from ccproxy.app.pricing import compute_cost
+
+    app.state.templates.env.globals["compute_cost"] = compute_cost
+
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 

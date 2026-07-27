@@ -1,15 +1,18 @@
 """FastAPI middleware.
 
-Two middlewares stack onto the FastAPI app:
+Three middlewares stack onto the FastAPI app:
 
-1. ``BodyCaptureMiddleware`` reads POST/PUT/PATCH bodies once, eagerly, into
+1. ``RateLimitMiddleware`` applies a token-bucket rate limiter to the
+   ``/v1/messages`` endpoint. Returns 429 when the bucket is empty.
+
+2. ``BodyCaptureMiddleware`` reads POST/PUT/PATCH bodies once, eagerly, into
    ``request.state.body_bytes`` so that handlers can forward the same
    bytes to an upstream LLM provider without re-reading.
 
-2. ``AccessLogMiddleware`` writes one ``METHOD /path status duration_ms``
+3. ``AccessLogMiddleware`` writes one ``METHOD /path status duration_ms``
    line per request to the ``app.access`` logger, coloured by status class.
 
-Both run inside Starlette's ``BaseHTTPMiddleware`` framework.
+All run inside Starlette's ``BaseHTTPMiddleware`` framework.
 """
 
 from __future__ import annotations
@@ -41,6 +44,48 @@ def _color_for(status: int) -> str:
     if status >= 300:
         return _BLUE
     return _GREEN
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Token-bucket rate limiter for the proxy endpoint.
+
+    Prevents accidental infinite loops (e.g. a misconfigured agent that
+    retries immediately on failure) from flooding the upstream API and
+    exhausting quotas. Only applies to POST /v1/messages.
+
+    Defaults: 60 requests per minute, bucket refills continuously.
+    """
+
+    def __init__(self, app, *, max_tokens: int = 60, refill_seconds: float = 60.0) -> None:
+        super().__init__(app)
+        self._max_tokens = max_tokens
+        self._tokens = float(max_tokens)
+        self._refill_rate = max_tokens / refill_seconds
+        self._last_refill = time.monotonic()
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(self._max_tokens, self._tokens + elapsed * self._refill_rate)
+        self._last_refill = now
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        if request.url.path == "/v1/messages" and request.method == "POST":
+            self._refill()
+            if self._tokens < 1.0:
+                from starlette.responses import JSONResponse
+
+                return JSONResponse(
+                    {"error": "rate limit exceeded", "retry_after_seconds": 1.0},
+                    status_code=429,
+                    headers={"Retry-After": "1"},
+                )
+            self._tokens -= 1.0
+        return await call_next(request)
 
 
 class BodyCaptureMiddleware(BaseHTTPMiddleware):

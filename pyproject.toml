@@ -48,6 +48,9 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0",
 ]
+keyring = [
+    "keyring>=25.0",
+]
 
 [project.scripts]
 markdown-editor = "src.main:main"
