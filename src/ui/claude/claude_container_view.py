@@ -384,6 +384,7 @@ class ClaudeContainerView(QWidget):
             argv=["claude"],
             env=env,
             cwd=profile.session_cwd,
+            session_label="claude",
             parent=self,
         )
         view.exited.connect(lambda v=view: self._on_session_exited(v))

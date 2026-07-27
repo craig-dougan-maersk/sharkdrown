@@ -34,7 +34,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
 
-from src.ui.terminal.renderer import screen_to_html
+from src.ui.terminal.renderer import history_lines_to_html, screen_to_html
 
 
 # --- Pure keymap (testable without Qt) -------------------------------------
@@ -246,7 +246,7 @@ class TerminalTextEdit(QTextEdit):
         # ``_recompute_size`` (which divides viewport height by
         # ``font.lineSpacing()``) agree on the cell grid boundaries.
         self.document().setDocumentMargin(0)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
     # No further work here — ``setDocumentMargin(0)`` is called inline
     # in ``__init__`` (see below) so the cell grid lines up exactly
@@ -315,6 +315,20 @@ class TerminalTextEdit(QTextEdit):
             cb()
         except Exception:  # noqa: BLE001 — best-effort hook
             pass
+
+    # ---- scrollback ---------------------------------------------------------
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        """Track user scroll direction to manage auto-scroll behavior."""
+        super().wheelEvent(event)
+        scrollbar = self.verticalScrollBar()
+        parent_view = self.parent()
+        if parent_view is None:
+            return
+        if scrollbar.value() >= scrollbar.maximum() - 5:
+            parent_view._user_scrolled_up = False
+        elif event.angleDelta().y() > 0:
+            parent_view._user_scrolled_up = True
 
     # ---- input -------------------------------------------------------------
 
@@ -924,10 +938,12 @@ class TerminalSessionView(QWidget):
         *,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        session_label: str = "terminal",
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._argv = argv
+        self._session_label = session_label
         # Per-session environment overrides. ``env`` is a COMPLETE
         # replacement (PtySession calls ``os.execvpe``), so callers must
         # build on top of ``os.environ.copy()`` themselves — see
@@ -971,6 +987,14 @@ class TerminalSessionView(QWidget):
         # Session recorder — None until start_recording() is called.
         self._recorder = None
 
+        # Plain-text session logger — started automatically if logging
+        # is enabled (controlled by the status-bar checkbox via QSettings).
+        self._logger = None
+
+        # Scrollback: when True, user has scrolled up and we should NOT
+        # auto-scroll to the bottom on repaint.
+        self._user_scrolled_up = False
+
         # Lazy pyte import — pyte is a runtime dep but not required to
         # construct the widget, so render-only tests can still import this
         # module.
@@ -999,7 +1023,7 @@ class TerminalSessionView(QWidget):
 
         import pyte
 
-        self._screen = pyte.Screen(self._cols, self._rows)
+        self._screen = pyte.HistoryScreen(self._cols, self._rows, history=5000)
         self._stream = pyte.ByteStream(self._screen)
 
         from src.ui.terminal.pty_backend import PtySession
@@ -1017,6 +1041,9 @@ class TerminalSessionView(QWidget):
         self._session.read_error.connect(self._on_read_error)
         self._session.start_pty()
 
+        # Start plain-text logging if enabled in settings.
+        self._start_logging_if_enabled()
+
         # First paint — usually empty until the shell prompt arrives.
         self._repaint()
 
@@ -1028,6 +1055,8 @@ class TerminalSessionView(QWidget):
         self._repaint_timer.stop()
         if self._recorder is not None and self._recorder.is_recording:
             self._recorder.stop()
+        if self._logger is not None and self._logger.is_enabled:
+            self._logger.stop()
         if self._session is not None:
             try:
                 self._session.shutdown()
@@ -1066,6 +1095,33 @@ class TerminalSessionView(QWidget):
     @property
     def is_recording(self) -> bool:
         return self._recorder is not None and self._recorder.is_recording
+
+    # ---- Session logging ---------------------------------------------------
+
+    def _start_logging_if_enabled(self) -> None:
+        """Start the plain-text logger if QSettings says logging is on."""
+        from PySide6.QtCore import QSettings
+        from src.ui.terminal.session_logger import SessionLogger
+
+        settings = QSettings("SharkDrown", "App")
+        enabled = settings.value("session_logging_enabled", True, type=bool)
+        if enabled:
+            self._logger = SessionLogger(session_label=self._session_label)
+            self._logger.start()
+
+    def set_logging_enabled(self, enabled: bool) -> None:
+        """Enable or disable logging for this session."""
+        from src.ui.terminal.session_logger import SessionLogger
+
+        if enabled and (self._logger is None or not self._logger.is_enabled):
+            self._logger = SessionLogger(session_label=self._session_label)
+            self._logger.start()
+        elif not enabled and self._logger is not None and self._logger.is_enabled:
+            self._logger.stop()
+
+    @property
+    def is_logging(self) -> bool:
+        return self._logger is not None and self._logger.is_enabled
 
     def title(self) -> str:
         """Short label suitable for the tab text."""
@@ -1190,6 +1246,8 @@ class TerminalSessionView(QWidget):
             return
         if self._recorder is not None and self._recorder.is_recording:
             self._recorder.record(chunk)
+        if self._logger is not None and self._logger.is_enabled:
+            self._logger.write(chunk)
         # Detect a scroll BEFORE feeding bytes so we know if content
         # reflowed. After the feed, if the screen scrolled (cursor at
         # top + dirty rows above), any held cell-coord selection now
@@ -1238,25 +1296,42 @@ class TerminalSessionView(QWidget):
         if self._screen is None:
             return
         # Pass the cell-coordinate selection through to the renderer so
-        # the highlighted cells render with reversed fg/bg. ``selection_range``
-        # returns ``((x1,y1,x2,y2), is_block)`` or None — exactly what
-        # ``screen_to_html`` expects.
+        # the highlighted cells render with reversed fg/bg.
         sel = None
         if hasattr(self, "text_edit"):
             sel = self.text_edit.selection_range()
-        html = screen_to_html(self._screen, selection=sel)
-        # setHtml resets the scrollbar to 0. We then move the cursor
-        # to End and ask for the cursor to be visible — that scrolls
-        # the bar all the way down to its maximum value, keeping the
-        # bottom row of the cell grid (where new output and the
-        # pyte cursor live) anchored to the bottom of the viewport.
-        # Without this, the user sees the cursor "snap back" to the
-        # top of the document on every repaint.
+
+        # Build full HTML: scrollback history + live screen.
+        live_html = screen_to_html(self._screen, selection=sel)
+
+        history_html = ""
+        if hasattr(self._screen, "history") and self._screen.history.top:
+            history_html = history_lines_to_html(
+                self._screen.history.top, self._screen.columns
+            )
+
+        if history_html:
+            # Inject history rows before the live content inside the <pre> tag.
+            # screen_to_html returns '<pre style="...">CONTENT</pre>'.
+            # We insert history_html right after the opening <pre ...> tag.
+            pre_end = live_html.index(">") + 1
+            html = live_html[:pre_end] + history_html + live_html[pre_end:]
+        else:
+            html = live_html
+
+        # Detect scroll position before replacing content.
+        scrollbar = self.text_edit.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 5
+
         self.text_edit.setHtml(html)
-        cursor = self.text_edit.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.text_edit.setTextCursor(cursor)
-        self.text_edit.ensureCursorVisible()
+
+        # Auto-scroll to bottom unless the user manually scrolled up.
+        if not self._user_scrolled_up or was_at_bottom:
+            self._user_scrolled_up = False
+            cursor = self.text_edit.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.text_edit.setTextCursor(cursor)
+            self.text_edit.ensureCursorVisible()
 
     def _recompute_size(self) -> None:
         """Translate current pixel size → rows/cols via QFontMetrics.

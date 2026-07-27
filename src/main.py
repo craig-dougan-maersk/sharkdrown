@@ -44,6 +44,18 @@ def main() -> None:
         from PySide6.QtGui import QIcon
         app.setWindowIcon(QIcon(str(icon_path)))
 
+    # Restore persisted font size adjustment.
+    from PySide6.QtCore import QSettings
+    settings = QSettings("SharkDrown", "App")
+    if not settings.contains("app_font_base_size"):
+        settings.setValue("app_font_base_size", app.font().pointSize())
+    font_delta = settings.value("app_font_delta", 0, type=int)
+    if font_delta:
+        font = app.font()
+        base = settings.value("app_font_base_size", font.pointSize(), type=int)
+        font.setPointSize(max(8, min(32, base + font_delta)))
+        app.setFont(font)
+
     # Create and show the main window
     window = MainWindow()
     window.show()

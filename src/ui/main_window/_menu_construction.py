@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtGui import QAction, QActionGroup, QClipboard, QKeySequence
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QLabel,
     QMenu,
@@ -105,6 +106,23 @@ class MenuConstructionMixin:
         saved = self.theme_manager.load_saved()
         self._theme_actions[saved].setChecked(True)
 
+        view_menu.addSeparator()
+
+        self.action_increase_font = QAction("Increase Font Size", self)
+        self.action_increase_font.setShortcut("Ctrl+=")
+        self.action_increase_font.triggered.connect(self._increase_font_size)
+        view_menu.addAction(self.action_increase_font)
+
+        self.action_decrease_font = QAction("Decrease Font Size", self)
+        self.action_decrease_font.setShortcut("Ctrl+-")
+        self.action_decrease_font.triggered.connect(self._decrease_font_size)
+        view_menu.addAction(self.action_decrease_font)
+
+        self.action_reset_font = QAction("Reset Font Size", self)
+        self.action_reset_font.setShortcut("Ctrl+0")
+        self.action_reset_font.triggered.connect(self._reset_font_size)
+        view_menu.addAction(self.action_reset_font)
+
     def _apply_theme(self, mode) -> None:
         from src.ui.theme import ThemeMode
 
@@ -112,10 +130,79 @@ class MenuConstructionMixin:
         for m, action in self._theme_actions.items():
             action.setChecked(m == mode)
 
+    # ---- font size -----------------------------------------------------------
+
+    def _increase_font_size(self) -> None:
+        self._adjust_font(+1)
+
+    def _decrease_font_size(self) -> None:
+        self._adjust_font(-1)
+
+    def _reset_font_size(self) -> None:
+        self._adjust_font(0, reset=True)
+
+    def _adjust_font(self, delta: int, *, reset: bool = False) -> None:
+        """Adjust font size for the active context and application chrome."""
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import QApplication
+
+        settings = QSettings("SharkDrown", "App")
+
+        # Adjust application-wide font (menus, dialogs, labels).
+        app = QApplication.instance()
+        app_font = app.font()
+        base_size = settings.value("app_font_base_size", app_font.pointSize(), type=int)
+        if reset:
+            app_font.setPointSize(base_size)
+            settings.setValue("app_font_delta", 0)
+        else:
+            current_delta = settings.value("app_font_delta", 0, type=int)
+            new_delta = current_delta + delta
+            new_size = max(8, min(32, base_size + new_delta))
+            app_font.setPointSize(new_size)
+            settings.setValue("app_font_delta", new_size - base_size)
+        app.setFont(app_font)
+
+        # Also adjust the active tab's specific widget.
+        view_index = self.view_tabs.currentIndex()
+        is_documents = view_index == getattr(self, "_TAB_INDEX_DOCUMENTS", -1)
+        is_terminals = view_index == getattr(self, "_TAB_INDEX_TERMINALS", -1)
+        is_claude = view_index == getattr(self, "_TAB_INDEX_CLAUDE", -1)
+
+        if is_terminals or is_claude:
+            sess = self._active_terminal_session()
+            if sess is not None:
+                if reset:
+                    sess.adjust_font_size(0)
+                else:
+                    sess.adjust_font_size(delta)
+        elif is_documents:
+            editor = self.editor_tabs.currentWidget()
+            if editor is not None and hasattr(editor, "adjust_font_size"):
+                if reset:
+                    editor.reset_font_size()
+                else:
+                    editor.adjust_font_size(delta)
+
     def _init_status_bar(self) -> None:
         """Initialize the status bar."""
+        from PySide6.QtCore import QSettings
+
         self.status = self.statusBar()
         self.status.showMessage("Ready")
+
+        # Session logging toggle — appears on the left of the permanent area.
+        settings = QSettings("SharkDrown", "App")
+        self.log_sessions_checkbox = QCheckBox("Log Sessions")
+        self.log_sessions_checkbox.setChecked(
+            settings.value("session_logging_enabled", True, type=bool)
+        )
+        self.log_sessions_checkbox.setToolTip(
+            "When checked, new terminal and Claude sessions write\n"
+            "a plain-text log to ~/.sharkdrown/logs/"
+        )
+        self.log_sessions_checkbox.toggled.connect(self._on_log_sessions_toggled)
+        self.status.addPermanentWidget(self.log_sessions_checkbox)
 
         self.format_combo = QComboBox()
         self.format_combo.addItems(["markdown", "json", "yaml"])
@@ -164,6 +251,15 @@ class MenuConstructionMixin:
     def _on_format_combo_changed(self, fmt: str) -> None:
         """Slot for format_combo.currentTextChanged."""
         self._set_current_format(fmt)
+
+    def _on_log_sessions_toggled(self, checked: bool) -> None:
+        """Persist the logging preference and update the active session."""
+        from PySide6.QtCore import QSettings
+
+        QSettings("SharkDrown", "App").setValue("session_logging_enabled", checked)
+        sess = self._active_terminal_session()
+        if sess is not None:
+            sess.set_logging_enabled(checked)
 
     def _init_terminal_menu(self) -> None:
         """Add the Terminal menu."""

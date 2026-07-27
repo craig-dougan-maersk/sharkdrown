@@ -345,3 +345,49 @@ def screen_to_html(
 
     out.append("</pre>")
     return "".join(out)
+
+
+def history_lines_to_html(history_top, cols: int) -> str:
+    """Render scrollback history lines as HTML rows.
+
+    Each line in *history_top* is a dict-like mapping column index to a
+    pyte ``Char`` namedtuple — the same format as ``screen.buffer[y]``.
+
+    Returns the HTML content for all history rows (without wrapping
+    ``<pre>`` tags — the caller prepends this to the live-screen HTML).
+    """
+    if not history_top:
+        return ""
+
+    out: list[str] = []
+    for line in history_top:
+        x = 0
+        while x < cols:
+            cell = line[x]
+            end = x + 1
+            while end < cols:
+                nxt = line[end]
+                if _attrs_key(nxt) != _attrs_key(cell):
+                    break
+                end += 1
+
+            run_text = "".join(line[i].data for i in range(x, end))
+
+            has_style = (
+                cell.fg != "default"
+                or cell.bg != "default"
+                or getattr(cell, "bold", False)
+                or getattr(cell, "italics", False)
+                or getattr(cell, "reverse", False)
+            )
+            if has_style:
+                out.append(
+                    f'<span style="{_style_attrs(cell)}">'
+                    f"{_escape(run_text)}"
+                    "</span>"
+                )
+            else:
+                out.append(_escape(run_text))
+            x = end
+        out.append("\n")
+    return "".join(out)

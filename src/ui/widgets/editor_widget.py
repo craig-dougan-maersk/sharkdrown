@@ -308,3 +308,25 @@ class EditorWidget(QWidget):
     def setPlainText(self, text: str) -> None:
         """Set the plain text content."""
         self.editor.setPlainText(text)
+
+    # ---- font sizing -------------------------------------------------------
+
+    MIN_FONT_POINT_SIZE = 8
+    MAX_FONT_POINT_SIZE = 32
+    DEFAULT_FONT_POINT_SIZE = 12
+
+    def adjust_font_size(self, delta: int) -> None:
+        """Increase or decrease the editor font size by delta points."""
+        font = self.editor.font()
+        new_size = max(
+            self.MIN_FONT_POINT_SIZE,
+            min(self.MAX_FONT_POINT_SIZE, font.pointSize() + delta),
+        )
+        font.setPointSize(new_size)
+        self.editor.setFont(font)
+
+    def reset_font_size(self) -> None:
+        """Reset editor font to default size."""
+        font = self.editor.font()
+        font.setPointSize(self.DEFAULT_FONT_POINT_SIZE)
+        self.editor.setFont(font)
