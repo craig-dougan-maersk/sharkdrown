@@ -147,8 +147,14 @@ class PtySession(QThread):
                 if self._cwd is not None:
                     os.chdir(self._cwd)
                 if self._env is not None:
+                    # Ensure TERM is set for proper capability detection.
+                    if "TERM" not in self._env:
+                        self._env["TERM"] = "xterm-256color"
                     os.execvpe(self._argv[0], self._argv, self._env)
                 else:
+                    # Ensure TERM is set even when inheriting parent env.
+                    if "TERM" not in os.environ:
+                        os.environ["TERM"] = "xterm-256color"
                     os.execvp(self._argv[0], self._argv)
             except OSError:
                 os._exit(127)

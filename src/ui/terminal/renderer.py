@@ -67,6 +67,34 @@ _16_COLOR_HEX: dict[str, str] = {
     "bright_white":   "#eeeeec",
 }
 
+# Active theme override — set by ``apply_theme()`` at runtime. When None,
+# the hardcoded dark palette above is used (backward-compatible default).
+_active_theme: "dict[str, str] | None" = None
+
+
+def apply_theme(theme: "dict[str, str] | None") -> None:
+    """Set the active terminal colour theme (or None to reset to default)."""
+    global _active_theme
+    _active_theme = theme
+
+
+def _get_fg() -> str:
+    if _active_theme:
+        return _active_theme.get("fg", _DARK_FG)
+    return _DARK_FG
+
+
+def _get_bg() -> str:
+    if _active_theme:
+        return _active_theme.get("bg", _DARK_BG)
+    return _DARK_BG
+
+
+def _get_16color(name: str) -> "str | None":
+    if _active_theme and name in _active_theme:
+        return _active_theme[name]
+    return _16_COLOR_HEX.get(name)
+
 
 def _color_to_css(value: str, role: str) -> str:
     """Map a pyte colour string to a CSS colour value.
@@ -76,8 +104,9 @@ def _color_to_css(value: str, role: str) -> str:
     """
     if value == "default":
         return f"var(--term-{role})"
-    if value in _16_COLOR_HEX:
-        return _16_COLOR_HEX[value]
+    mapped = _get_16color(value)
+    if mapped is not None:
+        return mapped
     # pyte 256-colour is six lowercase hex digits with no leading '#'.
     if len(value) == 6 and all(c in "0123456789abcdef" for c in value):
         return f"#{value}"
@@ -123,17 +152,12 @@ def _in_selection(
 ) -> bool:
     """True if cell ``(x, y)`` is inside the selection rectangle.
 
-    Linear: per-row x clamp — row y1 has x≥x1, row y2 has x≤x2, interior
-    rows are full-width. Matches xterm's "drag flows across rows"
-    behaviour. Currently unused by the terminal UI (block is the
-    default) but kept so a future mode toggle can re-enable it without
-    rewriting the highlight math.
+    Linear (default): per-row x clamp — row y1 has x≥x1, row y2 has
+    x≤x2, interior rows are full-width. Selection follows text flow,
+    wrapping to the next line at the end of each row.
 
-    Block: simple rectangle test — same x-range, same y-range. This is
-    the default selection mode for the terminal because on a uniform
-    character grid every row contains meaningful content, so the
-    "linear flow" interpretation produces confusing results where
-    diagonal drags highlight most of the screen.
+    Block (Command/Alt held): simple rectangle test — same x-range,
+    same y-range. Useful for selecting columnar data.
     """
     if selection is None:
         return False
@@ -191,11 +215,17 @@ def _style_attrs(cell, *, force_reverse: bool = False) -> str:
     # the original fg visible and gives the selection a clear
     # difference from the surrounding default-bg cells.
     if force_reverse and bg == "var(--term-bg)":
-        # ``_DARK_BG`` is the terminal's default bg (#1a1a1a). We
-        # lighten it to #3a3a3a for selection — about 20% brighter,
-        # which gives clear contrast with both the unselected cells
-        # and the (lighter) terminal foreground.
-        parts.append("background-color:#3a3a3a")
+        # Selection highlight on default-bg cells: lighten the theme bg
+        # for contrast. Parse the hex bg and add ~0x20 to each channel.
+        theme_bg = _get_bg()
+        try:
+            r = min(255, int(theme_bg[1:3], 16) + 0x20)
+            g = min(255, int(theme_bg[3:5], 16) + 0x20)
+            b = min(255, int(theme_bg[5:7], 16) + 0x20)
+            sel_bg = f"#{r:02x}{g:02x}{b:02x}"
+        except (ValueError, IndexError):
+            sel_bg = "#3a3a3a"
+        parts.append(f"background-color:{sel_bg}")
     if getattr(cell, "bold", False):
         parts.append("font-weight:bold")
     if getattr(cell, "italics", False):
@@ -249,23 +279,16 @@ def screen_to_html(
     rows = screen.lines
     cols = screen.columns
 
+    fg = _get_fg()
+    bg = _get_bg()
     out: list[str] = [
         '<pre style="'
         'font-family:Menlo,Consolas,monospace;'
-        f'--term-fg:{_DARK_FG};'
-        f'--term-bg:{_DARK_BG};'
-        # Padding must be 0 — QTextDocument already adds its own
-        # document-margin on top of anything we put here, so any
-        # extra pixels compound into rows of vertical slack. The
-        # cell grid is exactly the viewport's pixel area.
+        f'--term-fg:{fg};'
+        f'--term-bg:{bg};'
         'margin:0;padding:0;'
         'background-color:var(--term-bg);'
         'color:var(--term-fg);'
-        # Line-height:1.0 makes ``font.lineSpacing()`` (which renders
-        # the row baseline measurement) match the actual rendered row
-        # height — otherwise QTextDocument lays out slightly taller
-        # rows than ``_recompute_size`` measures, and the document
-        # ends up ``rows + 2`` tall, leaving room for vertical scroll.
         'line-height:1.0;'
         '">'
     ]

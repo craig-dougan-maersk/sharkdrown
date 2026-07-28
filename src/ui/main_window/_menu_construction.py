@@ -9,7 +9,9 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QMessageBox,
+    QSlider,
 )
+from PySide6.QtCore import Qt
 
 from src.proxy.activity_tile import ActivityTile
 
@@ -108,20 +110,58 @@ class MenuConstructionMixin:
 
         view_menu.addSeparator()
 
-        self.action_increase_font = QAction("Increase Font Size", self)
+        # Content font size (affects editor/terminal/claude, NOT UI chrome)
+        self.action_increase_font = QAction("Increase Content Font", self)
         self.action_increase_font.setShortcut("Ctrl+=")
         self.action_increase_font.triggered.connect(self._increase_font_size)
         view_menu.addAction(self.action_increase_font)
 
-        self.action_decrease_font = QAction("Decrease Font Size", self)
+        self.action_decrease_font = QAction("Decrease Content Font", self)
         self.action_decrease_font.setShortcut("Ctrl+-")
         self.action_decrease_font.triggered.connect(self._decrease_font_size)
         view_menu.addAction(self.action_decrease_font)
 
-        self.action_reset_font = QAction("Reset Font Size", self)
+        self.action_reset_font = QAction("Reset Content Font", self)
         self.action_reset_font.setShortcut("Ctrl+0")
         self.action_reset_font.triggered.connect(self._reset_font_size)
         view_menu.addAction(self.action_reset_font)
+
+        view_menu.addSeparator()
+
+        # UI font submenu
+        ui_font_menu = view_menu.addMenu("&UI Font")
+
+        self.action_ui_font_increase = QAction("Increase UI Font", self)
+        self.action_ui_font_increase.triggered.connect(self._increase_ui_font)
+        ui_font_menu.addAction(self.action_ui_font_increase)
+
+        self.action_ui_font_decrease = QAction("Decrease UI Font", self)
+        self.action_ui_font_decrease.triggered.connect(self._decrease_ui_font)
+        ui_font_menu.addAction(self.action_ui_font_decrease)
+
+        self.action_ui_font_reset = QAction("Reset UI Font", self)
+        self.action_ui_font_reset.triggered.connect(self._reset_ui_font)
+        ui_font_menu.addAction(self.action_ui_font_reset)
+
+        ui_font_menu.addSeparator()
+
+        # UI font family selector
+        self._ui_font_family_group = QActionGroup(self)
+        self._ui_font_family_group.setExclusive(True)
+        families = ["System Default", "Inter", "Segoe UI", "Helvetica Neue",
+                    "SF Pro", "Roboto", "Noto Sans"]
+        from PySide6.QtCore import QSettings
+        settings = QSettings("SharkDrown", "App")
+        saved_family = settings.value("ui_font_family", "System Default")
+        for family in families:
+            action = QAction(family, self)
+            action.setCheckable(True)
+            action.setChecked(family == saved_family)
+            action.triggered.connect(
+                lambda checked, f=family: self._set_ui_font_family(f)
+            )
+            self._ui_font_family_group.addAction(action)
+            ui_font_menu.addAction(action)
 
     def _apply_theme(self, mode) -> None:
         from src.ui.theme import ThemeMode
@@ -130,40 +170,21 @@ class MenuConstructionMixin:
         for m, action in self._theme_actions.items():
             action.setChecked(m == mode)
 
-    # ---- font size -----------------------------------------------------------
+    # ---- content font size (Ctrl+=/-, does NOT affect UI chrome) ------------
 
     def _increase_font_size(self) -> None:
-        self._adjust_font(+1)
+        self._adjust_content_font(+1)
 
     def _decrease_font_size(self) -> None:
-        self._adjust_font(-1)
+        self._adjust_content_font(-1)
 
     def _reset_font_size(self) -> None:
-        self._adjust_font(0, reset=True)
+        self._adjust_content_font(0, reset=True)
 
-    def _adjust_font(self, delta: int, *, reset: bool = False) -> None:
-        """Adjust font size for the active context and application chrome."""
+    def _adjust_content_font(self, delta: int, *, reset: bool = False) -> None:
+        """Adjust font size for the active editor/terminal/claude session."""
         from PySide6.QtCore import QSettings
-        from PySide6.QtWidgets import QApplication
 
-        settings = QSettings("SharkDrown", "App")
-
-        # Adjust application-wide font (menus, dialogs, labels).
-        app = QApplication.instance()
-        app_font = app.font()
-        base_size = settings.value("app_font_base_size", app_font.pointSize(), type=int)
-        if reset:
-            app_font.setPointSize(base_size)
-            settings.setValue("app_font_delta", 0)
-        else:
-            current_delta = settings.value("app_font_delta", 0, type=int)
-            new_delta = current_delta + delta
-            new_size = max(8, min(32, base_size + new_delta))
-            app_font.setPointSize(new_size)
-            settings.setValue("app_font_delta", new_size - base_size)
-        app.setFont(app_font)
-
-        # Also adjust the active tab's specific widget.
         view_index = self.view_tabs.currentIndex()
         is_documents = view_index == getattr(self, "_TAB_INDEX_DOCUMENTS", -1)
         is_terminals = view_index == getattr(self, "_TAB_INDEX_TERMINALS", -1)
@@ -184,6 +205,60 @@ class MenuConstructionMixin:
                 else:
                     editor.adjust_font_size(delta)
 
+        # Update the status bar slider to reflect the new size.
+        self._sync_font_slider()
+
+    # ---- UI font (separate from content font) --------------------------------
+
+    def _increase_ui_font(self) -> None:
+        self._adjust_ui_font(+1)
+
+    def _decrease_ui_font(self) -> None:
+        self._adjust_ui_font(-1)
+
+    def _reset_ui_font(self) -> None:
+        self._adjust_ui_font(0, reset=True)
+
+    def _adjust_ui_font(self, delta: int, *, reset: bool = False) -> None:
+        """Adjust the application UI font size (menus, dialogs, labels)."""
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import QApplication
+
+        settings = QSettings("SharkDrown", "App")
+        app = QApplication.instance()
+        app_font = app.font()
+        base_size = settings.value("app_font_base_size", 13, type=int)
+
+        if reset:
+            app_font.setPointSize(base_size)
+            settings.setValue("app_font_delta", 0)
+        else:
+            current_delta = settings.value("app_font_delta", 0, type=int)
+            new_delta = current_delta + delta
+            new_size = max(8, min(24, base_size + new_delta))
+            app_font.setPointSize(new_size)
+            settings.setValue("app_font_delta", new_size - base_size)
+        app.setFont(app_font)
+
+    def _set_ui_font_family(self, family: str) -> None:
+        """Change the UI font family."""
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtGui import QFont
+
+        settings = QSettings("SharkDrown", "App")
+        settings.setValue("ui_font_family", family)
+
+        app = QApplication.instance()
+        font = app.font()
+        if family == "System Default":
+            from PySide6.QtGui import QFontDatabase
+            default = QFontDatabase.systemFont(QFontDatabase.GeneralFont)
+            font.setFamily(default.family())
+        else:
+            font.setFamily(family)
+        app.setFont(font)
+
     def _init_status_bar(self) -> None:
         """Initialize the status bar."""
         from PySide6.QtCore import QSettings
@@ -203,6 +278,22 @@ class MenuConstructionMixin:
         )
         self.log_sessions_checkbox.toggled.connect(self._on_log_sessions_toggled)
         self.status.addPermanentWidget(self.log_sessions_checkbox)
+
+        # Font size slider for editor/terminal/claude content.
+        self.font_size_label = QLabel("Font:")
+        self.status.addPermanentWidget(self.font_size_label)
+
+        self.font_size_slider = QSlider(Qt.Horizontal)
+        self.font_size_slider.setRange(8, 32)
+        self.font_size_slider.setValue(12)
+        self.font_size_slider.setFixedWidth(100)
+        self.font_size_slider.setToolTip("Adjust font size for editor/terminal/Claude sessions")
+        self.font_size_slider.valueChanged.connect(self._on_font_slider_changed)
+        self.status.addPermanentWidget(self.font_size_slider)
+
+        self.font_size_value_label = QLabel("12pt")
+        self.font_size_value_label.setFixedWidth(32)
+        self.status.addPermanentWidget(self.font_size_value_label)
 
         self.format_combo = QComboBox()
         self.format_combo.addItems(["markdown", "json", "yaml"])
@@ -231,6 +322,7 @@ class MenuConstructionMixin:
         self.format_combo.setVisible(is_documents)
         self.proxy_status_label.setVisible(is_claude)
         self.activity_tile.setVisible(is_claude)
+        self._sync_font_slider()
 
     def _sync_format_combo_to_current_document(self) -> None:
         """Point the format combo at the active document's format."""
@@ -260,6 +352,50 @@ class MenuConstructionMixin:
         sess = self._active_terminal_session()
         if sess is not None:
             sess.set_logging_enabled(checked)
+
+    def _on_font_slider_changed(self, value: int) -> None:
+        """Set the content font to the slider's value."""
+        self.font_size_value_label.setText(f"{value}pt")
+        view_index = self.view_tabs.currentIndex()
+        is_documents = view_index == getattr(self, "_TAB_INDEX_DOCUMENTS", -1)
+        is_terminals = view_index == getattr(self, "_TAB_INDEX_TERMINALS", -1)
+        is_claude = view_index == getattr(self, "_TAB_INDEX_CLAUDE", -1)
+
+        if is_terminals or is_claude:
+            sess = self._active_terminal_session()
+            if sess is not None and hasattr(sess, "_base_font"):
+                current = sess._base_font.pointSize()
+                if current != value:
+                    sess.adjust_font_size(value - current)
+        elif is_documents:
+            editor = self.editor_tabs.currentWidget()
+            if editor is not None and hasattr(editor, "editor"):
+                font = editor.editor.font()
+                if font.pointSize() != value:
+                    font.setPointSize(max(8, min(32, value)))
+                    editor.editor.setFont(font)
+
+    def _sync_font_slider(self) -> None:
+        """Sync the font slider to the current active widget's font size."""
+        size = 12
+        view_index = self.view_tabs.currentIndex()
+        is_documents = view_index == getattr(self, "_TAB_INDEX_DOCUMENTS", -1)
+        is_terminals = view_index == getattr(self, "_TAB_INDEX_TERMINALS", -1)
+        is_claude = view_index == getattr(self, "_TAB_INDEX_CLAUDE", -1)
+
+        if is_terminals or is_claude:
+            sess = self._active_terminal_session()
+            if sess is not None and hasattr(sess, "_base_font"):
+                size = sess._base_font.pointSize()
+        elif is_documents:
+            editor = self.editor_tabs.currentWidget()
+            if editor is not None and hasattr(editor, "editor"):
+                size = editor.editor.font().pointSize()
+
+        self.font_size_slider.blockSignals(True)
+        self.font_size_slider.setValue(size)
+        self.font_size_slider.blockSignals(False)
+        self.font_size_value_label.setText(f"{size}pt")
 
     def _init_terminal_menu(self) -> None:
         """Add the Terminal menu."""
@@ -307,6 +443,12 @@ class MenuConstructionMixin:
         self.action_kill_all_sessions = QAction("&Kill All Sessions", self)
         self.action_kill_all_sessions.triggered.connect(self._kill_all_terminal_sessions)
         terminal_menu.addAction(self.action_kill_all_sessions)
+
+        terminal_menu.addSeparator()
+
+        self.action_terminal_settings = QAction("Terminal &Settings…", self)
+        self.action_terminal_settings.triggered.connect(self._open_terminal_settings)
+        terminal_menu.addAction(self.action_terminal_settings)
 
     def _init_claude_menu(self) -> None:
         """Add the Claude menu."""
@@ -395,11 +537,23 @@ class MenuConstructionMixin:
             self.view_tabs.setCurrentIndex(idx)
 
     def _active_terminal_session(self):
-        """Return the active TerminalSessionView or None."""
+        """Return the active TerminalSessionView (terminal or Claude) or None."""
+        from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+        view_index = self.view_tabs.currentIndex()
+        is_claude = view_index == getattr(self, "_TAB_INDEX_CLAUDE", -1)
+
+        if is_claude:
+            claude_container = getattr(self, "claude_container", None)
+            if claude_container is not None:
+                widget = claude_container.tabs.currentWidget()
+                if isinstance(widget, TerminalSessionView):
+                    return widget
+            return None
+
         if self.terminal_container is None:
             return None
         sess = self.terminal_container.session_tabs.currentWidget()
-        from src.ui.terminal.terminal_session_view import TerminalSessionView
         if isinstance(sess, TerminalSessionView):
             return sess
         return None
@@ -456,3 +610,20 @@ class MenuConstructionMixin:
             return
         self.terminal_container.shutdown()
         self.status.showMessage("Killed all terminal sessions.", 3000)
+
+    def _open_terminal_settings(self) -> None:
+        """Slot for Terminal -> Terminal Settings…"""
+        from src.ui.terminal.settings_dialog import TerminalSettingsDialog
+
+        if TerminalSettingsDialog.open_dialog(self):
+            # Apply the new theme immediately to any future repaints.
+            from src.ui.terminal.settings_dialog import get_terminal_theme
+            from src.ui.terminal.renderer import apply_theme
+
+            apply_theme(get_terminal_theme())
+            # Force a repaint on the active terminal session so the user
+            # sees the change immediately.
+            sess = self._active_terminal_session()
+            if sess is not None:
+                sess._repaint()
+            self.status.showMessage("Terminal settings saved.", 3000)

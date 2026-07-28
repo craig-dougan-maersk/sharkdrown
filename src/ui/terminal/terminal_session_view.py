@@ -158,21 +158,14 @@ class TerminalTextEdit(QTextEdit):
 
     Modes
     -----
-    * **Block** (default): the selection is the rectangle the cursor
-      traversed — the same column window across every touched row.
-      Matches gnome-terminal / konsole / iTerm2 behaviour and is what
-      users intuitively expect when dragging on a uniform character
-      grid. On copy, column padding is preserved so ``ls -l`` output
-      stays column-aligned in the paste target.
-    * Linear (legacy): drag flows across rows so the start row covers
-      x1..end, the end row covers 0..x2, and intermediate rows go
-      full-width. Useful for selecting prose-style text with line
-      breaks as natural separators, but on a terminal grid every
-      row contains meaningful content so this behaviour makes
-      diagonal drags highlight "most of the screen" — which is
-      counter-intuitive. Not currently exposed via UI; the flag
-      remains in the data model so a future mode toggle can re-enable
-      it.
+    * **Linear** (default): drag flows across rows like a text editor —
+      selection follows text flow, wrapping to the next line at the end
+      of each row. Start row covers x1..end, end row covers 0..x2,
+      intermediate rows are full-width.
+    * **Block** (Command/Alt held): the selection is the rectangle the
+      cursor traversed — the same column window across every touched row.
+      Useful for selecting columnar data (e.g. ``ls -l`` output). On
+      copy, column padding is preserved so pasted text stays aligned.
     """
 
     # Document margin used by QTextDocument — subtract this when
@@ -246,6 +239,7 @@ class TerminalTextEdit(QTextEdit):
         # ``_recompute_size`` (which divides viewport height by
         # ``font.lineSpacing()``) agree on the cell grid boundaries.
         self.document().setDocumentMargin(0)
+        self.setLineWrapMode(QTextEdit.NoWrap)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
     # No further work here — ``setDocumentMargin(0)`` is called inline
@@ -285,8 +279,8 @@ class TerminalTextEdit(QTextEdit):
         return self.selection_range() is not None
 
     def select_all(self) -> None:
-        """Select every cell on the screen (block mode)."""
-        self._sel_block_flag = True
+        """Select every cell on the screen (linear mode)."""
+        self._sel_block_flag = False
         w = self._screen_width()
         h = self._screen_height()
         if w <= 0 or h <= 0:
@@ -417,34 +411,24 @@ class TerminalTextEdit(QTextEdit):
         pos = event.pos()
         button = event.button()
         if button == Qt.LeftButton:
-            # Click = focus + start selection. Block (rectangle) is
-            # the default for a terminal cell grid — a diagonal drag
-            # covers only the rectangle the cursor traversed, not the
-            # "linear flow" used by text editors where rows fan out
-            # to full-width in between. The latter makes diagonal
-            # drags highlight "most of the screen" because every
-            # intermediate row gets fully selected, which is the
-            # exact opposite of what users expect when dragging on a
-            # uniform character grid. ``Alt`` no longer toggles modes
-            # (both modes now behave the same); we keep
-            # ``_sel_block_flag`` for copy semantics (block mode
-            # preserves column padding on copy).
+            # Default: linear (line-following) selection like a text
+            # editor. Hold Command (Meta) or Alt for block/rectangular
+            # selection (useful for columnar data like `ls -l`).
             #
             # NB: do NOT call ``super().mousePressEvent(event)`` here.
             # QTextEdit's default behaviour mutates the QTextCursor
             # to start a *native* drag selection — which draws a
             # blue highlight on top of our HTML using the document's
-            # text positions (not cell coordinates). That highlight
-            # is the "anchored in the bottom-right / most of the
-            # screen" symptom — it stays visible during the drag
-            # until the next ``setHtml`` repaint (16ms later)
-            # clobbers it. Returning from here without delegating to
-            # super prevents Qt from starting its native selection
-            # entirely; the cell-coord selection is the only one the
-            # user sees.
+            # text positions (not cell coordinates). Returning from
+            # here without delegating to super prevents Qt from
+            # starting its native selection entirely; the cell-coord
+            # selection is the only one the user sees.
             self.setFocus(Qt.MouseFocusReason)
             cell = self._pixel_to_cell(pos)
-            self._sel_block_flag = True
+            mod_mask = _norm_mods(event.modifiers())
+            self._sel_block_flag = bool(
+                mod_mask & (int(Qt.MetaModifier.value) | int(Qt.AltModifier.value))
+            )
             self._sel_anchor = cell
             self._sel_active = cell
             self._emit_selection_changed()
@@ -520,7 +504,10 @@ class TerminalTextEdit(QTextEdit):
         x2 = x
         while x2 + 1 < w and _is_word(row[x2 + 1]):
             x2 += 1
-        self._sel_block_flag = True
+        mod_mask = _norm_mods(event.modifiers())
+        self._sel_block_flag = bool(
+            mod_mask & (int(Qt.MetaModifier.value) | int(Qt.AltModifier.value))
+        )
         self._sel_anchor = (x1, y)
         self._sel_active = (x2, y)
         self._emit_selection_changed()
@@ -1010,6 +997,11 @@ class TerminalSessionView(QWidget):
             return
         self._started = True
 
+        # Apply the saved terminal colour theme to the renderer.
+        from src.ui.terminal.settings_dialog import get_terminal_theme
+        from src.ui.terminal.renderer import apply_theme
+        apply_theme(get_terminal_theme())
+
         # Compute initial size from the widget's current pixel size if
         # it's been laid out; otherwise fall back to defaults.
         self._recompute_size()
@@ -1219,12 +1211,17 @@ class TerminalSessionView(QWidget):
         self.text_edit._screen_ref = lambda: self._screen
         self.text_edit._screen_width = lambda: self._cols
         self.text_edit._screen_height = lambda: self._rows
-        # Use a monospace font. Pick the system monospace family.
-        # Stash a reference on ``self._base_font`` so ``adjust_font_size``
-        # can mutate the pointSize without re-fetching the system font
-        # each time (which would reset other style attributes too).
-        self._base_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
-        self._base_font.setPointSize(max(self._base_font.pointSize(), 10))
+        # Use a monospace font. Prefer the user's saved terminal font;
+        # fall back to the system monospace family.
+        from src.ui.terminal.settings_dialog import load_terminal_settings
+        ts = load_terminal_settings()
+        if ts["font_family"]:
+            from PySide6.QtGui import QFont
+            self._base_font = QFont(ts["font_family"])
+        else:
+            self._base_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        size = ts["font_size"] if ts["font_size"] > 0 else max(self._base_font.pointSize(), 10)
+        self._base_font.setPointSize(size)
         self.text_edit.setFont(self._base_font)
         # Disable the horizontal scrollbar — the screen is fixed-width
         # and any overflow is a bug, not user-visible state.
@@ -1328,10 +1325,20 @@ class TerminalSessionView(QWidget):
         # Auto-scroll to bottom unless the user manually scrolled up.
         if not self._user_scrolled_up or was_at_bottom:
             self._user_scrolled_up = False
-            cursor = self.text_edit.textCursor()
-            cursor.movePosition(QTextCursor.End)
-            self.text_edit.setTextCursor(cursor)
-            self.text_edit.ensureCursorVisible()
+            # Force the document layout so scrollbar.maximum() reflects
+            # the new content height. Without this, the maximum is stale
+            # (from the previous setHtml) and the scroll falls short —
+            # leaving the last few rows (where oh-my-posh draws its
+            # status line) just below the visible area.
+            self.text_edit.document().adjustSize()
+            scrollbar.setValue(scrollbar.maximum())
+            # Reset horizontal scroll — the terminal grid should always
+            # start at x=0. Without this, ensureCursorVisible() (which we
+            # previously used) scrolls right to show the cursor at the end
+            # of the line, clipping the first few characters on the left.
+            hbar = self.text_edit.horizontalScrollBar()
+            if hbar.value() != 0:
+                hbar.setValue(0)
 
     def _recompute_size(self) -> None:
         """Translate current pixel size → rows/cols via QFontMetrics.
@@ -1365,7 +1372,14 @@ class TerminalSessionView(QWidget):
         h = self.text_edit.viewport().height()
         if w <= 0 or h <= 0:
             return
+        # Use floor division then verify the total pixel width fits.
+        # Without this check, rounding means cols*cw can exceed the
+        # viewport by up to (cw-1) px, pushing content past the right
+        # edge. ensureCursorVisible() then scrolls horizontally to show
+        # the cursor — clipping the first characters on the left.
         cols = max(1, w // cw)
+        if cols * cw > w:
+            cols -= 1
         # Measure the ACTUAL rendered line height by feeding ``rows``
         # candidate newlines into a temporary document with the same
         # font + the same line-height/pre rules the renderer uses.

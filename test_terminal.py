@@ -665,12 +665,9 @@ def test_mouse_press_with_keyboard_modifier_enum() -> None:
     ``QMouseEvent`` carrying the ``AltModifier`` flag and asserts no
     exception is raised.
 
-    Note: as of the block-default change, ``_sel_block_flag`` is True
-    for every left-click — Alt no longer toggles modes (both modes
-    behave the same in the UI; the flag persists in the data model
-    for copy semantics). The test now asserts the press doesn't
-    raise and ``_sel_block_flag`` is True, rather than asserting that
-    Alt specifically sets it.
+    Selection modes: plain click = linear (line-following), Command/Alt
+    held = block (rectangular). The test verifies both paths work and
+    set the flag correctly.
     """
     _qapp()
     from PySide6.QtCore import QEvent, QPoint, Qt
@@ -687,8 +684,7 @@ def test_mouse_press_with_keyboard_modifier_enum() -> None:
     edit.show()
     _spin(20)
 
-    # Construct a real QMouseEvent — modifier is a Qt.KeyboardModifier
-    # flag enum, which is what ``QMouseEvent`` produces in practice.
+    # Alt held — block selection mode.
     ev_alt = QMouseEvent(
         QEvent.Type.MouseButtonPress,
         QPoint(2, 2),
@@ -697,14 +693,12 @@ def test_mouse_press_with_keyboard_modifier_enum() -> None:
         Qt.MouseButton.NoButton,
         Qt.KeyboardModifier.AltModifier,
     )
-    # The headline assertion: no exception thrown.
     edit.mousePressEvent(ev_alt)
     assert edit._sel_block_flag is True, (
-        f"left-click should set _sel_block_flag=True (block default), "
+        f"Alt+click should set _sel_block_flag=True (block mode), "
         f"got {edit._sel_block_flag}"
     )
-    # Plain click (no modifiers) — must also not raise and should
-    # leave the flag as True (block is the default for every click).
+    # Plain click (no modifiers) — linear selection mode.
     edit.clear_selection()
     ev_plain = QMouseEvent(
         QEvent.Type.MouseButtonPress,
@@ -715,8 +709,8 @@ def test_mouse_press_with_keyboard_modifier_enum() -> None:
         Qt.KeyboardModifier.NoModifier,
     )
     edit.mousePressEvent(ev_plain)
-    assert edit._sel_block_flag is True, (
-        f"plain left-click should also default to block=True, "
+    assert edit._sel_block_flag is False, (
+        f"plain left-click should default to linear (block=False), "
         f"got {edit._sel_block_flag}"
     )
     print("✓ mousePressEvent safely handles Qt.KeyboardModifier flag enum")
@@ -1478,10 +1472,10 @@ def test_pixel_to_cell_drag_stays_in_dragged_region() -> None:
         assert rng[3] <= view._rows // 2, (
             f"selection y-end {rng[3]} should be in top half of {view._rows} rows"
         )
-        # And: block (rectangle) must be the default mode now, so the
-        # intermediate rows don't fan out to full-width.
-        assert is_block is True, (
-            f"default selection mode should be block (rectangle), got linear"
+        # Default selection mode is now linear (line-following). Block
+        # mode requires Command/Alt held during the drag.
+        assert is_block is False, (
+            f"default selection mode should be linear, got block"
         )
     finally:
         view.shutdown()
@@ -1489,21 +1483,11 @@ def test_pixel_to_cell_drag_stays_in_dragged_region() -> None:
 
 
 def test_block_selection_default_highlights_only_drag_rectangle() -> None:
-    """A diagonal drag highlights the rectangle the cursor traversed — not full-width rows.
+    """An Alt+drag highlights the rectangle the cursor traversed — not full-width rows.
 
-    Regression test for the user-reported "selection anchored in
-    bottom-right, most of the screen selected" symptom. The previous
-    default was linear (xterm-style) where intermediate rows fan out
-    to full-width, so a drag from (5, 2) to (25, 10) highlighted:
-      * Row 2: cols 5..79 (full-width to the right)
-      * Rows 3-9: ALL cells (full-width)
-      * Row 10: cols 0..25 (full-width from the left)
-    That's roughly 85% of the screen — the exact user complaint.
-
-    With block (rectangle) as the default, the same drag highlights
-    ONLY cells (x in [5, 25], y in [2, 10]) — 21×9 = 189 cells out of
-    1920, about 10% of the screen. Verifies the renderer no-ops for
-    cells outside the dragged rectangle.
+    Block selection is activated by holding Command/Alt during the drag.
+    This tests that the block rectangle covers only the dragged area
+    (cells in [5, 25] × [2, 10]) rather than full-width rows.
     """
     _qapp()
     import pyte
@@ -1545,17 +1529,17 @@ def test_block_selection_default_highlights_only_drag_rectangle() -> None:
         ev_press = QMouseEvent(
             QEvent.Type.MouseButtonPress, QPoint(*press_px),
             Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
-            Qt.KeyboardModifier.NoModifier,
+            Qt.KeyboardModifier.AltModifier,
         )
         QApplication.sendEvent(edit.viewport(), ev_press)
         ev_move = QMouseEvent(
             QEvent.Type.MouseMove, QPoint(*move_px),
             Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
-            Qt.KeyboardModifier.NoModifier,
+            Qt.KeyboardModifier.AltModifier,
         )
         QApplication.sendEvent(edit.viewport(), ev_move)
         rng, is_block = edit.selection_range()
-        assert is_block, "default selection mode must be block"
+        assert is_block, "Alt+drag must activate block selection mode"
         x1, y1, x2, y2 = rng
         # Rectangle bounds: 5..25 cols, 2..10 rows. We use
         # approximate bounds (off-by-one tolerance) because the test
@@ -1831,7 +1815,7 @@ def test_real_mouse_event_via_viewport_sets_cell_selection() -> None:
         rng = edit.selection_range()
         assert rng is not None, "drag via viewport did not produce a selection"
         rng_box, is_block = rng
-        assert is_block is True, "default selection should be block (rectangle)"
+        assert is_block is False, "default selection should be linear (line-following)"
         assert rng_box[2] > rng_box[0] or rng_box[3] > rng_box[1], (
             f"drag should produce a non-degenerate rectangle, got {rng_box}"
         )

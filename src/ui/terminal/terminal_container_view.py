@@ -90,7 +90,8 @@ class TerminalContainerView(QWidget):
 
     def new_session(self, cwd: str | None = None) -> TerminalSessionView:
         """Spawn a new shell session and add it as a tab. Returns the view."""
-        view = TerminalSessionView(parent=self)
+        argv, env = self._session_argv_env()
+        view = TerminalSessionView(argv=argv, env=env, cwd=cwd, parent=self)
         view.exited.connect(lambda v=view: self._on_session_exited(v))
         index = self.session_tabs.addTab(view, view.title())
         self.session_tabs.setCurrentIndex(index)
@@ -162,6 +163,28 @@ class TerminalContainerView(QWidget):
 
     # ---- internals ---------------------------------------------------------
 
+    @staticmethod
+    def _session_argv_env() -> "tuple[list[str] | None, dict[str, str] | None]":
+        """Build argv and env from saved terminal settings."""
+        import os
+        from src.ui.terminal.settings_dialog import load_terminal_settings
+
+        ts = load_terminal_settings()
+        argv = None
+        if ts["shell"]:
+            argv = [ts["shell"], "-i"]
+
+        env = None
+        if ts["env_vars"]:
+            env = os.environ.copy()
+            for line in ts["env_vars"].splitlines():
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    key, _, val = line.partition("=")
+                    env[key.strip()] = val.strip()
+
+        return argv, env
+
     def _close_session(self, index: int) -> None:
         """Slot for the inner tab widget's ``tabCloseRequested``."""
         widget = self.session_tabs.widget(index)
@@ -185,11 +208,11 @@ class TerminalContainerView(QWidget):
         self._update_info_label()
 
     def _on_session_exited(self, view: TerminalSessionView) -> None:
-        """Refresh the tab title when the child shell exits."""
+        """Auto-close the tab when the child shell exits."""
         for i in range(self.session_tabs.count()):
             if self.session_tabs.widget(i) is view:
-                self.session_tabs.setTabText(i, view.title())
-                break
+                self._close_session(i)
+                return
         self._update_info_label()
 
     def _update_info_label(self) -> None:
