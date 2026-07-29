@@ -71,8 +71,11 @@ class MainWindow(
         self._init_claude_menu()
         self._init_status_bar()
 
+        # Install double-click rename on tab bar
+        self._install_tab_rename_filter()
+
         # Create initial tab
-        self._create_new_tab()
+        self._create_new_tab(format_type="markdown")
 
         self._apply_view_state()
 
@@ -87,6 +90,9 @@ class MainWindow(
 
     def _init_central_widget(self) -> None:
         """Initialize the central widget with top-level tab structure."""
+        from src.ui.widgets.markdown_toolbar import MarkdownToolbar
+        from src.ui.widgets.lint_panel import LintPanel
+
         self.splitter = QSplitter(Qt.Horizontal)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 1)
@@ -106,6 +112,22 @@ class MainWindow(
         self.splitter.addWidget(self.editor_tabs)
         self.splitter.addWidget(self.preview_tabs)
 
+        # Markdown toolbar (hidden by default, shown for markdown tabs)
+        self.markdown_toolbar = MarkdownToolbar()
+        self.markdown_toolbar.setVisible(False)
+
+        # Lint panel (below editor, hidden by default)
+        self.lint_panel = LintPanel()
+        self.lint_panel.setVisible(False)
+        self.lint_panel.issue_clicked.connect(self._on_lint_issue_clicked)
+
+        # Vertical splitter: editor area on top, lint panel on bottom
+        self.doc_vsplitter = QSplitter(Qt.Vertical)
+        self.doc_vsplitter.addWidget(self.splitter)
+        self.doc_vsplitter.addWidget(self.lint_panel)
+        self.doc_vsplitter.setStretchFactor(0, 4)
+        self.doc_vsplitter.setStretchFactor(1, 1)
+
         # ---- Top-level view tabs (Documents / Terminals / Claude) ------
         self.view_tabs = QTabWidget()
         self.view_tabs.setDocumentMode(True)
@@ -121,7 +143,8 @@ class MainWindow(
         documents_layout = QVBoxLayout(documents_page)
         documents_layout.setContentsMargins(0, 0, 0, 0)
         documents_layout.setSpacing(0)
-        documents_layout.addWidget(self.splitter)
+        documents_layout.addWidget(self.markdown_toolbar)
+        documents_layout.addWidget(self.doc_vsplitter)
         self.view_tabs.addTab(documents_page, "Documents")
         self.view_tabs.currentChanged.connect(self._on_view_tab_changed)
 

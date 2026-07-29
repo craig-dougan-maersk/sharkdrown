@@ -30,7 +30,7 @@ class MenuConstructionMixin:
 
         self.action_new = QAction("&New", self)
         self.action_new.setShortcut("Ctrl+N")
-        self.action_new.triggered.connect(lambda _checked=False: self._create_new_tab())
+        self.action_new.triggered.connect(lambda _checked=False: self._new_file_with_dialog())
         file_menu.addAction(self.action_new)
 
         self.action_open = QAction("&Open...", self)
@@ -125,6 +125,15 @@ class MenuConstructionMixin:
         self.action_reset_font.setShortcut("Ctrl+0")
         self.action_reset_font.triggered.connect(self._reset_font_size)
         view_menu.addAction(self.action_reset_font)
+
+        view_menu.addSeparator()
+
+        self.action_toggle_lint = QAction("Toggle &Lint Panel", self)
+        self.action_toggle_lint.setShortcut("Ctrl+Shift+L")
+        self.action_toggle_lint.setCheckable(True)
+        self.action_toggle_lint.setChecked(False)
+        self.action_toggle_lint.triggered.connect(self._toggle_lint_panel)
+        view_menu.addAction(self.action_toggle_lint)
 
         view_menu.addSeparator()
 
@@ -296,13 +305,26 @@ class MenuConstructionMixin:
         self.status.addPermanentWidget(self.font_size_value_label)
 
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["markdown", "json", "yaml"])
+        self.format_combo.addItems(["markdown", "json", "yaml", "text"])
         self.format_combo.setToolTip(
             "Format for the current document.\n"
             "Drives syntax highlighting and preview rendering."
         )
         self.format_combo.currentTextChanged.connect(self._on_format_combo_changed)
         self.status.addPermanentWidget(self.format_combo)
+
+        # Document statistics labels (visible on Documents tab only)
+        self.word_count_label = QLabel("Words: 0")
+        self.word_count_label.setStyleSheet("font-size: 11px; padding: 0 4px;")
+        self.status.addPermanentWidget(self.word_count_label)
+
+        self.line_count_label = QLabel("Lines: 0")
+        self.line_count_label.setStyleSheet("font-size: 11px; padding: 0 4px;")
+        self.status.addPermanentWidget(self.line_count_label)
+
+        self.cursor_pos_label = QLabel("Ln 1, Col 1")
+        self.cursor_pos_label.setStyleSheet("font-size: 11px; padding: 0 4px;")
+        self.status.addPermanentWidget(self.cursor_pos_label)
 
         self.proxy_status_label = QLabel("Proxy: stopped")
         self.status.addPermanentWidget(self.proxy_status_label)
@@ -320,6 +342,9 @@ class MenuConstructionMixin:
         is_claude = view_index == getattr(self, "_TAB_INDEX_CLAUDE", -1)
 
         self.format_combo.setVisible(is_documents)
+        self.word_count_label.setVisible(is_documents)
+        self.line_count_label.setVisible(is_documents)
+        self.cursor_pos_label.setVisible(is_documents)
         self.proxy_status_label.setVisible(is_claude)
         self.activity_tile.setVisible(is_claude)
         self._sync_font_slider()
@@ -343,6 +368,13 @@ class MenuConstructionMixin:
     def _on_format_combo_changed(self, fmt: str) -> None:
         """Slot for format_combo.currentTextChanged."""
         self._set_current_format(fmt)
+
+    def _toggle_lint_panel(self, checked: bool) -> None:
+        """Show or hide the lint results panel."""
+        if hasattr(self, "lint_panel"):
+            self.lint_panel.setVisible(checked)
+            if checked:
+                self._run_lint()
 
     def _on_log_sessions_toggled(self, checked: bool) -> None:
         """Persist the logging preference and update the active session."""

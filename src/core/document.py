@@ -11,10 +11,24 @@ from pathlib import Path
 class DocumentTab:
     """Represents a tab in the editor with its content and type."""
 
-    def __init__(self, file_path: Path | None = None, content: str = ""):
+    def __init__(
+        self,
+        file_path: Path | None = None,
+        content: str = "",
+        format_type: str | None = None,
+    ):
         self.file_path = file_path
         self.content = content
-        self.format_type = self._detect_format() if file_path else "markdown"
+        self.display_name: str | None = None
+        self.cursor_block: int = 0
+        self.cursor_column: int = 0
+
+        if format_type is not None:
+            self.format_type = format_type
+        elif file_path:
+            self.format_type = self._detect_format()
+        else:
+            self.format_type = "markdown"
 
     def _detect_format(self) -> str:
         """Detect file format from extension."""
@@ -27,11 +41,14 @@ class DocumentTab:
             ".json": "json",
             ".yaml": "yaml",
             ".yml": "yaml",
+            ".txt": "text",
         }
-        return format_map.get(suffix, "markdown")
+        return format_map.get(suffix, "text")
 
     def title(self) -> str:
-        """Get tab title, showing filename or 'Untitled'."""
+        """Get tab title, showing filename or display_name or 'Untitled'."""
+        if self.display_name:
+            return self.display_name
         if self.file_path:
             return self.file_path.name or "Untitled"
         return "Untitled"
