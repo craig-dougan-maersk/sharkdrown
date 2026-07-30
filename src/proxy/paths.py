@@ -42,16 +42,15 @@ def default_config_path() -> Path:
 
 # ---- Config discovery -----------------------------------------------------
 
-# A small set of well-known parent directories where the upstream
-# ``claude-code-proxy-py`` source might live. Used only as a final fallback
-# when neither the data dir nor CWD contains a ``config.yaml``.
+# Common parent directories under $HOME where users typically clone repos.
+# Used only as a final fallback when neither the data dir nor CWD has a
+# config.yaml. /srv is intentionally excluded — it is a system directory on
+# Linux and should never be scanned for user config.
 _KNOWN_PROXY_PARENTS = (
-    Path.home() / "stuff" / "tooling",
     Path.home() / "code",
     Path.home() / "projects",
     Path.home() / "src",
     Path.home() / "work",
-    Path("/srv"),
 )
 
 

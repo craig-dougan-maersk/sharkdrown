@@ -9,6 +9,7 @@ router at startup, and tears them down on shutdown.
 from __future__ import annotations
 
 import logging
+import secrets
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -181,6 +182,16 @@ def create_app(
     if settings is None:
         settings = Settings()
     app.state.settings = settings
+
+    # Per-startup token that gates ?debug=1 on /v1/models. Printed to stderr
+    # at startup so the operator can use it; never exposed in any response body.
+    debug_token = secrets.token_urlsafe(16)
+    app.state.debug_token = debug_token
+    print(
+        f"proxy debug token: {debug_token}  "
+        f"(use: GET /v1/models?debug=1&token={debug_token})",
+        file=sys.stderr,
+    )
 
     # Build providers.
     if providers is None:

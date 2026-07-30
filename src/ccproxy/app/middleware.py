@@ -28,6 +28,9 @@ from starlette.responses import Response
 logger = logging.getLogger("claude_code_proxy.access")
 
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+# Hard ceiling on inbound request bodies. LLM API requests are JSON payloads;
+# 50 MB is generous even for max-context requests with image attachments.
+MAX_REQUEST_BODY_BYTES = 50 * 1024 * 1024
 
 _GREEN = "\033[32m"
 _BLUE = "\033[34m"
@@ -79,10 +82,14 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             if self._tokens < 1.0:
                 from starlette.responses import JSONResponse
 
+                # Compute how long until the bucket refills enough for 1 token.
+                deficit = 1.0 - self._tokens
+                retry_after = max(1.0, deficit / self._refill_rate)
+                retry_after_int = max(1, int(retry_after))
                 return JSONResponse(
-                    {"error": "rate limit exceeded", "retry_after_seconds": 1.0},
+                    {"error": "rate limit exceeded", "retry_after_seconds": retry_after},
                     status_code=429,
-                    headers={"Retry-After": "1"},
+                    headers={"Retry-After": str(retry_after_int)},
                 )
             self._tokens -= 1.0
         return await call_next(request)
@@ -97,7 +104,24 @@ class BodyCaptureMiddleware(BaseHTTPMiddleware):
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
         if request.method in _BODY_METHODS:
+            content_length = request.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    if int(content_length) > MAX_REQUEST_BODY_BYTES:
+                        from starlette.responses import JSONResponse
+                        return JSONResponse(
+                            {"error": "request body too large"},
+                            status_code=413,
+                        )
+                except ValueError:
+                    pass
             body = await request.body()
+            if len(body) > MAX_REQUEST_BODY_BYTES:
+                from starlette.responses import JSONResponse
+                return JSONResponse(
+                    {"error": "request body too large"},
+                    status_code=413,
+                )
             request.state.body_bytes = body
         return await call_next(request)
 

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import secrets
 import sys
 from collections.abc import AsyncIterator
 from typing import Any
@@ -45,8 +47,11 @@ logger = logging.getLogger("claude_code_proxy.providers.openai")
 
 _MAX_TOKENS_O_SERIES_CAP = 16384
 
-# OpenAI rejects these name patterns; we coerce them to the openai form.
-_O_SERIES_PREFIXES = ("o1", "o3")
+# Matches OpenAI o-series models: o followed by one or more digits,
+# optionally followed by a hyphen and a variant name (e.g. o1-mini, o4-mini).
+# A prefix-tuple like ("o1", "o3") would incorrectly match "o10" as o1 and
+# would miss o4-mini entirely.
+_O_SERIES_RE = re.compile(r"^o\d+(?:-|$)")
 
 
 # ---- Request: Anthropic → OpenAI ------------------------------------------
@@ -106,14 +111,35 @@ def _convert_tool_choice(
     return "auto"
 
 
+def _render_tool_result_content(inner: Any) -> str:
+    """Render the content field of a tool_result block as a plain string."""
+    if isinstance(inner, str):
+        return inner
+    if isinstance(inner, list):
+        return "\n".join(json.dumps(item) for item in inner)
+    if isinstance(inner, dict):
+        return json.dumps(inner)
+    return str(inner)
+
+
 def _convert_messages(
     anthropic_messages: list[AnthropicMessage],
 ) -> list[dict[str, Any]]:
     """Translate Anthropic message list → OpenAI chat-completion messages.
 
-    Each Anthropic message becomes *one* OpenAI message. ``tool_result``
-    blocks are concatenated into the message's text content prefixed with
-    ``"Tool result for <id>:\n<content>\n"``.
+    Anthropic and OpenAI have structurally different tool-turn representations:
+
+    * Anthropic: tool results are ``tool_result`` blocks inside a **user** message.
+    * OpenAI: tool results are separate ``role: "tool"`` messages with a
+      ``tool_call_id`` that correlates each result to the assistant's
+      ``tool_calls`` entry.
+
+    * Anthropic: tool calls are ``tool_use`` blocks inside an **assistant** message.
+    * OpenAI: tool calls live in the ``tool_calls`` array on an assistant message,
+      not in ``content``.
+
+    This function expands a single Anthropic message into potentially multiple
+    OpenAI messages when tool results or tool calls are present.
     """
     out: list[dict[str, Any]] = []
     for msg in anthropic_messages:
@@ -121,49 +147,56 @@ def _convert_messages(
         content = msg.content
 
         if isinstance(content, str):
-            text = content
-        else:
-            # Content is a single block or list of blocks. Normalise to a list.
-            blocks = content if isinstance(content, list) else [content]
-            text_parts: list[str] = []
-            for block in blocks:
-                if isinstance(block, AnthropicContentBlockText):
-                    text_parts.append(block.text)
-                elif isinstance(block, AnthropicContentBlockToolResult):
-                    inner = block.content
-                    if isinstance(inner, str):
-                        rendered = inner
-                    elif isinstance(inner, list):
-                        rendered = "\n".join(json.dumps(item) for item in inner)
-                    elif isinstance(inner, dict):
-                        rendered = json.dumps(inner)
-                    else:
-                        rendered = str(inner)
-                    text_parts.append(f"Tool result for {block.tool_use_id}:\n{rendered}\n")
-                elif isinstance(block, AnthropicContentBlockToolUse):
-                    # Tool use becomes a JSON-encoded text payload — OpenAI is
-                    # strict about message boundaries (tool_calls only on
-                    # assistant messages), and we keep this implementation simple.
-                    text_parts.append(
-                        json.dumps(
-                            {
-                                "type": "tool_use",
-                                "id": block.id,
-                                "name": block.name,
-                                "input": block.input,
-                            }
-                        )
-                    )
-                else:
-                    # Image / unknown block types: stringify as JSON.
-                    text_parts.append(json.dumps(block.model_dump(mode="json")))
+            out.append({"role": role, "content": content or ("..." if role == "user" else "")})
+            continue
+
+        blocks = content if isinstance(content, list) else [content]
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        tool_results: list[dict[str, Any]] = []
+
+        for block in blocks:
+            if isinstance(block, AnthropicContentBlockText):
+                text_parts.append(block.text)
+            elif isinstance(block, AnthropicContentBlockToolResult):
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": block.tool_use_id,
+                    "content": _render_tool_result_content(block.content),
+                })
+            elif isinstance(block, AnthropicContentBlockToolUse):
+                tool_calls.append({
+                    "id": block.id,
+                    "type": "function",
+                    "function": {
+                        "name": block.name,
+                        "arguments": json.dumps(block.input, ensure_ascii=False),
+                    },
+                })
+            else:
+                # Image / unknown block types: stringify as JSON in text.
+                text_parts.append(json.dumps(block.model_dump(mode="json")))
+
+        if tool_results:
+            # tool_result blocks → individual role:"tool" messages (OpenAI format).
+            # Any text parts in the same Anthropic message become a separate user message.
+            if text_parts:
+                text = "\n".join(p for p in text_parts if p) or "..."
+                out.append({"role": "user", "content": text})
+            out.extend(tool_results)
+        elif role == "assistant" and tool_calls:
+            # Tool-use blocks → tool_calls array on the assistant message.
+            msg_dict: dict[str, Any] = {"role": "assistant", "tool_calls": tool_calls}
             text = "\n".join(p for p in text_parts if p)
+            if text:
+                msg_dict["content"] = text
+            out.append(msg_dict)
+        else:
+            text = "\n".join(p for p in text_parts if p)
+            if not text and role == "user":
+                text = "..."
+            out.append({"role": role, "content": text})
 
-        if not text and role == "user":
-            # OpenAI rejects empty user content; substitute a placeholder.
-            text = "..."
-
-        out.append({"role": role, "content": text})
     return out
 
 
@@ -174,7 +207,7 @@ def convert_anthropic_to_openai(req: AnthropicRequest) -> dict[str, Any]:
     ``json.dumps`` and OpenAI rejects unknown keys — so we want to fail
     fast if we ever pass one through.
     """
-    is_o_series = req.model.startswith(_O_SERIES_PREFIXES)
+    is_o_series = bool(_O_SERIES_RE.match(req.model))
 
     out: dict[str, Any] = {
         "model": req.model,
@@ -253,7 +286,7 @@ def _build_content_blocks(choice: dict[str, Any]) -> list[dict[str, Any]]:
         blocks.append(
             {
                 "type": "tool_use",
-                "id": tc.get("id", f"toolu_{id(tc)}"),
+                "id": tc.get("id") or f"toolu_{secrets.token_hex(8)}",
                 "name": fn.get("name", ""),
                 "input": parsed_args,
             }
@@ -268,9 +301,22 @@ def transform_openai_response_to_anthropic(resp_body: bytes) -> bytes:
     """Translate a non-streaming OpenAI response into an Anthropic-shaped one.
 
     Returns the JSON-encoded Anthropic response body. The caller wraps it
-    in an ``httpx.Response`` and forwards.
+    in an ``httpx.Response`` and forwards. If the upstream returned
+    non-JSON (e.g. an HTML error page or a gateway error), the raw body
+    is wrapped in a synthetic error response rather than crashing.
     """
-    openai = json.loads(resp_body)
+    try:
+        openai = json.loads(resp_body)
+    except (json.JSONDecodeError, ValueError):
+        raw_text = resp_body.decode("utf-8", errors="replace")
+        logger.warning("OpenAI upstream returned non-JSON body: %s…", raw_text[:200])
+        return json.dumps({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": f"upstream returned non-JSON response: {raw_text[:500]}",
+            },
+        }, ensure_ascii=False).encode()
     choice = (openai.get("choices") or [{}])[0]
     content_blocks = _build_content_blocks(choice)
 
@@ -481,7 +527,7 @@ async def transform_openai_stream_to_anthropic(
                         state.tool_block_indices[oi] = idx
                         state.input_json_buffers[oi] = ""
                         # First chunk for this tool call: emit start with id+name.
-                        tc_id = tc.get("id") or f"toolu_{oi}_{abs(hash((oi, tc.get('id', ''))))}"
+                        tc_id = tc.get("id") or f"toolu_{oi}_{secrets.token_hex(6)}"
                         tc_name = (tc.get("function") or {}).get("name") or ""
                         state.input_json_ids[oi] = tc_id
                         state.input_json_names[oi] = tc_name

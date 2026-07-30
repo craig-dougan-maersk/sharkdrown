@@ -28,6 +28,8 @@ import logging
 import os
 import stat
 import sys
+import tempfile
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -37,6 +39,10 @@ _IS_POSIX = sys.platform != "win32"
 _WINDOWS_CHMOD_WARNING_ISSUED = False
 
 _KEYRING_SERVICE = "sharkdrown"
+# Sentinel stored as a file value when the real secret lives in the system
+# keyring. Lets all_refs()/refs() enumerate keyring-backed credentials by
+# name without needing a keyring list API (which most backends lack).
+_KEYRING_SENTINEL = "<keyring>"
 
 
 def _keyring_available() -> bool:
@@ -105,21 +111,25 @@ class CredentialStore:
                 )
         # Ensure parent exists; we write the file lazily.
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock: threading.Lock = threading.Lock()
 
     # ---- public API --------------------------------------------------------
 
     def get(self, ref: str) -> str | None:
         """Return the key for ``ref`` or ``None`` if absent."""
-        if self._keyring is not None:
-            val = self._keyring.get(ref)
-            if val is not None:
-                return val
-        data = self._read()
-        creds = data.get("credentials", {})
-        if not isinstance(creds, dict):
-            return None
-        val = creds.get(ref)
-        return val if isinstance(val, str) else None
+        with self._lock:
+            if self._keyring is not None:
+                val = self._keyring.get(ref)
+                if val is not None:
+                    return val
+            data = self._read()
+            creds = data.get("credentials", {})
+            if not isinstance(creds, dict):
+                return None
+            val = creds.get(ref)
+            if not isinstance(val, str) or val == _KEYRING_SENTINEL:
+                return None
+            return val
 
     def set(self, ref: str, value: str) -> None:
         """Insert or update ``ref`` → ``value``. Empty string deletes.
@@ -134,38 +144,68 @@ class CredentialStore:
         """
         cleaned = value.strip()
         cleaned = "".join(cleaned.split())
-        if self._keyring is not None:
-            self._keyring.set(ref, cleaned)
-            return
-        data = self._read()
-        creds = data.setdefault("credentials", {})
-        if not isinstance(creds, dict):
-            creds = {}
-            data["credentials"] = creds
-        if cleaned == "":
-            creds.pop(ref, None)
-        else:
-            creds[ref] = cleaned
-        self._write(data)
-
-    def delete(self, ref: str) -> None:
-        """Remove ``ref`` if present (silent if absent)."""
-        if self._keyring is not None:
-            self._keyring.delete(ref)
-            return
-        data = self._read()
-        creds = data.get("credentials", {})
-        if isinstance(creds, dict) and ref in creds:
-            creds.pop(ref)
+        with self._lock:
+            data = self._read()
+            creds = data.setdefault("credentials", {})
+            if not isinstance(creds, dict):
+                creds = {}
+                data["credentials"] = creds
+            if self._keyring is not None:
+                self._keyring.set(ref, cleaned)
+                # Write a sentinel so all_refs()/refs() can discover this ref
+                # by name without needing a keyring list API.
+                if cleaned == "":
+                    creds.pop(ref, None)
+                else:
+                    creds[ref] = _KEYRING_SENTINEL
+                self._write(data)
+                return
+            if cleaned == "":
+                creds.pop(ref, None)
+            else:
+                creds[ref] = cleaned
             self._write(data)
 
+    def delete(self, ref: str) -> None:
+        """Remove ``ref`` if present (silent if absent).
+
+        Clears both the keyring *and* the file so that the file-based
+        fallback in ``get()`` does not resurrect a key that was deleted
+        from the keyring backend.
+        """
+        with self._lock:
+            if self._keyring is not None:
+                self._keyring.delete(ref)
+            data = self._read()
+            creds = data.get("credentials", {})
+            if isinstance(creds, dict) and ref in creds:
+                creds.pop(ref)
+                self._write(data)
+
     def all_refs(self) -> dict[str, str]:
-        """Return a copy of the full credentials mapping."""
-        data = self._read()
-        creds = data.get("credentials", {})
-        if not isinstance(creds, dict):
-            return {}
-        return {k: v for k, v in creds.items() if isinstance(k, str) and isinstance(v, str)}
+        """Return a copy of the full credentials mapping (ref → value).
+
+        When the keyring backend is active, sentinel entries in the file are
+        resolved to their real values via the keyring. Refs whose keyring value
+        is missing (e.g. the backend lost it) are silently omitted.
+        """
+        with self._lock:
+            data = self._read()
+            creds = data.get("credentials", {})
+            if not isinstance(creds, dict):
+                return {}
+            result: dict[str, str] = {}
+            for k, v in creds.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    continue
+                if v == _KEYRING_SENTINEL:
+                    if self._keyring is not None:
+                        real = self._keyring.get(k)
+                        if real is not None:
+                            result[k] = real
+                else:
+                    result[k] = v
+            return result
 
     def refs(self) -> Iterable[str]:
         """Return the set of stored credential refs (no values)."""
@@ -189,25 +229,32 @@ class CredentialStore:
         global _WINDOWS_CHMOD_WARNING_ISSUED  # noqa: PLW0603
 
         data["schema_version"] = self.SCHEMA_VERSION
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, sort_keys=True)
-            fh.write("\n")
-
-        if _IS_POSIX:
-            os.chmod(tmp, 0o600)
-        elif not _WINDOWS_CHMOD_WARNING_ISSUED:
-            logger.warning(
-                "credential store on Windows has no file-permission protection; "
-                "ensure %s is in a user-private directory",
-                self._path,
-            )
-            _WINDOWS_CHMOD_WARNING_ISSUED = True
-
-        os.replace(tmp, self._path)
-
-        if _IS_POSIX:
-            os.chmod(self._path, 0o600)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=self._path.parent, suffix=".tmp", prefix=self._path.stem + "_"
+        )
+        tmp = Path(tmp_path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+                if _IS_POSIX:
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                    os.fchmod(fh.fileno(), 0o600)
+                elif not _WINDOWS_CHMOD_WARNING_ISSUED:
+                    logger.warning(
+                        "credential store on Windows has no file-permission protection; "
+                        "ensure %s is in a user-private directory",
+                        self._path,
+                    )
+                    _WINDOWS_CHMOD_WARNING_ISSUED = True
+            os.replace(tmp, self._path)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
 
     @property
     def path(self) -> Path:

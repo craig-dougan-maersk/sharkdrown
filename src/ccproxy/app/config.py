@@ -198,12 +198,15 @@ class ProviderCfg(BaseModel):
     ``available_models`` is a read-only catalog the proxy exposes via
     ``GET /v1/models`` (future work) and uses internally to validate
     that a routed request names a model the provider actually hosts.
+
+    ``extra="forbid"`` catches YAML typos at startup. Safe here because
+    the desktop app is the sole writer and always uses known field names.
     """
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     url: str
-    api_key: str | None = None
+    api_key: SecretStr | None = None
     available_models: list[str] = Field(default_factory=list)
 
 

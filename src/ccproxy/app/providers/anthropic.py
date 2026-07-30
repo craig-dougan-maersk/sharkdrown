@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -102,16 +102,8 @@ class AnthropicProvider(Provider):
         # logged. Keys < 8 chars have their entire value obscured,
         # which is fine — anything that short isn't a real key.
         if target_api_key:
-            key_prefix = target_api_key[:4]
-            key_suffix = target_api_key[-4:] if len(target_api_key) > 8 else "***"
-            print(
-                f"anthropic forward: target_api_key prefix={key_prefix!r} "
-                f"suffix={key_suffix!r} len={len(target_api_key)}",
-                file=sys.stderr,
-            )
-        if target_api_key:
             for k in list(out_headers.keys()):
-                if k.lower() == "x-api-key":
+                if k.lower() in ("x-api-key", "anthropic-api-key"):
                     out_headers.pop(k, None)
             out_headers["x-api-key"] = target_api_key
         if "anthropic-version" not in {k.lower() for k in out_headers}:
@@ -147,37 +139,41 @@ class AnthropicProvider(Provider):
         # flow entirely; reconstructing the API URL explicitly is
         # safe enough — it's not a transparent redirect follow, the
         # URL is built from the Location header plus a known suffix.
-        # ``logger.info`` is suppressed by uvicorn's dictConfig; the
-        # proxy startup banner (``main.py``) already uses
-        # ``print(..., file=sys.stderr)`` for the same reason. We do
-        # the same here so the line shows up in the user's terminal
-        # / container logs next to uvicorn's own access log.
-        print(
-            f"anthropic forward: post-send check status={response.status_code} "
-            f"location={response.headers.get('location', '')!r}",
-            file=sys.stderr,
-        )
         if response.status_code in (301, 302):
             location = response.headers.get("location", "")
             if location and location.endswith("/"):
-                retry_url = location.rstrip("/") + "/v1/messages"
-                # Drain the redirect response body before retrying
-                # (httpx requires this before re-using the client).
-                await response.aread()
-                print(
-                    "anthropic forward: upstream 3xx points at "
-                    f"directory URL; retrying POST at {retry_url}",
-                    file=sys.stderr,
-                )
-                retry_request = httpx.Request(
-                    "POST",
-                    retry_url,
-                    headers=out_headers,
-                    content=body,
-                )
-                response = await self._client.send(
-                    retry_request, stream=stream
-                )
+                # Validate that the redirect stays on the same host to
+                # prevent SSRF: a crafted Location header from a
+                # compromised upstream must not cause us to POST the
+                # request body (including the API key) to an attacker.
+                expected_host = urlparse(url).netloc
+                redirect_host = urlparse(location).netloc
+                if redirect_host and redirect_host != expected_host:
+                    logger.warning(
+                        "anthropic forward: ignoring redirect from %s to "
+                        "different host %s (SSRF guard)",
+                        expected_host,
+                        redirect_host,
+                    )
+                else:
+                    retry_url = location.rstrip("/") + "/v1/messages"
+                    # Drain the redirect response body before retrying
+                    # (httpx requires this before re-using the client).
+                    await response.aread()
+                    print(
+                        "anthropic forward: upstream 3xx points at "
+                        f"directory URL; retrying POST at {retry_url}",
+                        file=sys.stderr,
+                    )
+                    retry_request = httpx.Request(
+                        "POST",
+                        retry_url,
+                        headers=out_headers,
+                        content=body,
+                    )
+                    response = await self._client.send(
+                        retry_request, stream=stream
+                    )
         return response
 
     async def aclose(self) -> None:

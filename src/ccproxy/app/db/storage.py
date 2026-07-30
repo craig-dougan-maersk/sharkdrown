@@ -14,6 +14,7 @@ import os
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -348,10 +349,9 @@ class StorageService:
 
     async def clear_requests(self) -> int:
         async with self.conn.execute("DELETE FROM requests") as cur:
-            await cur.fetchone()
+            count = cur.rowcount
         await self.conn.commit()
-        # aiosqlite returns rowcount via cursor; use that for the count.
-        return cur.rowcount if cur.rowcount is not None else 0
+        return count if count is not None else 0
 
     # ---- Aggregate counters (used by /api/stats) ----
 
@@ -462,8 +462,16 @@ def _build_where(
     clauses: list[str] = []
     args: list[Any] = []
     if model_filter:
-        clauses.append("LOWER(original_model) LIKE ?")
-        args.append(f"%{model_filter.lower()}%")
+        # Escape LIKE wildcards so a user typing "%" or "_" doesn't
+        # accidentally match all rows.
+        escaped = (
+            model_filter.lower()
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        clauses.append("LOWER(original_model) LIKE ? ESCAPE '\\'")
+        args.append(f"%{escaped}%")
     if provider_filter:
         clauses.append("routed_provider = ?")
         args.append(provider_filter)
@@ -508,23 +516,43 @@ def _row_to_request_log(row: Any) -> RequestLog:
         total_tokens,
     ) = row
 
-    headers = json.loads(headers_json) if headers_json else {}
-    body = json.loads(body_json) if body_json else {}
+    try:
+        headers = json.loads(headers_json) if headers_json else {}
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("corrupt headers JSON for request %s; using empty dict", rid)
+        headers = {}
+    try:
+        body = json.loads(body_json) if body_json else {}
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("corrupt body JSON for request %s; using empty dict", rid)
+        body = {}
     response = None
     if response_json:
-        response_dict = json.loads(response_json)
-        response = ResponseLog(
-            status_code=status_code if status_code is not None else 0,
-            headers=response_dict.get("headers", {}),
-            body_text=response_dict.get("body_text"),
-            response_time_ms=response_time_ms,
-            is_streaming=bool(is_streaming),
-            streaming_chunks=json.loads(streaming_chunks_json) if streaming_chunks_json else [],
-            completed_at=_parse_dt(completed_at),
-        )
+        try:
+            response_dict = json.loads(response_json)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("corrupt response JSON for request %s; skipping response", rid)
+            response_dict = None
+        if response_dict is not None:
+            try:
+                streaming_chunks = json.loads(streaming_chunks_json) if streaming_chunks_json else []
+            except (json.JSONDecodeError, ValueError):
+                streaming_chunks = []
+            response = ResponseLog(
+                status_code=status_code if status_code is not None else 0,
+                headers=response_dict.get("headers", {}),
+                body_text=response_dict.get("body_text"),
+                response_time_ms=response_time_ms,
+                is_streaming=bool(is_streaming),
+                streaming_chunks=streaming_chunks,
+                completed_at=_parse_dt(completed_at),
+            )
     prompt_grade = None
     if prompt_grade_json:
-        prompt_grade = PromptGrade(**json.loads(prompt_grade_json))
+        try:
+            prompt_grade = PromptGrade(**json.loads(prompt_grade_json))
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            logger.warning("corrupt prompt_grade for request %s: %s", rid, exc)
 
     return RequestLog(
         id=rid,
@@ -558,26 +586,21 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
-def _parse_dt(value: Any) -> Any:
-    """Parse a SQLite datetime string into a ``datetime``."""
-    from datetime import datetime
+def _parse_dt(value: Any) -> datetime | None:
+    """Parse a SQLite datetime string into a ``datetime``.
 
+    Uses ``datetime.fromisoformat`` which handles all ISO 8601 forms Python
+    3.7+ produces, including timezone-offset suffixes (+00:00, -05:00, Z).
+    """
     if value is None:
         return None
     if isinstance(value, datetime):
         return value
-    # SQLite stores ISO strings; handle the common forms.
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S.%f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S.%f",
-        "%Y-%m-%dT%H:%M:%S",
-    ):
-        try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-    return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except (ValueError, TypeError):
+        logger.warning("unparseable datetime value %r; returning None", value)
+        return None
 
 
 # Cast helper (kept local to avoid importing typing.cast elsewhere).

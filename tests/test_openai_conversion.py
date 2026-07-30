@@ -16,7 +16,7 @@ import json
 import sys
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).parent
+_PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
@@ -149,7 +149,7 @@ def test_o3_model_constraints() -> None:
 
 
 def test_tool_result_message_conversion() -> None:
-    """Tool results are rendered as text in the user message."""
+    """Tool results become role:'tool' messages with tool_call_id (OpenAI format)."""
     req = _basic_request(
         messages=[
             AnthropicMessage(
@@ -165,10 +165,11 @@ def test_tool_result_message_conversion() -> None:
         ],
     )
     result = convert_anthropic_to_openai(req)
-    user_msg = result["messages"][-1]
-    assert "Tool result for toolu_123" in user_msg["content"]
-    assert "sunny" in user_msg["content"]
-    print("  convert_anthropic_to_openai: tool_result blocks")
+    tool_msg = result["messages"][-1]
+    assert tool_msg["role"] == "tool"
+    assert tool_msg["tool_call_id"] == "toolu_123"
+    assert "sunny" in tool_msg["content"]
+    print("  convert_anthropic_to_openai: tool_result blocks → role:tool")
 
 
 def test_stop_sequences_become_stop() -> None:

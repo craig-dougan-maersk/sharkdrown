@@ -87,7 +87,7 @@ def proxy_app(tmp_path: Path):
     Returns the app instance suitable for use with httpx.ASGITransport.
     """
     # Add src/ to path for ccproxy imports
-    src_dir = Path(__file__).parent / "src"
+    src_dir = Path(__file__).parent.parent / "src"
     if str(src_dir) not in sys.path:
         sys.path.insert(0, str(src_dir))
 

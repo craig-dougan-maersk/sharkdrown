@@ -23,13 +23,16 @@ import logging
 import sys
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from ccproxy.app.config import ModelEndpointsCfg, Settings
 from ccproxy.app.db.storage import StorageService
+from ccproxy.app.middleware import MAX_REQUEST_BODY_BYTES
 from ccproxy.app.models.anthropic import AnthropicRequest
 from ccproxy.app.models.storage import RequestLog, ResponseLog
 from ccproxy.app.providers.openai import transform_openai_response_to_anthropic
@@ -157,7 +160,7 @@ def _resolve_request_target(
         return (None, None)
     return (
         provider.url or None,
-        provider.api_key if provider.api_key else None,
+        provider.api_key.get_secret_value() if provider.api_key else None,
     )
 
 
@@ -202,7 +205,10 @@ async def list_models(
         if real in seen:
             continue
         models.append({"id": real, "aliases": []})
-    debug = "debug" in request.query_params
+    debug_requested = "debug" in request.query_params
+    debug_token = getattr(request.app.state, "debug_token", None)
+    provided_token = request.query_params.get("token", "")
+    debug = debug_requested and debug_token is not None and provided_token == debug_token
     payload: dict = {"object": "list", "data": models}
     if debug:
         payload["__proxy__"] = {
@@ -367,11 +373,20 @@ async def post_v1_messages(
     # anthropic``) we need to append the API path here. Skip when
     # the URL already ends with ``/v1/messages`` (a user might
     # have set the full URL explicitly for a non-Anthropic gateway).
-    if target_url and not target_url.rstrip("/").endswith("/v1/messages"):
-        # Preserve any trailing slash on the user's URL (some
-        # nginx-fronted gateways canonicalise on trailing slashes).
-        stripped = target_url.rstrip("/")
-        target_url = stripped + "/v1/messages"
+    if target_url:
+        # Append /v1/messages only when the URL doesn't already end with that
+        # exact path segment pair. Use URL-path component matching rather than
+        # a string suffix so that a URL like
+        # https://api.example.com/v1/messages/extra doesn't pass the check and
+        # then receive a doubled suffix.
+        _parsed_path = PurePosixPath(urlparse(target_url).path.rstrip("/"))
+        _ends_with_v1_messages = (
+            len(_parsed_path.parts) >= 2
+            and _parsed_path.parts[-2] == "v1"
+            and _parsed_path.parts[-1] == "messages"
+        )
+        if not _ends_with_v1_messages:
+            target_url = target_url.rstrip("/") + "/v1/messages"
 
     # Log the resolved route at INFO — handy when Recent Activity
     # is empty but Claude Code still sees upstream errors; this
@@ -431,10 +446,17 @@ async def post_v1_messages(
         from ccproxy.app.streaming.capture import stream_and_capture
 
         async def stream_iter() -> AsyncIterator[bytes]:
-            async for chunk in stream_and_capture(
-                response, storage, request_id, request_log.endpoint
-            ):
-                yield chunk
+            try:
+                async for chunk in stream_and_capture(
+                    response, storage, request_id, request_log.endpoint
+                ):
+                    yield chunk
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "streaming failed mid-response for request %s: %s",
+                    request_id,
+                    exc,
+                )
 
         return StreamingResponse(
             stream_iter(),
@@ -446,6 +468,12 @@ async def post_v1_messages(
     # Non-streaming: read the body, possibly convert OpenAI→Anthropic,
     # persist ResponseLog, and return.
     raw_body = await response.aread()
+    if len(raw_body) > MAX_REQUEST_BODY_BYTES:
+        logger.warning(
+            "upstream response for request %s exceeds size limit (%d bytes); truncating storage",
+            request_id,
+            len(raw_body),
+        )
     body_out = raw_body
 
     if decision.target_provider_name == "openai":

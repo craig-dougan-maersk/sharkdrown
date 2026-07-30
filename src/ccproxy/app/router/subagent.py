@@ -78,19 +78,17 @@ def hash_static_prompt(prompt: str) -> str:
 
 
 _NOTES_SINGLE = "\nNotes:"
-_NOTES_DOUBLE = "\n\nNotes:"
 
 
 def extract_static_prompt(system_prompt: str) -> str:
     """Return the static portion of an agent's system prompt.
 
-    Strips everything from the first ``\\nNotes:`` (or ``\\n\\nNotes:``) line
-    onwards, since the ``Notes:`` section is dynamic content Claude Code
-    injects at runtime and would invalidate the hash.
+    Strips everything from the first ``\\nNotes:`` line onwards, since the
+    ``Notes:`` section is dynamic content Claude Code injects at runtime and
+    would invalidate the hash. ``\\n\\nNotes:`` always contains ``\\nNotes:``
+    as a substring, so a single find() covers both separators.
     """
     idx = system_prompt.find(_NOTES_SINGLE)
-    if idx == -1:
-        idx = system_prompt.find(_NOTES_DOUBLE)
     if idx != -1:
         return system_prompt[:idx].strip()
     return system_prompt.strip()
@@ -246,30 +244,36 @@ class SubagentRouter:
             settings, providers, cwd=cwd, home=home
         )
         self._last_refresh_time = time.monotonic()
-        self._agents_mtime = self._max_agents_mtime()
+        self._agents_sig = self._agents_signature()
 
-    def _max_agents_mtime(self) -> float:
-        """Return the max mtime across all agent .md files in search dirs."""
+    def _agents_search_dirs(self) -> list[Path]:
         import os
-
         resolved_home = self._home or Path(os.path.expanduser("~"))
-        search_dirs: list[Path] = [resolved_home / ".claude" / "agents"]
+        dirs: list[Path] = [resolved_home / ".claude" / "agents"]
         if self._cwd is not None:
-            search_dirs.insert(0, self._cwd / ".claude" / "agents")
+            dirs.insert(0, self._cwd / ".claude" / "agents")
+        return dirs
 
-        max_mtime = 0.0
-        for d in search_dirs:
+    def _agents_signature(self) -> frozenset[tuple[Path, float]]:
+        """Return a frozenset of (path, mtime) for all agent .md files.
+
+        Any addition, deletion, or modification produces a different frozenset,
+        so equality comparison detects all three cases — unlike a bare max-mtime
+        check which misses deletions (remaining files have a lower or equal max).
+        """
+        result: set[tuple[Path, float]] = set()
+        for d in self._agents_search_dirs():
             if not d.is_dir():
                 continue
             for f in d.glob("*.md"):
                 try:
-                    max_mtime = max(max_mtime, f.stat().st_mtime)
+                    result.add((f, f.stat().st_mtime))
                 except OSError:
                     pass
-        return max_mtime
+        return frozenset(result)
 
     def _maybe_refresh_agents(self) -> None:
-        """Refresh the agent hash cache if any .md file has been modified."""
+        """Refresh the agent hash cache if the set of agent files has changed."""
         import time
 
         now = time.monotonic()
@@ -277,13 +281,13 @@ class SubagentRouter:
             return
         self._last_refresh_time = now
 
-        current_mtime = self._max_agents_mtime()
-        if current_mtime > self._agents_mtime:
-            logger.info("agent files changed (mtime %s > %s); refreshing hashes", current_mtime, self._agents_mtime)
+        current_sig = self._agents_signature()
+        if current_sig != self._agents_sig:
+            logger.info("agent files changed; refreshing hashes")
             self._custom_agents = load_custom_agents(
                 self._settings, self._providers, cwd=self._cwd, home=self._home
             )
-            self._agents_mtime = current_mtime
+            self._agents_sig = current_sig
 
     @property
     def custom_agent_count(self) -> int:

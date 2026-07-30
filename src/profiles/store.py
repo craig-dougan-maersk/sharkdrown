@@ -25,6 +25,8 @@ import json
 import logging
 import os
 import sys
+import tempfile
+import threading
 from dataclasses import asdict
 from pathlib import Path
 
@@ -78,6 +80,10 @@ class ProfileStore:
         # import QSettings at module load — keeps the store
         # unit-testable without a QApplication.
         self._legacy_proxy_config_provider = legacy_proxy_config_provider
+        # RLock because public methods call each other (e.g. save → get_active_name,
+        # upsert → load → save). Re-entrant so nested acquisitions from the
+        # same thread don't deadlock.
+        self._lock: threading.RLock = threading.RLock()
 
     # ---- public API --------------------------------------------------------
 
@@ -94,6 +100,10 @@ class ProfileStore:
         exists). The returned list is ordered: ``Default`` first,
         then everything else in their on-disk order.
         """
+        with self._lock:
+            return self._load_unlocked()
+
+    def _load_unlocked(self) -> list[ClaudeProfile]:
         data = self._read_raw()
         if data is None:
             # First launch (or someone deleted the file). Always
@@ -104,32 +114,47 @@ class ProfileStore:
             profiles = self._parse_profiles(seeded["profiles"])
             return self._ensure_default_present(profiles)
         profiles = self._parse_profiles(data.get("profiles", []))
+        had_default = any(p.name == DEFAULT_PROFILE_NAME for p in profiles)
         profiles = self._ensure_default_present(profiles)
-        return self._dedup_slugs(profiles)
+        profiles = self._dedup_slugs(profiles)
+        if not had_default:
+            # A Default was fabricated in-memory; persist it so it survives
+            # the next load() call rather than being re-fabricated each time.
+            active_name = data.get("active_profile") or DEFAULT_PROFILE_NAME
+            self._save_raw({
+                "schema_version": data.get("schema_version", SCHEMA_VERSION),
+                "active_profile": active_name,
+                "profiles": [_serialize_profile(p) for p in profiles],
+            })
+        return profiles
 
     def get_active_name(self) -> str | None:
         """Name of the currently-active profile (``None`` if unset/missing)."""
-        data = self._read_raw()
-        if data is None:
-            return None
-        active = data.get("active_profile")
-        return active if isinstance(active, str) and active else None
+        with self._lock:
+            data = self._read_raw()
+            if data is None:
+                return None
+            active = data.get("active_profile")
+            return active if isinstance(active, str) and active else None
 
     def get_active(self) -> ClaudeProfile | None:
         """Return the active profile or ``None`` if unset / not found."""
-        profiles = self.load()
-        active_name = self.get_active_name()
-        if active_name is None:
-            # No explicit active — fall back to first profile so the
-            # menu has a sensible default.
+        with self._lock:
+            profiles = self._load_unlocked()
+            data = self._read_raw()
+            active_name = data.get("active_profile") if data else None
+            active_name = active_name if isinstance(active_name, str) and active_name else None
+            if active_name is None:
+                # No explicit active — fall back to first profile so the
+                # menu has a sensible default.
+                return profiles[0] if profiles else None
+            for p in profiles:
+                if p.name == active_name:
+                    return p
+            # Active points at a deleted profile — silently retarget to
+            # the first one (the most likely real-world case is a profile
+            # that was removed via the editor).
             return profiles[0] if profiles else None
-        for p in profiles:
-            if p.name == active_name:
-                return p
-        # Active points at a deleted profile — silently retarget to
-        # the first one (the most likely real-world case is a profile
-        # that was removed via the editor).
-        return profiles[0] if profiles else None
 
     def save(
         self,
@@ -142,23 +167,26 @@ class ProfileStore:
         first profile's name on first call). Caller passes ``None`` to
         mean "don't change the active selection".
         """
-        # Defensive copy + dedup-by-slug so a UI bug that lets two
-        # profiles collide doesn't blow up the file format.
-        profiles = self._dedup_slugs(copy.deepcopy(profiles))
+        with self._lock:
+            # Defensive copy + dedup-by-slug so a UI bug that lets two
+            # profiles collide doesn't blow up the file format.
+            profiles = self._dedup_slugs(copy.deepcopy(profiles))
 
-        # Resolve the active name before serialisation so we know what
-        # to write — ``None`` or absent profile → first one's name.
-        if active_name is None:
-            active_name = self.get_active_name()
-        if active_name is None or not any(p.name == active_name for p in profiles):
-            active_name = profiles[0].name if profiles else None
+            # Resolve the active name before serialisation so we know what
+            # to write — ``None`` or absent profile → first one's name.
+            if active_name is None:
+                data = self._read_raw()
+                active_name = data.get("active_profile") if data else None
+                active_name = active_name if isinstance(active_name, str) and active_name else None
+            if active_name is None or not any(p.name == active_name for p in profiles):
+                active_name = profiles[0].name if profiles else None
 
-        payload = {
-            "schema_version": SCHEMA_VERSION,
-            "active_profile": active_name,
-            "profiles": [_serialize_profile(p) for p in profiles],
-        }
-        self._save_raw(payload)
+            payload = {
+                "schema_version": SCHEMA_VERSION,
+                "active_profile": active_name,
+                "profiles": [_serialize_profile(p) for p in profiles],
+            }
+            self._save_raw(payload)
 
     def set_active(self, name: str) -> None:
         """Set the active profile by name.
@@ -167,10 +195,11 @@ class ProfileStore:
         Persists immediately so a subsequent ``get_active()`` reflects
         the change.
         """
-        profiles = self.load()
-        if not any(p.name == name for p in profiles):
-            raise KeyError(f"no profile named {name!r}")
-        self.save(profiles, active_name=name)
+        with self._lock:
+            profiles = self._load_unlocked()
+            if not any(p.name == name for p in profiles):
+                raise KeyError(f"no profile named {name!r}")
+            self.save(profiles, active_name=name)
 
     def upsert(self, profile: ClaudeProfile) -> None:
         """Insert-or-replace a single profile by ``name``.
@@ -181,21 +210,24 @@ class ProfileStore:
         (so editing the "Default" profile doesn't silently deactivate
         itself).
         """
-        profiles = self.load()
-        active_name = self.get_active_name()
-        replaced = False
-        for i, p in enumerate(profiles):
-            if p.name == profile.name:
-                profiles[i] = profile
-                replaced = True
-                break
-        if not replaced:
-            profiles.append(profile)
-        # If the active profile was the one we replaced, keep it.
-        # Otherwise leave the existing active alone (a user might be
-        # editing a non-active profile in the background).
-        new_active = active_name if replaced else None
-        self.save(profiles, active_name=new_active)
+        with self._lock:
+            profiles = self._load_unlocked()
+            data = self._read_raw()
+            active_name = data.get("active_profile") if data else None
+            active_name = active_name if isinstance(active_name, str) and active_name else None
+            replaced = False
+            for i, p in enumerate(profiles):
+                if p.name == profile.name:
+                    profiles[i] = profile
+                    replaced = True
+                    break
+            if not replaced:
+                profiles.append(profile)
+            # If the active profile was the one we replaced, keep it.
+            # Otherwise leave the existing active alone (a user might be
+            # editing a non-active profile in the background).
+            new_active = active_name if replaced else None
+            self.save(profiles, active_name=new_active)
 
     def delete(self, name: str) -> None:
         """Remove the named profile.
@@ -206,15 +238,16 @@ class ProfileStore:
         If the deleted profile was active, the next ``load()`` picks
         a new active (first remaining).
         """
-        if name == DEFAULT_PROFILE_NAME:
-            # Belt-and-braces: the Manage Profiles dialog disables
-            # the Delete button, but guard the underlying API too.
-            return
-        profiles = self.load()
-        kept = [p for p in profiles if p.name != name]
-        if len(kept) == len(profiles):
-            return
-        self.save(kept, active_name=None)  # let save() pick a new active
+        with self._lock:
+            if name == DEFAULT_PROFILE_NAME:
+                # Belt-and-braces: the Manage Profiles dialog disables
+                # the Delete button, but guard the underlying API too.
+                return
+            profiles = self._load_unlocked()
+            kept = [p for p in profiles if p.name != name]
+            if len(kept) == len(profiles):
+                return
+            self.save(kept, active_name=None)  # let save() pick a new active
 
     def ensure_default(self) -> ClaudeProfile:
         """Return the Default profile, creating one if it doesn't exist.
@@ -226,47 +259,92 @@ class ProfileStore:
         to ``upsert`` of a "new profile seeded from default" works
         without a write race.
         """
-        profiles = self.load()
-        for p in profiles:
-            if p.name == DEFAULT_PROFILE_NAME:
-                return p
-        # Fall back to a brand-new seed (no legacy data here; we've
-        # already read the file once).
-        default = ClaudeProfile(
-            name=DEFAULT_PROFILE_NAME,
-            slug=slugify(DEFAULT_PROFILE_NAME),
-            is_default=True,
-        )
-        profiles.append(default)
-        self.save(profiles, active_name=DEFAULT_PROFILE_NAME)
-        return default
+        with self._lock:
+            profiles = self._load_unlocked()
+            for p in profiles:
+                if p.name == DEFAULT_PROFILE_NAME:
+                    return p
+            # Fall back to a brand-new seed (no legacy data here; we've
+            # already read the file once).
+            default = ClaudeProfile(
+                name=DEFAULT_PROFILE_NAME,
+                slug=slugify(DEFAULT_PROFILE_NAME),
+                is_default=True,
+            )
+            profiles.append(default)
+            self.save(profiles, active_name=DEFAULT_PROFILE_NAME)
+            return default
 
     # ---- internals ---------------------------------------------------------
 
     def _read_raw(self) -> dict | None:
-        """Return the raw JSON payload, or ``None`` if the file is missing."""
+        """Return the raw JSON payload, or ``None`` if the file is missing.
+
+        When the file exists but is corrupt (JSON parse error, wrong type),
+        a backup is written alongside the original before returning ``None``
+        so the caller's re-seed path doesn't silently destroy recoverable data.
+        """
         if not self._path.is_file():
             return None
         try:
             with self._path.open("r", encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            self._backup_corrupt_file(exc)
             return None
         if not isinstance(data, dict):
+            logger.error(
+                "profiles.json has unexpected top-level type %s; re-seeding. "
+                "Backup written to %s.corrupt.",
+                type(data).__name__,
+                self._path,
+            )
+            self._backup_corrupt_file(TypeError(f"expected dict, got {type(data).__name__}"))
             return None
         return data
 
+    def _backup_corrupt_file(self, exc: Exception) -> None:
+        """Copy the corrupt profiles.json to a .corrupt sidecar for recovery."""
+        import shutil
+
+        backup = self._path.with_suffix(".json.corrupt")
+        try:
+            shutil.copy2(self._path, backup)
+            logger.error(
+                "profiles.json is corrupt (%s); backed up to %s and re-seeding. "
+                "Inspect the backup to recover your profiles.",
+                exc,
+                backup,
+            )
+        except OSError as copy_exc:
+            logger.error(
+                "profiles.json is corrupt (%s) and backup failed (%s); "
+                "re-seeding from defaults. The corrupt file will be overwritten.",
+                exc,
+                copy_exc,
+            )
+
     def _save_raw(self, data: dict) -> None:
         """Atomic JSON write with chmod 600 (POSIX only) re-asserted on save."""
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, sort_keys=True)
-            fh.write("\n")
-        if _IS_POSIX:
-            os.chmod(tmp, 0o600)
-        os.replace(tmp, self._path)
-        if _IS_POSIX:
-            os.chmod(self._path, 0o600)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=self._path.parent, suffix=".tmp", prefix=self._path.stem + "_"
+        )
+        tmp = Path(tmp_path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+                if _IS_POSIX:
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                    os.fchmod(fh.fileno(), 0o600)
+            os.replace(tmp, self._path)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
 
     def _seed_from_legacy_or_default(self) -> dict:
         """First-launch seed.

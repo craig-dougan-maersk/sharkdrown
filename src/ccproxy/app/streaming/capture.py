@@ -6,6 +6,7 @@ Used by the proxy handler in ``/v1/messages`` for ``stream: true`` requests.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -16,6 +17,12 @@ from ccproxy.app.db.storage import StorageService
 from ccproxy.app.models.storage import ResponseLog
 
 _RECORD_SEPARATOR = b"\n\n"
+# Cap on SSE chunks retained for dashboard storage. Client forwarding is
+# unaffected — all bytes are still yielded; only the in-memory capture
+# list is bounded. 2000 chunks covers the largest practical responses.
+_MAX_CAPTURE_CHUNKS = 2000
+
+logger = logging.getLogger("claude_code_proxy.streaming.capture")
 
 
 async def stream_and_capture(
@@ -27,7 +34,11 @@ async def stream_and_capture(
     """Forward bytes to the client and accumulate ``data:`` lines for storage.
 
     ``response`` must be opened with ``stream=True`` so its body is iterable.
-    On stream completion, a ``ResponseLog`` is persisted.
+    On stream completion (or client disconnect), a ``ResponseLog`` is persisted
+    via a ``finally`` block. Python calls ``.aclose()`` on an async generator
+    when its consumer stops iterating (e.g. client disconnect), and ``.aclose()``
+    properly executes ``finally`` blocks including their ``await`` expressions,
+    so the DB write happens regardless of how the stream ends.
 
     The capture is byte-aware: ``response.aiter_bytes()`` may deliver
     chunks whose boundaries cut a single ``data:`` JSON line in two. We
@@ -41,37 +52,61 @@ async def stream_and_capture(
     start = time.monotonic()
     status_code = response.status_code
     buffer = b""
+    capture_full = True  # False once the cap is reached
 
-    async for raw in response.aiter_bytes():
-        # Forward the upstream's raw bytes 1:1 to the client. SSE is
-        # line-based; the client reassembles records itself.
-        yield raw
+    try:
+        async for raw in response.aiter_bytes():
+            # Forward the upstream's raw bytes 1:1 to the client. SSE is
+            # line-based; the client reassembles records itself.
+            yield raw
 
-        buffer += raw
-        # Drain complete records from the buffer; keep the trailing
-        # partial record for the next iteration so a data: line that
-        # crosses a chunk boundary isn't dropped.
-        while _RECORD_SEPARATOR in buffer:
-            record, _, buffer = buffer.partition(_RECORD_SEPARATOR)
-            _capture_data_lines(record, chunks)
+            if capture_full:
+                buffer += raw
+                # Drain complete records from the buffer; keep the trailing
+                # partial record for the next iteration so a data: line that
+                # crosses a chunk boundary isn't dropped.
+                while _RECORD_SEPARATOR in buffer:
+                    record, _, buffer = buffer.partition(_RECORD_SEPARATOR)
+                    _capture_data_lines(record, chunks)
+                    if len(chunks) >= _MAX_CAPTURE_CHUNKS:
+                        logger.debug(
+                            "stream capture cap reached (%d chunks) for request %s; "
+                            "further chunks will not be stored",
+                            _MAX_CAPTURE_CHUNKS,
+                            request_id,
+                        )
+                        capture_full = False
+                        buffer = b""
+                        break
 
-    # Drain any trailing record that didn't end with the separator
-    # (e.g. the stream ended mid-record, or the upstream closed cleanly
-    # without a final blank line).
-    if buffer.strip():
-        _capture_data_lines(buffer, chunks)
+        # Drain any trailing record that didn't end with the separator
+        # (e.g. the stream ended mid-record, or the upstream closed cleanly
+        # without a final blank line).
+        if capture_full and buffer.strip():
+            _capture_data_lines(buffer, chunks)
 
-    elapsed_ms = int((time.monotonic() - start) * 1000)
-    response_log = ResponseLog(
-        status_code=status_code,
-        headers=dict(response.headers.items()),
-        is_streaming=True,
-        streaming_chunks=chunks,
-        response_time_ms=elapsed_ms,
-        completed_at=datetime.now(UTC),
-        body_text="\n\n".join(chunks),
-    )
-    await storage.update_request_with_response(request_id, response_log)
+    finally:
+        # Always persist whatever was captured — handles both clean
+        # completion and early termination (client disconnect, upstream
+        # error). The elapsed time reflects wall-clock up to this point.
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        response_log = ResponseLog(
+            status_code=status_code,
+            headers=dict(response.headers.items()),
+            is_streaming=True,
+            streaming_chunks=chunks,
+            response_time_ms=elapsed_ms,
+            completed_at=datetime.now(UTC),
+            body_text="\n\n".join(chunks),
+        )
+        try:
+            await storage.update_request_with_response(request_id, response_log)
+        except Exception as exc:
+            logger.warning(
+                "failed to persist response log for request %s: %s",
+                request_id,
+                exc,
+            )
 
 
 def _capture_data_lines(record: bytes, chunks: list[str]) -> None:

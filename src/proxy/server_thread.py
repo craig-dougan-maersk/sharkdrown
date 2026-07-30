@@ -145,15 +145,25 @@ class ProxyServerThread(QThread):
         serve_task = asyncio.create_task(server.serve())
         try:
             # Wait for uvicorn to finish startup (or fail) before emitting.
+            # Cap the wait at 30 seconds; a bound that wasn't in uvicorn 0.30+
+            # would otherwise spin forever.
+            _startup_deadline = 30.0
+            _startup_elapsed = 0.0
+            _POLL_INTERVAL = 0.05
             while not serve_task.done():
-                if server.started:
+                if getattr(server, "started", False):
                     bound_port = self._resolve_bound_port(server)
                     self._port = bound_port
                     self.started_ok.emit(bound_port)
                     break
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(_POLL_INTERVAL)
+                _startup_elapsed += _POLL_INTERVAL
+                if _startup_elapsed >= _startup_deadline:
+                    self.failed.emit("server did not become ready within 30 s")
+                    serve_task.cancel()
+                    return
             # If startup failed before ``started`` flipped, surface the error.
-            if not server.started:
+            if not getattr(server, "started", False):
                 try:
                     await serve_task
                 except Exception as exc:  # noqa: BLE001
@@ -188,12 +198,12 @@ class ProxyServerThread(QThread):
         return self._port
 
     # -- Configuration -----------------------------------------------------
-    def _build_settings(self) -> Settings | None:
+    def _build_settings(self) -> Settings:
         """Build a Settings instance wired to the discovered config files.
 
-        Returns ``None`` if no config files were found, in which case
-        ``create_app`` will fall back to defaults — useful for first-run
-        users who haven't set anything up yet.
+        Always returns a valid Settings object — never None — so that GUI
+        profile overrides (model endpoints, providers, aliases) are applied
+        unconditionally regardless of whether a config.yaml or .env exists.
 
         The order of operations matters:
           1. ``dotenv.load_dotenv`` populates ``os.environ`` with any
@@ -207,33 +217,35 @@ class ProxyServerThread(QThread):
              over anything in the YAML.
         """
         env_path = find_env_file(self._config_dir)
+        yaml_path = find_config_yaml(self._config_dir)
+
+        # Pass _env_file directly to the Settings constructor so pydantic-settings
+        # reads the .env file internally without mutating os.environ. load_dotenv()
+        # makes individual os.environ assignments that are not atomic from the
+        # perspective of another thread also reading os.environ.
+        env_kwargs: dict = {}
         if env_path is not None:
             logger.info("loading proxy env from %s", env_path)
-            # python-dotenv is already a dep of fastapi/pydantic-settings
-            import dotenv
+            env_kwargs["_env_file"] = str(env_path)
 
-            dotenv.load_dotenv(env_path, override=False)
-
-        yaml_path = find_config_yaml(self._config_dir)
-        settings: Settings | None
         if yaml_path is not None:
             logger.info("loading proxy config from %s", yaml_path)
-            settings = Settings(config_yaml_path=yaml_path)
+            settings = Settings(config_yaml_path=yaml_path, **env_kwargs)
         elif env_path is not None:
             logger.info("no config.yaml found; using env + defaults")
-            settings = None
+            settings = Settings(**env_kwargs)
         else:
             logger.warning(
                 "no proxy config.yaml or .env found; using defaults "
                 "(upstream will be api.anthropic.com)"
             )
-            settings = None
+            settings = Settings()
 
         # Layer in the per-model endpoint overrides. We replace the
         # ``model_endpoints`` field wholesale because the user explicitly
         # configured this in the desktop's settings dialog — it should
         # not be silently merged with anything the YAML happens to have.
-        if settings is not None and (
+        if (
             self._model_endpoints
             or self._default_endpoint
             or self._model_aliases
