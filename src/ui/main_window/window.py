@@ -67,6 +67,7 @@ class MainWindow(
         # Initialize components
         self._init_central_widget()
         self._init_menu()
+        self._init_code_menu()
         self._init_terminal_menu()
         self._init_claude_menu()
         self._init_status_bar()
@@ -74,8 +75,10 @@ class MainWindow(
         # Install double-click rename on tab bar
         self._install_tab_rename_filter()
 
-        # Create initial tab
-        self._create_new_tab(format_type="markdown")
+        # Create initial tab — named ``untitled.md`` (not the generic
+        # ``Untitled``) so the format tag and filename are immediately
+        # informative in the tab strip.
+        self._new_untitled_tab("markdown")
 
         self._apply_view_state()
 

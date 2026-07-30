@@ -774,6 +774,58 @@ def test_claude_container_flush_pending_launches():
     print("✓ ClaudeContainerView.flush_pending_launch wires env + cwd correctly")
 
 
+def test_claude_container_info_label_stays_alive():
+    """Regression: ``info_label`` C++ object must outlive ``_build_ui``.
+
+    Previously the toolbar in ``_build_ui`` was a local variable and
+    was never added to the layout, so the QWidget (and its
+    ``info_label`` child) was garbage-collected as soon as
+    ``_build_ui`` returned. The next call to ``_update_info_label``
+    then raised ``RuntimeError: Internal C++ object already deleted``
+    — which propagated up out of ``_launch_session`` *before*
+    ``view.start()`` ran, so the PTY never forked and the new
+    session tab stayed blank.
+    """
+    from PySide6.QtWidgets import QWidget
+
+    _qapp()
+    cv = _container_with_proxy_callbacks(running=True)
+
+    # The toolbar is an instance attribute, not a local variable.
+    assert hasattr(cv, "_toolbar"), (
+        "_toolbar should be an instance attribute so it survives _build_ui"
+    )
+    assert isinstance(cv._toolbar, QWidget)
+
+    # The info_label's parent must be the live toolbar (not the
+    # already-deleted C++ object of a former local variable).
+    assert cv.info_label.parent() is cv._toolbar
+
+    # The toolbar is in the container's layout (so the label is
+    # actually visible to the user, not just alive in memory).
+    layout = cv.layout()
+    in_layout = any(
+        layout.itemAt(i).widget() is cv._toolbar
+        for i in range(layout.count())
+    )
+    assert in_layout, "toolbar should be added to the container layout"
+
+    # The actual call that used to crash.
+    cv._update_info_label()
+    assert cv.info_label.text() == "No sessions yet — click '+ New Session' to start."
+
+    # And with a fake session count, the label updates without error.
+    cv._sessions = ["fake"]  # type: ignore[assignment]
+    cv._update_info_label()
+    assert cv.info_label.text() == "1 session open"
+
+    cv._sessions = ["s1", "s2", "s3"]  # type: ignore[assignment]
+    cv._update_info_label()
+    assert cv.info_label.text() == "3 sessions open"
+
+    print("✓ ClaudeContainerView._update_info_label does not crash after _build_ui")
+
+
 # ---- Runner --------------------------------------------------------------
 
 
@@ -808,6 +860,7 @@ def main():
         test_claude_container_blocks_when_no_claude_binary,
         test_claude_container_queues_when_proxy_not_running,
         test_claude_container_flush_pending_launches,
+        test_claude_container_info_label_stays_alive,
     ]
     failed = 0
     for t in tests:

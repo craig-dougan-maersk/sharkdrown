@@ -31,7 +31,6 @@
        refresh() { this.refreshList(); this.refreshUrl(); }
      }">
   <header class="flex items-center justify-between mb-6">
-    <h1 class="text-2xl font-semibold">Claude Code Proxy</h1>
     <div class="flex items-center gap-4">
       <div hx-get="/partials/stats" hx-trigger="load, every 30s" hx-swap="innerHTML"></div>
       <span hx-ext="sse" sse-connect="/stream" sse-swap="new_request"

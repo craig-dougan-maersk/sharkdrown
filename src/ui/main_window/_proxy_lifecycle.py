@@ -185,17 +185,32 @@ class ProxyLifecycleMixin:
         if self.claude_container is not None:
             self.claude_container.show_dashboard()
 
-    def _show_recent_activity(self) -> None:
-        """Switch to the Claude tab and select the Recent Activity pane."""
-        self.view_tabs.setCurrentIndex(self._TAB_INDEX_CLAUDE)
-        if self.claude_container is not None:
-            self.claude_container.show_recent_activity()
+    def _show_recent_activity(self, checked: bool) -> None:
+        """Slot for Claude -> Show Recent Activity (checkable).
 
-    def _show_dashboard_panel(self) -> None:
-        """Slot for Claude -> Show Dashboard."""
-        self.view_tabs.setCurrentIndex(self._TAB_INDEX_CLAUDE)
+        Toggling the menu item shows/hides the Recent Activity inner
+        tab AND makes the Claude tab the active top-level view. When
+        the box is checked, the recent-activity pane becomes visible
+        and selected; when unchecked, the pane is hidden and the
+        tab strip falls forward to the next visible tab.
+        """
         if self.claude_container is not None:
-            self.claude_container.show_dashboard()
+            self.claude_container.set_recent_activity_visible(checked)
+        if checked:
+            self.view_tabs.setCurrentIndex(self._TAB_INDEX_CLAUDE)
+            if self.claude_container is not None:
+                self.claude_container.show_recent_activity()
+        self.action_show_recent.setChecked(checked)
+
+    def _show_dashboard_panel(self, checked: bool) -> None:
+        """Slot for Claude -> Show Dashboard (checkable)."""
+        if self.claude_container is not None:
+            self.claude_container.set_dashboard_visible(checked)
+        if checked:
+            self.view_tabs.setCurrentIndex(self._TAB_INDEX_CLAUDE)
+            if self.claude_container is not None:
+                self.claude_container.show_dashboard()
+        self.action_show_dashboard.setChecked(checked)
 
     def _open_dashboard_external(self) -> None:
         """Open the dashboard in the user's default web browser."""

@@ -1033,6 +1033,170 @@ def test_resize_changes_rows_and_cols() -> None:
     print("✓ resize event propagates to pyte screen via debounce timer")
 
 
+def test_repaint_scrolls_to_max_when_content_overflows() -> None:
+    """When new shell output overflows the viewport, _repaint must scroll
+    the QTextEdit so the cursor (the active line) stays visible.
+
+    Regression test for the "active line can scroll off the bottom" symptom.
+    Without the synchronous ``setTextWidth(viewport_width) + adjustSize()``
+    pair inside ``_repaint``, the scrollbar's ``maximum`` stayed at the
+    value left over from the *previous* repaint's layout — the new
+    content's height was larger but the scroll position was still pegged
+    to the old maximum, so the bottom rows of new output were rendered
+    below the visible area.
+    """
+    _qapp()
+    from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+    view = TerminalSessionView(argv=["/bin/cat"])
+    view.resize(800, 600)
+    view.show()
+    _spin(50)
+    # Offscreen-mode viewport quirk: force the viewport to fill the
+    # widget, same as ``test_recompute_size_does_not_overflow_viewport``.
+    view.text_edit.viewport().resize(view.text_edit.size())
+    view.start()
+    _spin(50)
+    view._recompute_size()
+
+    try:
+        # Push enough lines to overflow the viewport.
+        for i in range(80):
+            view._stream.feed(f"Output line {i:02d}\n".encode())
+        view._repaint()
+        _spin(50)
+
+        sb = view.text_edit.verticalScrollBar()
+        vp_h = view.text_edit.viewport().height()
+        # The scrollbar max should be > 0 (content is taller than the
+        # viewport). The scroll position should put the cursor in the
+        # visible area — which, for a terminal whose cursor is on the
+        # last row of the live screen, is the bottom of the viewport.
+        assert sb.maximum() > 0, (
+            f"expected scrollbar maximum > 0 after overflow, got {sb.maximum()}"
+        )
+        # The cursor's row in the document is at the bottom, so the
+        # bottom of the document must be visible — i.e. the scroll
+        # position should be within 1 row of the maximum (the "a few
+        # lines off" tolerance is a 1-row window in this test).
+        assert sb.value() >= sb.maximum() - 1, (
+            f"expected scrollbar value to be near maximum={sb.maximum()}, "
+            f"got value={sb.value()} — active line is off the bottom"
+        )
+        # The visible bottom must reach the bottom of the document.
+        visible_bottom_px = sb.value() + vp_h
+        assert visible_bottom_px >= sb.maximum() + vp_h - 5, (
+            f"bottom of document not visible: value={sb.value()} "
+            f"max={sb.maximum()} vp_h={vp_h}"
+        )
+    finally:
+        view.shutdown()
+    print("✓ repaint scrolls to keep the active line visible when content overflows")
+
+
+def test_repaint_scrolls_to_top_for_new_session() -> None:
+    """A brand-new session has the cursor at row 0 (top of document). The
+    auto-scroll must put the cursor in view, not land on the blank rows
+    below.
+
+    Regression test for the "active line is a few lines off the top of
+    the terminal window" symptom after creating a new session. The old
+    ``setValue(maximum)`` approach pinned the scrollbar to the bottom
+    of the document, which is the right place for an *active* session
+    (where the cursor is at the bottom of the live screen) but the
+    wrong place for a fresh session where the cursor is on the very
+    first row. With the cursor at row 0, ``setValue(maximum)`` lands
+    the viewport on the empty bottom rows and the prompt / cursor
+    sits above the visible area.
+
+    The fix uses ``ensureCursorVisible`` on a QTextCursor placed at
+    the pyte cursor's row. For a new session that's row 0, so the
+    viewport lands on the top — the prompt is visible.
+    """
+    _qapp()
+    from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+    view = TerminalSessionView(argv=["/bin/cat"])
+    view.resize(800, 600)
+    view.show()
+    _spin(50)
+    view.text_edit.viewport().resize(view.text_edit.size())
+    view.start()
+    _spin(50)
+    view._recompute_size()
+
+    try:
+        # New session — no data fed, cursor is at (0, 0).
+        assert view._screen.cursor.y == 0, (
+            f"sanity: cursor should start at row 0, got {view._screen.cursor.y}"
+        )
+        view._repaint()
+        _spin(50)
+
+        sb = view.text_edit.verticalScrollBar()
+        # Scroll position should be at (or near) the top of the
+        # document so the cursor at row 0 is visible.
+        assert sb.value() <= 1, (
+            f"new session: scroll position should be at the top "
+            f"(value <= 1), got value={sb.value()} max={sb.maximum()}"
+        )
+    finally:
+        view.shutdown()
+    print("✓ repaint scrolls to the top for a new session (cursor at row 0)")
+
+
+def test_repaint_clears_user_scrolled_up_when_at_bottom() -> None:
+    """A repaint where the user is already at the bottom re-engages follow
+    mode even if ``_user_scrolled_up`` was True at the start.
+
+    Regression test for the "scrolled up, then scrolled back down via
+    keyboard/scrollbar instead of the wheel" path. ``wheelEvent`` is the
+    only place that previously cleared ``_user_scrolled_up``, so a user
+    who scrolled up to read history and then navigated back to the
+    bottom via Ctrl+End or the scrollbar drag handle would be stuck in
+    "scrolled up" mode forever — new content accumulated invisibly
+    below the viewport. The fix resets the flag in ``_repaint`` when
+    ``was_at_bottom`` is True, so the next repaint follows again.
+    """
+    _qapp()
+    from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+    view = TerminalSessionView(argv=["/bin/cat"])
+    view.resize(800, 600)
+    view.show()
+    _spin(50)
+    view.text_edit.viewport().resize(view.text_edit.size())
+    view.start()
+    _spin(50)
+    view._recompute_size()
+
+    try:
+        # Produce overflow so there's something to scroll past.
+        for i in range(80):
+            view._stream.feed(f"Output line {i:02d}\n".encode())
+        view._repaint()
+        _spin(50)
+        sb = view.text_edit.verticalScrollBar()
+        # Sanity: at the bottom after the overflow.
+        assert sb.value() == sb.maximum(), (
+            f"sanity: should be at max, got value={sb.value()} max={sb.maximum()}"
+        )
+
+        # Simulate the user having scrolled up at some earlier point.
+        view._user_scrolled_up = True
+        # A new repaint (no new data) should clear the flag because
+        # the scrollbar is at the bottom.
+        view._repaint()
+        _spin(50)
+        assert view._user_scrolled_up is False, (
+            "_user_scrolled_up should be reset to False when the user is "
+            "at the bottom — otherwise new content scrolls off the bottom"
+        )
+    finally:
+        view.shutdown()
+    print("✓ repaint clears _user_scrolled_up when scrollbar is at the bottom")
+
+
 # ---- Font size + tab navigation -----------------------------------------
 
 
@@ -1870,6 +2034,9 @@ def main() -> None:
         test_block_selection_default_highlights_only_drag_rectangle,
         test_real_mouse_event_via_viewport_sets_cell_selection,
         test_pixel_to_cell_uses_viewport_size_not_widget_size,
+        test_repaint_scrolls_to_max_when_content_overflows,
+        test_repaint_scrolls_to_top_for_new_session,
+        test_repaint_clears_user_scrolled_up_when_at_bottom,
     ]
     failed = 0
     for t in tests:

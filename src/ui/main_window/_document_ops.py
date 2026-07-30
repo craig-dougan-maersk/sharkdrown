@@ -5,14 +5,23 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, Qt, QTimer
-from PySide6.QtGui import QColor, QIcon, QPixmap, QPainter, QTextCursor
-from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QMessageBox,
+    QSizePolicy,
+    QTabBar,
+    QWidget,
+)
 
 from src.core.document import DocumentTab
 
 
 # ---------------------------------------------------------------------------
-# Format → colour mapping for tab icons
+# Format → colour and short-tag mapping for editor tabs
 # ---------------------------------------------------------------------------
 
 _FORMAT_COLORS: dict[str, str] = {
@@ -20,27 +29,29 @@ _FORMAT_COLORS: dict[str, str] = {
     "json": "#e8a838",
     "yaml": "#4ec86c",
     "text": "#888888",
+    "html": "#c678dd",
 }
 
-_icon_cache: dict[str, QIcon] = {}
+# Short tag text shown in the tab label before the filename. The tag
+# is a format identifier (not the actual file extension) — so a .yml
+# file shows the tag "yaml" while a .yaml file also shows "yaml".
+_FORMAT_TAGS: dict[str, str] = {
+    "markdown": "md",
+    "json": "json",
+    "yaml": "yaml",
+    "text": "txt",
+    "html": "html",
+}
 
-
-def _format_icon(format_type: str) -> QIcon:
-    """Return a small coloured circle icon for the given format."""
-    if format_type in _icon_cache:
-        return _icon_cache[format_type]
-    color = _FORMAT_COLORS.get(format_type, "#888888")
-    px = QPixmap(12, 12)
-    px.fill(QColor(0, 0, 0, 0))
-    painter = QPainter(px)
-    painter.setRenderHint(QPainter.Antialiasing)
-    painter.setBrush(QColor(color))
-    painter.setPen(Qt.NoPen)
-    painter.drawEllipse(1, 1, 10, 10)
-    painter.end()
-    icon = QIcon(px)
-    _icon_cache[format_type] = icon
-    return icon
+# Default file extension assigned to a brand-new untitled tab of the
+# given format. Note ``yaml`` -> ``yml`` per the spec.
+_DEFAULT_EXTENSIONS: dict[str, str] = {
+    "markdown": "md",
+    "json": "json",
+    "yaml": "yml",
+    "text": "txt",
+    "html": "html",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +63,102 @@ _STARTER_CONTENT: dict[str, str] = {
     "yaml": "---\n",
     "markdown": "",
     "text": "",
+    "html": (
+        "<!DOCTYPE html>\n<html>\n<head>\n"
+        "  <meta charset=\"utf-8\">\n"
+        "  <title></title>\n"
+        "</head>\n<body>\n</body>\n</html>\n"
+    ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Format detection from a bare extension string
+# ---------------------------------------------------------------------------
+
+def _detect_format_from_ext(ext: str) -> str:
+    """Map a (lowercased, dotted) extension to a format.
+
+    Unknown or empty extensions fall back to ``"text"`` so a renamed
+    file with an unrecognised suffix becomes a plain text document.
+    """
+    return {
+        ".md": "markdown",
+        ".markdown": "markdown",
+        ".json": "json",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".txt": "text",
+        ".html": "html",
+        ".htm": "html",
+    }.get(ext.lower(), "text")
+
+
+# ---------------------------------------------------------------------------
+# Custom tab label widget
+# ---------------------------------------------------------------------------
+
+class _TabLabelWidget(QWidget):
+    """Custom tab label: a coloured format tag + the filename.
+
+    Used in place of HTML in ``setTabText`` because ``QTabBar``'s
+    built-in label rendering only supports a tiny subset of HTML and
+    on many platforms/styles it shows the markup literally. A real
+    widget placed via ``QTabBar.setTabButton(LeftSide, ...)`` is
+    always rendered correctly.
+
+    The tag is a coloured "chip" (rounded background, white bold
+    text) that matches the colour previously used for the round
+    dot icon. The filename sits to the right of the chip and is
+    italic when the document is dirty.
+    """
+
+    def __init__(
+        self,
+        tag: str,
+        color: str,
+        name: str,
+        italic: bool,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        # Exposed for tests / debugging — useful attributes to have on
+        # hand rather than walking the child QLabels.
+        self.tag = tag
+        self.color = color
+        self.name = name
+        self.italic = italic
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(6)
+
+        # ---- Format tag chip ---------------------------------------
+        self._tag_label = QLabel(tag)
+        tag_font = self._tag_label.font()
+        tag_font.setBold(True)
+        self._tag_label.setFont(tag_font)
+        # ``setStyleSheet`` on a QLabel scopes the colour/background
+        # to the chip, not the whole tab.
+        self._tag_label.setStyleSheet(
+            f"background-color: {color}; color: white;"
+            f" padding: 1px 6px; border-radius: 3px;"
+        )
+        # Keep the chip compact — it shouldn't stretch to fill the tab.
+        self._tag_label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        layout.addWidget(self._tag_label)
+
+        # ---- Filename ----------------------------------------------
+        self._name_label = QLabel(name)
+        if italic:
+            name_font = self._name_label.font()
+            name_font.setItalic(True)
+            self._name_label.setFont(name_font)
+        layout.addWidget(self._name_label)
+
+        # Push the chip+name to the left so the close button (placed
+        # by the tab bar on the right) has room to sit at the end.
+        layout.addStretch()
 
 
 class DocumentOpsMixin:
@@ -71,8 +177,54 @@ class DocumentOpsMixin:
         fmt = NewFileDialog.ask(self)
         if fmt is None:
             return
-        content = _STARTER_CONTENT.get(fmt, "")
-        self._create_new_tab(content=content, format_type=fmt)
+        self._new_untitled_tab(fmt)
+
+    def _new_untitled_tab(self, format_type: str) -> None:
+        """Create a brand-new untitled tab for the given format.
+
+        The tab is named ``untitled.{ext}`` where ``ext`` is the
+        format's default extension. If a tab with that name is already
+        open, a ``(N)`` suffix is appended and incremented until unique
+        (so the second JSON file is ``untitled (2).json``, the third
+        is ``untitled (3).json``, and so on).
+        """
+        ext = _DEFAULT_EXTENSIONS.get(format_type, "txt")
+        base_name = f"untitled.{ext}"
+        name = self._dedup_tab_name(base_name)
+        content = _STARTER_CONTENT.get(format_type, "")
+        self._create_new_tab(
+            content=content,
+            format_type=format_type,
+            display_name=name,
+        )
+
+    def _dedup_tab_name(self, base_name: str) -> str:
+        """Return ``base_name`` or a ``(N)``-suffixed variant if already in use.
+
+        Scans the currently-open editor tabs and only counts a name as
+        taken if it appears verbatim. If only ``untitled (2).json`` is
+        open, a new JSON file is named ``untitled.json`` (not
+        ``untitled (3).json``) — the gap is left alone.
+        """
+        existing: set[str] = set()
+        for i in range(self.editor_tabs.count()):
+            editor = self.editor_tabs.widget(i)
+            if editor is not None and editor.document is not None:
+                existing.add(editor.document.title())
+
+        if base_name not in existing:
+            return base_name
+
+        if "." in base_name:
+            dot = base_name.rindex(".")
+            base, ext = base_name[:dot], base_name[dot:]
+        else:
+            base, ext = base_name, ""
+
+        n = 2
+        while f"{base} ({n}){ext}" in existing:
+            n += 1
+        return f"{base} ({n}){ext}"
 
     # ---- Tab creation -------------------------------------------------------
 
@@ -81,16 +233,28 @@ class DocumentOpsMixin:
         content: str = "",
         file_path: Path | None = None,
         format_type: str | None = None,
+        display_name: str | None = None,
     ) -> None:
-        """Create a new editor tab with optional content."""
+        """Create a new editor tab with optional content.
+
+        ``display_name`` is an override shown in the tab title — used
+        for brand-new untitled tabs (``untitled.json``,
+        ``untitled (2).json``, …) so they show a meaningful name
+        before they're ever saved to disk.
+        """
         doc_tab = DocumentTab(file_path, content, format_type=format_type)
+        if display_name is not None:
+            doc_tab.display_name = display_name
 
         from src.ui.widgets.editor_widget import EditorWidget
         editor = EditorWidget()
         editor.document = doc_tab
 
-        index = self.editor_tabs.addTab(editor, doc_tab.title())
-        self.editor_tabs.setTabIcon(index, _format_icon(doc_tab.format_type))
+        index = self.editor_tabs.addTab(editor, "")
+        # Route the title through ``_update_tab_title`` so the format
+        # tag and italic/roman state are set the same way as every
+        # later refresh.
+        self._update_tab_title(index, doc_tab)
         self.editor_tabs.setCurrentIndex(index)
 
         editor.text_changed.connect(lambda idx=index: self._update_tab_title(idx, doc_tab))
@@ -117,12 +281,40 @@ class DocumentOpsMixin:
     # ---- Tab title / icon ---------------------------------------------------
 
     def _update_tab_title(self, index: int, doc_tab: DocumentTab) -> None:
-        """Update tab title and icon when content or format changes."""
-        title = doc_tab.title()
-        if doc_tab.is_modified():
-            title = f"● {title}"
-        self.editor_tabs.setTabText(index, title)
-        self.editor_tabs.setTabIcon(index, _format_icon(doc_tab.format_type))
+        """Render the tab label as ``[format tag] [filename]``.
+
+        The tag is the short format identifier (``md``, ``json``,
+        ``yaml``, ``txt``, ``html``) shown as a coloured chip. The
+        filename is italic when the document is dirty and roman when
+        it matches the file on disk.
+
+        Uses a real ``_TabLabelWidget`` placed via
+        ``QTabBar.setTabButton(LeftSide, ...)`` rather than HTML in
+        ``setTabText`` — the tab bar's built-in label rendering only
+        supports a tiny subset of HTML and on many platforms it shows
+        the markup literally.
+        """
+        tag = _FORMAT_TAGS.get(doc_tab.format_type, doc_tab.format_type)
+        color = _FORMAT_COLORS.get(doc_tab.format_type, "#888888")
+        name = doc_tab.title()
+        italic = doc_tab.is_modified()
+
+        tab_bar = self.editor_tabs.tabBar()
+        # The previous widget (if any) is owned by the tab bar until
+        # we replace it; calling ``deleteLater()`` after detaching it
+        # frees the old widget's memory.
+        old_widget = tab_bar.tabButton(index, QTabBar.LeftSide)
+        if old_widget is not None:
+            old_widget.setParent(None)
+            old_widget.deleteLater()
+
+        label_widget = _TabLabelWidget(tag, color, name, italic)
+        tab_bar.setTabButton(index, QTabBar.LeftSide, label_widget)
+        # Clear the default style-drawn text so the custom widget is
+        # the only thing visible in the tab's left slot.
+        self.editor_tabs.setTabText(index, "")
+        self.editor_tabs.setTabIcon(index, QIcon())
+
         if index in self._tab_pairs:
             pindex = self._tab_pairs[index]
             self.preview_tabs.setTabText(pindex, f"Preview: {doc_tab.title()}")
@@ -143,17 +335,66 @@ class DocumentOpsMixin:
         return super().eventFilter(obj, event)
 
     def _rename_tab(self, index: int) -> None:
+        """Rename the tab's file via double-click.
+
+        If the extension changes, the user is warned and the format is
+        updated to match the new extension (or falls back to plain
+        text for unrecognised / missing extensions). For tabs backed
+        by a real file on disk, the rename updates ``file_path`` to
+        the new name in the same directory; for untitled tabs it
+        updates ``display_name`` instead. The actual file on disk is
+        only created/renamed when the user saves — until then the tab
+        renders italic (because the in-memory content no longer
+        matches the new file path, which doesn't exist yet).
+        """
         editor = self.editor_tabs.widget(index)
         if editor is None or editor.document is None:
             return
         doc_tab = editor.document
         current_name = doc_tab.title()
+
         new_name, ok = QInputDialog.getText(
             self, "Rename Tab", "New name:", text=current_name
         )
-        if ok and new_name.strip():
-            doc_tab.display_name = new_name.strip()
-            self._update_tab_title(index, doc_tab)
+        if not ok or not new_name.strip():
+            return
+        new_name = new_name.strip()
+
+        # ``Path(name).suffix`` returns ``""`` for names with no dot in
+        # the leaf — so a file literally called ``untitled`` is
+        # correctly treated as having no extension.
+        current_ext = Path(current_name).suffix.lower()
+        new_ext = Path(new_name).suffix.lower()
+
+        if new_ext != current_ext:
+            reply = QMessageBox.question(
+                self,
+                "Change File Type?",
+                f"You changed the extension from "
+                f"'{current_ext or '(none)'}' to '{new_ext or '(none)'}'.\n\n"
+                f"The file type will be updated to match the new "
+                f"extension. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            doc_tab.format_type = _detect_format_from_ext(new_ext)
+            if hasattr(editor, "_update_highlighter"):
+                editor._update_highlighter()
+            # The format tag in the tab depends on format_type, so
+            # re-render the title after the format change.
+            self._update_markdown_toolbar_visibility()
+
+        # Apply the new name. If the tab has a backing file, move the
+        # file path; otherwise the title is just a display override.
+        if doc_tab.file_path is not None:
+            doc_tab.file_path = doc_tab.file_path.parent / new_name
+            doc_tab.display_name = None
+        else:
+            doc_tab.display_name = new_name
+
+        self._update_tab_title(index, doc_tab)
 
     # ---- Content change / lint trigger --------------------------------------
 
@@ -513,7 +754,9 @@ class DocumentOpsMixin:
         if editor is None or editor.document is None:
             return
         editor.document.format_type = format_type
-        self.editor_tabs.setTabIcon(current_idx, _format_icon(format_type))
+        # The coloured-dot tab icon is gone — refresh the rich-text
+        # tag instead so the new format's colour shows immediately.
+        self._update_tab_title(current_idx, editor.document)
         self._on_editor_content_changed(current_idx, editor.document)
         if hasattr(editor, "_update_highlighter"):
             editor._update_highlighter()

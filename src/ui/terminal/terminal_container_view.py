@@ -36,8 +36,18 @@ class TerminalContainerView(QWidget):
         layout.setSpacing(0)
 
         # --- Toolbar -------------------------------------------------------
-        toolbar = QWidget()
-        toolbar_layout = QHBoxLayout(toolbar)
+        # ``self._toolbar`` keeps a Python reference to the toolbar widget
+        # so its children (``info_label``, ``new_button``) aren't destroyed
+        # when ``_build_ui`` returns. The toolbar is intentionally not
+        # added to the layout (it's hidden in the current design), but
+        # its child ``info_label`` is still referenced by
+        # ``_update_info_label`` and must stay alive — a ``QLabel`` whose
+        # C++ object is deleted raises ``RuntimeError`` and aborts
+        # ``new_session`` BEFORE ``view.start()`` can fork the PTY.
+        # Without that fix, opening a new terminal session leaves the
+        # tab visible but no shell process is ever spawned.
+        self._toolbar = QWidget()
+        toolbar_layout = QHBoxLayout(self._toolbar)
         toolbar_layout.setContentsMargins(8, 4, 8, 4)
         toolbar_layout.setSpacing(8)
 
@@ -47,14 +57,14 @@ class TerminalContainerView(QWidget):
             "Open a new shell session in this terminal pane (Ctrl+Alt+T)"
         )
         self.new_button.clicked.connect(self.new_session)
-        toolbar_layout.addWidget(self.new_button)
+        #toolbar_layout.addWidget(self.new_button)
 
         toolbar_layout.addStretch(1)
 
         self.info_label = QLabel("No sessions yet — click '+ New Session' to start.")
         self.info_label.setStyleSheet("color: gray; font-size: 12px;")
         toolbar_layout.addWidget(self.info_label)
-        layout.addWidget(toolbar)
+        #layout.addWidget(toolbar)
 
         # --- Inner tab widget (closable, movable) -------------------------
         # Closable + movable mirrors the editor_tabs config in

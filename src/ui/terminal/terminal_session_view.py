@@ -1322,20 +1322,65 @@ class TerminalSessionView(QWidget):
 
         self.text_edit.setHtml(html)
 
-        # Auto-scroll to bottom unless the user manually scrolled up.
+        # Auto-scroll to the cursor unless the user manually scrolled up.
         if not self._user_scrolled_up or was_at_bottom:
+            # Even when ``_user_scrolled_up`` was True at the start of
+            # this repaint, a repaint that already detected the user
+            # at the bottom (the ``was_at_bottom`` short-circuit) should
+            # re-engage follow mode — the user can navigate back to
+            # the bottom via keyboard (Ctrl+End), the scrollbar drag
+            # handle, or a programmatic scroll, none of which fire
+            # ``wheelEvent`` and so can't clear ``_user_scrolled_up``
+            # on their own. Without this, a user who scrolled up
+            # history and then scrolled back down would see new
+            # output accumulate invisibly below the viewport — the
+            # "active line off the bottom" symptom.
             self._user_scrolled_up = False
-            # Force the document layout so scrollbar.maximum() reflects
-            # the new content height. Without this, the maximum is stale
-            # (from the previous setHtml) and the scroll falls short —
-            # leaving the last few rows (where oh-my-posh draws its
-            # status line) just below the visible area.
+            # Force the document layout so ``scrollbar.maximum()``
+            # reflects the new content height. We pin the document's
+            # text width to the viewport first: without that,
+            # ``adjustSize`` is a no-op for documents with no
+            # fixed-width blocks (ours is a flowing ``<pre>``), and
+            # ``scrollbar.maximum()`` stays at the value left over
+            # from the *previous* repaint.
+            viewport_width = self.text_edit.viewport().width()
+            if viewport_width > 0:
+                self.text_edit.document().setTextWidth(viewport_width)
             self.text_edit.document().adjustSize()
-            scrollbar.setValue(scrollbar.maximum())
-            # Reset horizontal scroll — the terminal grid should always
-            # start at x=0. Without this, ensureCursorVisible() (which we
-            # previously used) scrolls right to show the cursor at the end
-            # of the line, clipping the first few characters on the left.
+
+            # Scroll to the *cursor's* position in the document, not
+            # to the bottom of the document. For an active session
+            # the cursor sits at the bottom of the live screen (which
+            # is at the bottom of the document), so the two are
+            # equivalent. For a new session with no data, the
+            # cursor is at the very top — ``setValue(maximum)`` would
+            # land the user on the blank rows below the prompt and
+            # leave the active line "a few lines off the top" of the
+            # viewport (the symptom the user reported after the
+            # previous fix). ``ensureCursorVisible`` is also more
+            # robust than ``setValue(maximum)`` when the document is
+            # a few pixels taller than expected: Qt's layout engine
+            # knows exactly where the cursor is and scrolls to put
+            # it in the visible area, even if ``maximum`` is off by
+            # one row's worth of pixels.
+            text_cursor = self.text_edit.textCursor()
+            text_cursor.movePosition(QTextCursor.Start)
+            # The pyte cursor's row is the offset within the live
+            # screen; the live screen starts after any scrollback
+            # history. Walk the QTextCursor down that many lines so
+            # ``ensureCursorVisible`` lands on the cursor's row.
+            history_lines = 0
+            if hasattr(self._screen, "history") and self._screen.history.top:
+                history_lines = len(self._screen.history.top)
+            target_line = history_lines + int(self._screen.cursor.y)
+            for _ in range(target_line):
+                text_cursor.movePosition(QTextCursor.Down)
+            self.text_edit.setTextCursor(text_cursor)
+            self.text_edit.ensureCursorVisible()
+            # Reset horizontal scroll — ``ensureCursorVisible`` may
+            # have scrolled right to keep the cursor's column in
+            # view, clipping the first characters on the left. The
+            # terminal grid should always start at x=0.
             hbar = self.text_edit.horizontalScrollBar()
             if hbar.value() != 0:
                 hbar.setValue(0)

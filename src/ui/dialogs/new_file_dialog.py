@@ -16,7 +16,8 @@ from PySide6.QtWidgets import (
 _FILE_TYPES = [
     ("Markdown", "markdown", ".md"),
     ("JSON", "json", ".json"),
-    ("YAML", "yaml", ".yaml"),
+    ("YAML", "yaml", ".yml"),
+    ("HTML", "html", ".html"),
     ("Plain Text", "text", ".txt"),
 ]
 

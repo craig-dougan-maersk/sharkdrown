@@ -289,12 +289,56 @@ class ClaudeContainerView(QWidget):
             widget.focus_terminal()
 
     def show_dashboard(self) -> None:
-        """Switch the inner tab strip to the Dashboard pane."""
+        """Switch the inner tab strip to the Dashboard pane.
+
+        Also forces the Dashboard tab visible (it may be hidden by
+        the ``Claude → Show Dashboard`` menu toggle).
+        """
+        self._set_pinned_visible(0, True)
         self.tabs.setCurrentIndex(0)
 
     def show_recent_activity(self) -> None:
-        """Switch the inner tab strip to the Recent Activity pane."""
+        """Switch the inner tab strip to the Recent Activity pane.
+
+        Also forces the Recent Activity tab visible (it may be hidden
+        by the ``Claude → Show Recent Activity`` menu toggle).
+        """
+        self._set_pinned_visible(1, True)
         self.tabs.setCurrentIndex(1)
+
+    def set_dashboard_visible(self, visible: bool) -> None:
+        """Show or hide the ``Proxy Dashboard`` inner tab.
+
+        Called from the ``Claude → Show Dashboard`` checkable menu
+        action. If the user hides the currently-selected Dashboard
+        tab, the tab strip falls forward to the next visible tab so
+        the user isn't left looking at an empty pane.
+        """
+        self._set_pinned_visible(0, visible)
+
+    def set_recent_activity_visible(self, visible: bool) -> None:
+        """Show or hide the ``Recent Activity`` inner tab."""
+        self._set_pinned_visible(1, visible)
+
+    def _set_pinned_visible(self, index: int, visible: bool) -> None:
+        """Show or hide a pinned tab and keep the selection sensible."""
+        self.tabs.setTabVisible(index, visible)
+        if not visible and self.tabs.currentIndex() == index:
+            # Pick the next visible tab so the user doesn't see a blank
+            # pane when the active tab is hidden. Walk forward, then
+            # backward, then fall back to index 0 if nothing is visible
+            # (the container still has at least one tab, but it might
+            # all be hidden).
+            n = self.tabs.count()
+            for delta in range(1, n + 1):
+                forward = (index + delta) % n
+                if self.tabs.isTabVisible(forward):
+                    self.tabs.setCurrentIndex(forward)
+                    return
+                backward = (index - delta) % n
+                if self.tabs.isTabVisible(backward):
+                    self.tabs.setCurrentIndex(backward)
+                    return
 
     @property
     def session_count(self) -> int:
@@ -406,8 +450,20 @@ class ClaudeContainerView(QWidget):
         layout.setSpacing(0)
 
         # --- Toolbar ------------------------------------------------------
-        toolbar = QWidget()
-        toolbar_layout = QHBoxLayout(toolbar)
+        # The toolbar is stored as ``self._toolbar`` (NOT a local
+        # variable) so its child ``info_label`` stays alive for the
+        # lifetime of the container. Previously this was a local
+        # variable *and* the ``layout.addWidget(toolbar)`` line below
+        # was commented out, so the QWidget had no parent and was
+        # garbage-collected when ``_build_ui`` returned — taking the
+        # ``info_label`` C++ object with it. The next call to
+        # ``_update_info_label()`` then raised
+        # ``RuntimeError: Internal C++ object already deleted``,
+        # which propagated up out of ``_launch_session`` *before*
+        # ``view.start()`` ran, so the PTY never forked and the new
+        # session tab stayed blank.
+        self._toolbar = QWidget()
+        toolbar_layout = QHBoxLayout(self._toolbar)
         toolbar_layout.setContentsMargins(8, 4, 8, 4)
         toolbar_layout.setSpacing(8)
 
@@ -417,7 +473,7 @@ class ClaudeContainerView(QWidget):
             "Open a new Claude Code session in this pane (Ctrl+Alt+C)"
         )
         self.new_button.clicked.connect(self._on_new_clicked)
-        toolbar_layout.addWidget(self.new_button)
+        #toolbar_layout.addWidget(self.new_button)
 
         toolbar_layout.addStretch(1)
 
@@ -426,7 +482,7 @@ class ClaudeContainerView(QWidget):
         )
         self.info_label.setStyleSheet("color: gray; font-size: 12px;")
         toolbar_layout.addWidget(self.info_label)
-        layout.addWidget(toolbar)
+        layout.addWidget(self._toolbar)
 
         # --- Inner tab strip ---------------------------------------------
         # A single QTabWidget hosts Dashboard (index 0), Recent Activity
@@ -460,7 +516,7 @@ class ClaudeContainerView(QWidget):
         self._dashboard_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._dashboard_placeholder.setStyleSheet("color: gray; font-size: 14px;")
         self.dashboard_layout.addWidget(self._dashboard_placeholder)
-        self.tabs.addTab(self.dashboard_container, "Dashboard")
+        self.tabs.addTab(self.dashboard_container, "Proxy Dashboard")
 
         # Pinned tab 1: Recent Activity. Built up-front (no heavy deps);
         # polling stays paused until ``set_base_url`` is called.
@@ -472,6 +528,14 @@ class ClaudeContainerView(QWidget):
         # would otherwise install.
         self._set_pinned_tab(0)
         self._set_pinned_tab(1)
+
+        # Both pinned tabs are hidden by default. The user opts in via
+        # the ``Claude → Show Dashboard`` / ``Claude → Show Recent
+        # Activity`` checkable menu items — that way the inner tab
+        # strip is empty until the user actually wants one of the
+        # panes, and toggling the menu item later restores it.
+        self.tabs.setTabVisible(0, False)
+        self.tabs.setTabVisible(1, False)
 
         layout.addWidget(self.tabs, 1)
 

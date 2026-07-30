@@ -159,11 +159,19 @@ class PreviewWidget(QWidget):
             # Process pandas blocks first
             processed = PandasTableProcessor.replace_pandas_blocks(content)
 
-            # Create markdown instance with extensions
+            # Create markdown instance with extensions. The ``toc``
+            # extension is kept (it generates the header anchor IDs the
+            # document may link to), but ``permalink`` is disabled —
+            # when enabled, python-markdown injects a ``¶`` (U+00B6,
+            # ``&para;``) anchor link at the end of every header, which
+            # QTextDocument renders as a stray control character that
+            # looks like a return-arrow in the preview. The anchor IDs
+            # are still emitted, so internal ``[link](#heading)``
+            # references keep working.
             md_instance = md.Markdown(
                 extensions=["fenced_code", "tables", "attr_list", "toc"],
                 extension_configs={
-                    "toc": {"permalink": True},
+                    "toc": {"permalink": False},
                 },
             )
 

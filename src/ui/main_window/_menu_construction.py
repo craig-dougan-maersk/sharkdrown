@@ -72,13 +72,6 @@ class MenuConstructionMixin:
         self.action_toggle_split.triggered.connect(self._toggle_split)
         view_menu.addAction(self.action_toggle_split)
 
-        self.action_toggle_preview = QAction("&Toggle Preview", self)
-        self.action_toggle_preview.setShortcut("Ctrl+P")
-        self.action_toggle_preview.setCheckable(True)
-        self.action_toggle_preview.setChecked(False)
-        self.action_toggle_preview.triggered.connect(self._toggle_preview)
-        view_menu.addAction(self.action_toggle_preview)
-
         view_menu.addSeparator()
 
         self.action_side_by_side = QAction("Side &By Side", self)
@@ -125,15 +118,6 @@ class MenuConstructionMixin:
         self.action_reset_font.setShortcut("Ctrl+0")
         self.action_reset_font.triggered.connect(self._reset_font_size)
         view_menu.addAction(self.action_reset_font)
-
-        view_menu.addSeparator()
-
-        self.action_toggle_lint = QAction("Toggle &Lint Panel", self)
-        self.action_toggle_lint.setShortcut("Ctrl+Shift+L")
-        self.action_toggle_lint.setCheckable(True)
-        self.action_toggle_lint.setChecked(False)
-        self.action_toggle_lint.triggered.connect(self._toggle_lint_panel)
-        view_menu.addAction(self.action_toggle_lint)
 
         view_menu.addSeparator()
 
@@ -305,12 +289,20 @@ class MenuConstructionMixin:
         self.status.addPermanentWidget(self.font_size_value_label)
 
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["markdown", "json", "yaml", "text"])
+        self.format_combo.addItems(["markdown", "json", "yaml", "text", "html"])
         self.format_combo.setToolTip(
             "Format for the current document.\n"
             "Drives syntax highlighting and preview rendering."
         )
-        self.format_combo.currentTextChanged.connect(self._on_format_combo_changed)
+        # ``activated`` fires only on user interaction (not on
+        # programmatic ``setCurrentText``), which is the right signal
+        # for "user picked an item". The previous ``currentTextChanged``
+        # connection could leave the popup open because the slot did
+        # heavy work (re-render preview, run lint) that stole focus
+        # before Qt's default close-after-click handling fired.
+        # Note: PySide6 only exposes the ``activated(int)`` overload,
+        # not a string overload, so the slot converts index→text.
+        self.format_combo.activated.connect(self._on_format_combo_activated)
         self.status.addPermanentWidget(self.format_combo)
 
         # Document statistics labels (visible on Documents tab only)
@@ -350,7 +342,12 @@ class MenuConstructionMixin:
         self._sync_font_slider()
 
     def _sync_format_combo_to_current_document(self) -> None:
-        """Point the format combo at the active document's format."""
+        """Point the format combo at the active document's format.
+
+        No ``blockSignals`` is needed: the combo is connected to
+        ``activated`` (user-only), so programmatic ``setCurrentText``
+        won't re-enter the slot.
+        """
         current_idx = self.editor_tabs.currentIndex()
         if current_idx < 0:
             return
@@ -359,14 +356,18 @@ class MenuConstructionMixin:
             return
         fmt = editor.document.format_type
         if self.format_combo.currentText() != fmt:
-            self.format_combo.blockSignals(True)
-            try:
-                self.format_combo.setCurrentText(fmt)
-            finally:
-                self.format_combo.blockSignals(False)
+            self.format_combo.setCurrentText(fmt)
 
-    def _on_format_combo_changed(self, fmt: str) -> None:
-        """Slot for format_combo.currentTextChanged."""
+    def _on_format_combo_activated(self, index: int) -> None:
+        """Slot for ``format_combo.activated`` — fires only on user pick.
+
+        The ``hidePopup()`` call is a safety net: ``activated`` is
+        emitted before Qt's default close-after-click, so the popup
+        would otherwise remain visible while the slot's downstream
+        work (preview re-render, lint) runs.
+        """
+        fmt = self.format_combo.itemText(index)
+        self.format_combo.hidePopup()
         self._set_current_format(fmt)
 
     def _toggle_lint_panel(self, checked: bool) -> None:
@@ -429,11 +430,38 @@ class MenuConstructionMixin:
         self.font_size_slider.blockSignals(False)
         self.font_size_value_label.setText(f"{size}pt")
 
+    def _init_code_menu(self) -> None:
+        """Add the Code menu between View and Terminal.
+
+        The Code menu owns the source-editing / code-analysis actions
+        that used to live on the View menu: ``Toggle Preview`` and
+        ``Toggle Lint Panel``. They were moved off View because they
+        are about *the code*, not the chrome — View now strictly
+        governs the application UI (split, theme, fonts).
+        """
+        menubar = self.menuBar()
+        code_menu = menubar.addMenu("&Code")
+
+        self.action_toggle_preview = QAction("&Toggle Preview", self)
+        self.action_toggle_preview.setShortcut("Ctrl+P")
+        self.action_toggle_preview.setCheckable(True)
+        self.action_toggle_preview.setChecked(False)
+        self.action_toggle_preview.triggered.connect(self._toggle_preview)
+        code_menu.addAction(self.action_toggle_preview)
+
+        code_menu.addSeparator()
+
+        self.action_toggle_lint = QAction("Toggle &Lint Panel", self)
+        self.action_toggle_lint.setShortcut("Ctrl+Shift+L")
+        self.action_toggle_lint.setCheckable(True)
+        self.action_toggle_lint.setChecked(False)
+        self.action_toggle_lint.triggered.connect(self._toggle_lint_panel)
+        code_menu.addAction(self.action_toggle_lint)
+
     def _init_terminal_menu(self) -> None:
         """Add the Terminal menu."""
         menubar = self.menuBar()
         terminal_menu = menubar.addMenu("&Terminal")
-
         self.action_new_terminal_session = QAction("&New Terminal Session", self)
         self.action_new_terminal_session.setShortcut("Ctrl+Alt+T")
         self.action_new_terminal_session.triggered.connect(self._new_terminal_session)
@@ -514,9 +542,14 @@ class MenuConstructionMixin:
         claude_menu.addSeparator()
 
         # ---- View toggles ---------------------------------------------
+        # The checkable ``Show Dashboard`` / ``Show Recent Activity``
+        # items now actually toggle visibility of the corresponding
+        # inner tabs in ``ClaudeContainerView`` — not just navigate
+        # to them. Both are unchecked by default; the user opts in to
+        # the dashboard / activity pane explicitly.
         self.action_show_dashboard = QAction("Show &Dashboard", self)
         self.action_show_dashboard.setCheckable(True)
-        self.action_show_dashboard.setChecked(True)
+        self.action_show_dashboard.setChecked(False)
         self.action_show_dashboard.triggered.connect(self._show_dashboard_panel)
         claude_menu.addAction(self.action_show_dashboard)
 
