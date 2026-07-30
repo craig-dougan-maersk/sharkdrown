@@ -153,6 +153,186 @@ class Subagent:
     model: str | None = None
 
 
+@dataclass(frozen=True)
+class MarketplaceSource:
+    """A registered Claude Code plugin marketplace.
+
+    Mirrors the shape of a single ``known_marketplaces.json[name].source``
+    entry plus its ``installLocation``. Claude Code supports four
+    source kinds (``github``, ``git``, ``url``, ``git-subdir``); we
+    model the union as a single dataclass with optional fields — only
+    the ones relevant to the chosen ``source`` are populated.
+
+    Attributes
+    ----------
+    source:
+        One of ``"github"``, ``"git"``, ``"url"``, ``"git-subdir"``.
+        The Plugins tab picker uses this to decide which sub-fields
+        to expose in the editor form.
+    repo:
+        For ``github`` sources: ``"<owner>/<repo>"`` (the slug
+        GitHub uses in URLs).
+    url:
+        For ``git`` / ``url`` / ``git-subdir`` sources: clone URL.
+    path:
+        For ``git-subdir``: subdirectory inside the repo holding
+        the marketplace manifest.
+    ref:
+        Optional branch / tag / commit-ish pin.
+    sha:
+        Optional exact commit SHA pin (Claude Code snapshots this
+        for reproducibility).
+    install_location:
+        Absolute local path Claude Code writes the marketplace to
+        (``~/.claude/plugins/marketplaces/<name>`` by convention).
+        Optional — ``write_profile_config`` will materialise the
+        marketplace here on first launch.
+    """
+
+    source: str
+    repo: str | None = None
+    url: str | None = None
+    path: str | None = None
+    ref: str | None = None
+    sha: str | None = None
+    install_location: str | None = None
+
+    def as_dict(self) -> dict:
+        """Render the ``known_marketplaces.json`` entry for this source.
+
+        Only the fields that map cleanly onto Claude Code's schema
+        are emitted (``installLocation`` is a sibling, not part of
+        ``source``). ``None`` values are dropped so the file stays
+        compact — Claude Code treats absence and null identically.
+        """
+        source_d: dict = {"source": self.source}
+        for k in ("repo", "url", "path", "ref", "sha"):
+            v = getattr(self, k)
+            if v:
+                source_d[k] = v
+        return source_d
+
+
+@dataclass
+class InstalledPlugin:
+    """One entry in ``plugins/installed_plugins.json``.
+
+    Claude Code's installed-plugins registry is keyed by
+    ``"<plugin>@<marketplace>"`` (e.g. ``"frontend-design@claude-plugins-official"``).
+    The Plugins tab shows this list read-only; the user edits
+    installation by invoking the Claude CLI, and we re-read the
+    resulting JSON on the next ``write_profile_config`` call.
+
+    Attributes
+    ----------
+    name:
+        ``"<plugin>@<marketplace>"`` — the registry key Claude Code
+        uses to look up the install record.
+    scope:
+        ``"user"`` for per-profile installs (the only scope SharkDrown
+        writes — there's no per-project install path in a profile
+        editor).
+    install_path:
+        Absolute local path where Claude Code cloned the plugin
+        source.
+    version:
+        Plugin version string from the marketplace manifest.
+    installed_at:
+        ISO-8601 timestamp the plugin was first installed
+        (preserved verbatim from Claude Code's output).
+    last_updated:
+        ISO-8601 timestamp of the last refresh.
+    """
+
+    name: str
+    scope: str = "user"
+    install_path: str = ""
+    version: str = ""
+    installed_at: str | None = None
+    last_updated: str | None = None
+
+    def as_dict(self) -> dict:
+        """Render one entry inside the ``plugins: {...}`` map."""
+        out: dict = {
+            "scope": self.scope,
+            "installPath": self.install_path,
+            "version": self.version,
+        }
+        if self.installed_at:
+            out["installedAt"] = self.installed_at
+        if self.last_updated:
+            out["lastUpdated"] = self.last_updated
+        return out
+
+
+@dataclass(frozen=True)
+class McpServer:
+    """One entry in ``.mcp.json``'s ``mcpServers`` map.
+
+    Captures the union of fields Claude Code accepts across all
+    transport types (stdio / sse / http). The form in the
+    MCP Servers tab exposes the common ones; anything Claude Code
+    may add in future (custom headers, OAuth config, etc.) lands in
+    ``extra`` via the raw-JSON fallback block.
+
+    Attributes
+    ----------
+    name:
+        Stable identifier (the dict key in ``mcpServers``). Used
+        by Claude Code in its `/mcp` picker and in tool logs.
+    transport:
+        ``"stdio"`` (default), ``"sse"``, or ``"http"``. Drives
+        which sub-fields are required at validation time.
+    command:
+        For stdio: the executable path or PATH-resolvable name.
+        ``None`` for non-stdio transports.
+    args:
+        For stdio: argv array passed to ``command``.
+    env:
+        For stdio: environment overrides merged onto the session
+        env when launching the server.
+    url:
+        For sse / http transports: the server endpoint URL.
+    extra:
+        Raw-JSON fallback for forward-compatibility — captures any
+        field Claude Code adds that we don't yet model
+        (``headers``, ``oauthClientId``, etc.). Stored verbatim
+        on disk; ``_on_accept`` validates it parses as JSON.
+    """
+
+    name: str
+    transport: str = "stdio"
+    command: str | None = None
+    args: tuple[str, ...] = ()
+    env: dict[str, str] = field(default_factory=dict)
+    url: str | None = None
+    extra: dict = field(default_factory=dict)
+
+    def as_dict(self) -> dict:
+        """Render the ``mcpServers[name]`` value for ``.mcp.json``.
+
+        Only emits fields relevant to the chosen transport so the
+        file is clean. ``extra`` is merged on top so users can
+        override modelled fields via the raw-JSON block if needed.
+        """
+        out: dict = {}
+        if self.transport != "stdio":
+            out["type"] = self.transport
+        if self.command:
+            out["command"] = self.command
+        if self.args:
+            out["args"] = list(self.args)
+        if self.env:
+            out["env"] = dict(self.env)
+        if self.url:
+            out["url"] = self.url
+        # ``extra`` last so user-overrides win on modelled keys.
+        if self.extra:
+            for k, v in self.extra.items():
+                out.setdefault(k, v)
+        return out
+
+
 @dataclass
 class ClaudeProfile:
     """One Claude Code session profile.
@@ -245,3 +425,23 @@ class ClaudeProfile:
     port: int = 3001
     config_dir: str = ""
     is_default: bool = False
+    # ---- Claude Code plugin / MCP configuration (added July 2026) -------
+    #
+    # These are first-class dataclass fields (not free-form ``claude_settings``
+    # entries) so they round-trip cleanly through
+    # :class:`ProfileStore`'s (de)serialisation and survive a profile
+    # export → import cycle. ``claude_settings`` is still the escape
+    # hatch for any plugin / MCP key Claude Code may add that we
+    # haven't taught the model yet.
+    #
+    # ``enabled_plugins`` flows into ``settings.json:enabledPlugins``
+    # (so Claude Code picks them up at session start).
+    # ``marketplaces`` / ``installed_plugins`` / ``blocked_plugins`` flow
+    # into the per-profile ``plugins/`` directory written by
+    # :func:`write_profile_config`. ``mcp_servers`` flows into
+    # ``.mcp.json`` in the same directory.
+    enabled_plugins: dict[str, bool] = field(default_factory=dict)
+    marketplaces: dict[str, MarketplaceSource] = field(default_factory=dict)
+    installed_plugins: dict[str, InstalledPlugin] = field(default_factory=dict)
+    blocked_plugins: list[str] = field(default_factory=list)
+    mcp_servers: dict[str, McpServer] = field(default_factory=dict)

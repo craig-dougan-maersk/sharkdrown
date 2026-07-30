@@ -1377,6 +1377,31 @@ class TerminalSessionView(QWidget):
                 text_cursor.movePosition(QTextCursor.Down)
             self.text_edit.setTextCursor(text_cursor)
             self.text_edit.ensureCursorVisible()
+            # ``ensureCursorVisible`` is a *minimum-distance* scroll: it
+            # scrolls only enough to bring the cursor's rect into the
+            # viewport. For a terminal that's correct for the cursor
+            # itself, but the content *below* the cursor (Claude Code's
+            # status bar / latest output, which sits on the last few
+            # rows of the live screen while the cursor is parked a few
+            # rows above it) ends up below the visible area — the
+            # "active line reaches the bottom, last five lines aren't
+            # viewable" symptom during an active session.
+            #
+            # Only force ``setValue(maximum)`` when there's *real*
+            # overflow — i.e. scrollback history exists. A fresh
+            # session has ``history_lines == 0`` and the document is
+            # at most a few rows taller than the viewport (rounding
+            # noise from ``_measure_rendered_rows``); snapping to
+            # ``maximum`` there scrolls the TUI header off the top
+            # because the cursor (already visible to ``ensureCursorVisible``)
+            # sits in the bottom viewport-height. The
+            # ``history_lines > 0`` gate means we only snap once
+            # content has actually scrolled off the top of the live
+            # screen — which is exactly when the user wants to see
+            # the latest output rather than the session start.
+            if history_lines > 0:
+                if scrollbar.value() < scrollbar.maximum():
+                    scrollbar.setValue(scrollbar.maximum())
             # Reset horizontal scroll — ``ensureCursorVisible`` may
             # have scrolled right to keep the cursor's column in
             # view, clipping the first characters on the left. The

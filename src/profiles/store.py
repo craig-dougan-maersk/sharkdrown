@@ -37,6 +37,9 @@ _IS_POSIX = sys.platform != "win32"
 from src.profiles.credential_store import CredentialStore
 from src.profiles.models import (
     ClaudeProfile,
+    InstalledPlugin,
+    MarketplaceSource,
+    McpServer,
     ModelEndpoint,
     Provider,
     Subagent,
@@ -665,6 +668,96 @@ def _serialize_profile(p: ClaudeProfile) -> dict:
         elif ep_d.get("url"):
             endpoints_out[str(model)] = ep_d
     d["model_endpoints"] = endpoints_out
+    # ---- plugin / marketplace / MCP (added July 2026) --------------------
+    #
+    # ``asdict`` already recursively converts the nested dataclasses
+    # (McpServer is frozen so its dict survives intact; InstalledPlugin
+    # + MarketplaceSource are mutable but only contain primitive
+    # fields). We post-process each one to drop None / empty defaults
+    # so the JSON stays compact — matching the tidy behaviour applied
+    # to ``providers`` / ``model_endpoints`` above.
+    raw_enabled = d.get("enabled_plugins") or {}
+    if isinstance(raw_enabled, dict) and raw_enabled:
+        d["enabled_plugins"] = {str(k): bool(v) for k, v in raw_enabled.items()}
+    else:
+        d.pop("enabled_plugins", None)
+    raw_marketplaces = d.get("marketplaces") or {}
+    if isinstance(raw_marketplaces, dict) and raw_marketplaces:
+        marketplaces_out: dict[str, dict] = {}
+        for mk, mv in raw_marketplaces.items():
+            if not isinstance(mv, dict):
+                continue
+            # Drop None values (the source kind itself is required).
+            if not mv.get("source"):
+                continue
+            marketplaces_out[str(mk)] = {k: v for k, v in mv.items() if v is not None}
+        if marketplaces_out:
+            d["marketplaces"] = marketplaces_out
+        else:
+            d.pop("marketplaces", None)
+    else:
+        d.pop("marketplaces", None)
+    raw_installed = d.get("installed_plugins") or {}
+    if isinstance(raw_installed, dict) and raw_installed:
+        installed_out: dict[str, list[dict]] = {}
+        for pk, pv in raw_installed.items():
+            if not isinstance(pv, list):
+                # Tolerate the older single-dict shape (which the
+                # installed_plugins.json file actually uses — one
+                # dict per install scope). We normalise to a list
+                # here so the round-trip is uniform.
+                pv = [pv] if isinstance(pv, dict) else []
+            cleaned: list[dict] = []
+            for entry in pv:
+                if not isinstance(entry, dict):
+                    continue
+                cleaned.append({k: v for k, v in entry.items() if v is not None and v != ""})
+            if cleaned:
+                installed_out[str(pk)] = cleaned
+        if installed_out:
+            d["installed_plugins"] = installed_out
+        else:
+            d.pop("installed_plugins", None)
+    else:
+        d.pop("installed_plugins", None)
+    raw_blocked = d.get("blocked_plugins") or []
+    if isinstance(raw_blocked, list) and raw_blocked:
+        d["blocked_plugins"] = [str(x) for x in raw_blocked if isinstance(x, str) and x]
+        if not d["blocked_plugins"]:
+            d.pop("blocked_plugins", None)
+    else:
+        d.pop("blocked_plugins", None)
+    raw_mcp = d.get("mcp_servers") or {}
+    if isinstance(raw_mcp, dict) and raw_mcp:
+        mcp_out: dict[str, dict] = {}
+        for sk, sv in raw_mcp.items():
+            if not isinstance(sv, dict):
+                continue
+            # ``name`` is redundant (it's the dict key). ``extra``
+            # is the forward-compat bag for unknown fields — its
+            # contents are *merged* into the server entry at the top
+            # level (Claude Code reads .mcp.json's server entries
+            # flat, not nested under an ``extra`` key). Drop
+            # ``name``/``extra`` after flattening so the round-trip
+            # doesn't re-inflate them on the next load.
+            cleaned = {
+                k: v
+                for k, v in sv.items()
+                if v is not None and v != () and k not in ("name", "extra")
+            }
+            extra_fields = sv.get("extra")
+            if isinstance(extra_fields, dict):
+                for ek, ev in extra_fields.items():
+                    # Modelled keys win on collision — the user
+                    # can't redefine ``command`` via raw JSON.
+                    cleaned.setdefault(str(ek), ev)
+            mcp_out[str(sk)] = cleaned
+        if mcp_out:
+            d["mcp_servers"] = mcp_out
+        else:
+            d.pop("mcp_servers", None)
+    else:
+        d.pop("mcp_servers", None)
     # Drop empty optional fields so the JSON doesn't carry noise.
     if d.get("default_model") is None:
         d.pop("default_model", None)
@@ -845,6 +938,99 @@ def _deserialize_profile(d: dict) -> ClaudeProfile:
     else:
         config_dir = ""
     is_default = bool(d.get("is_default", False))
+    # ---- plugin / marketplace / MCP deserialisation (added July 2026) ----
+    enabled_plugins_raw = d.get("enabled_plugins") or {}
+    enabled_plugins: dict[str, bool] = {}
+    if isinstance(enabled_plugins_raw, dict):
+        for k, v in enabled_plugins_raw.items():
+            if isinstance(k, str) and k:
+                enabled_plugins[k] = bool(v)
+    marketplaces_raw = d.get("marketplaces") or {}
+    marketplaces: dict[str, MarketplaceSource] = {}
+    if isinstance(marketplaces_raw, dict):
+        for mk, mv in marketplaces_raw.items():
+            if not isinstance(mv, dict) or not mv.get("source"):
+                continue
+            marketplaces[str(mk)] = MarketplaceSource(
+                source=str(mv["source"]),
+                repo=(str(mv["repo"]) if mv.get("repo") else None),
+                url=(str(mv["url"]) if mv.get("url") else None),
+                path=(str(mv["path"]) if mv.get("path") else None),
+                ref=(str(mv["ref"]) if mv.get("ref") else None),
+                sha=(str(mv["sha"]) if mv.get("sha") else None),
+                install_location=(
+                    str(mv["install_location"])
+                    if mv.get("install_location") else None
+                ),
+            )
+    installed_plugins_raw = d.get("installed_plugins") or {}
+    installed_plugins: dict[str, InstalledPlugin] = {}
+    if isinstance(installed_plugins_raw, dict):
+        # ``installed_plugins.json`` stores each plugin as a list of
+        # install records (one per scope). The on-disk profile JSON
+        # mirrors that shape; we collapse to a single
+        # ``InstalledPlugin`` per key (the first user-scoped record
+        # if multiple are present — SharkDrown only writes one scope).
+        for pk, pv in installed_plugins_raw.items():
+            record: dict = {}
+            if isinstance(pv, list) and pv and isinstance(pv[0], dict):
+                record = pv[0]
+            elif isinstance(pv, dict):
+                record = pv
+            if not record:
+                continue
+            installed_plugins[str(pk)] = InstalledPlugin(
+                name=str(pk),
+                scope=str(record.get("scope") or "user"),
+                install_path=str(record.get("installPath") or record.get("install_path") or ""),
+                version=str(record.get("version") or ""),
+                installed_at=(
+                    str(record.get("installedAt") or record.get("installed_at"))
+                    if record.get("installedAt") or record.get("installed_at") else None
+                ),
+                last_updated=(
+                    str(record.get("lastUpdated") or record.get("last_updated"))
+                    if record.get("lastUpdated") or record.get("last_updated") else None
+                ),
+            )
+    blocked_plugins_raw = d.get("blocked_plugins") or []
+    blocked_plugins: list[str] = []
+    if isinstance(blocked_plugins_raw, list):
+        blocked_plugins = [str(x) for x in blocked_plugins_raw if isinstance(x, str) and x]
+    mcp_raw = d.get("mcp_servers") or {}
+    mcp_servers: dict[str, McpServer] = {}
+    if isinstance(mcp_raw, dict):
+        for sk, sv in mcp_raw.items():
+            if not isinstance(sv, dict):
+                continue
+            transport = str(sv.get("type") or sv.get("transport") or "stdio")
+            args_raw = sv.get("args")
+            if isinstance(args_raw, list):
+                args = tuple(str(a) for a in args_raw)
+            elif isinstance(args_raw, tuple):
+                args = tuple(str(a) for a in args_raw)
+            elif isinstance(args_raw, str) and args_raw:
+                args = tuple(args_raw.split())
+            else:
+                args = ()
+            env_raw = sv.get("env") or {}
+            env = {str(k): str(v) for k, v in env_raw.items()} if isinstance(env_raw, dict) else {}
+            # ``extra`` is anything we don't model. The well-known
+            # modelled keys (transport-related + the redundant
+            # ``name`` key Claude Code never writes to .mcp.json but
+            # a hand-edited file might) are stripped so ``extra`` is
+            # the raw-JSON-fallback bag.
+            modelled = {"type", "transport", "command", "args", "env", "url", "name"}
+            extra = {k: v for k, v in sv.items() if k not in modelled}
+            mcp_servers[str(sk)] = McpServer(
+                name=str(sk),
+                transport=transport,
+                command=(str(sv["command"]) if sv.get("command") else None),
+                args=args,
+                env=env,
+                url=(str(sv["url"]) if sv.get("url") else None),
+                extra=extra,
+            )
     return ClaudeProfile(
         name=name,
         slug=slug,
@@ -859,4 +1045,9 @@ def _deserialize_profile(d: dict) -> ClaudeProfile:
         port=port,
         config_dir=config_dir,
         is_default=is_default,
+        enabled_plugins=enabled_plugins,
+        marketplaces=marketplaces,
+        installed_plugins=installed_plugins,
+        blocked_plugins=blocked_plugins,
+        mcp_servers=mcp_servers,
     )

@@ -18,6 +18,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -104,6 +105,303 @@ def test_claude_profile_serialization_roundtrips_new_fields() -> None:
     assert loaded.config_dir == "/tmp/my-config"
     assert loaded.is_default is True
     print("✓ New fields round-trip through ProfileStore")
+
+
+# ---- Plugin / MCP field round-trip (added July 2026) ----------------------
+
+
+def test_claude_profile_roundtrips_plugin_and_mcp_fields() -> None:
+    """Every plugin / MCP field on ``ClaudeProfile`` survives a
+    serialize / deserialize cycle through ``ProfileStore``.
+
+    Catches the easy bug of adding a new dataclass field but
+    forgetting to teach the (de)serializer about it.
+    """
+    from src.profiles import (
+        ClaudeProfile,
+        InstalledPlugin,
+        MarketplaceSource,
+        McpServer,
+        ProfileStore,
+    )
+
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    p = ClaudeProfile(
+        name="PluginProfile",
+        slug="plugin-profile",
+        enabled_plugins={"foo@bar": True, "baz@bar": False},
+        marketplaces={
+            "bar": MarketplaceSource(
+                source="github", repo="foo/bar", ref="main"
+            ),
+            "qux": MarketplaceSource(
+                source="git-subdir",
+                url="https://github.com/x/y",
+                path="plugins/qux",
+                sha="0123456789abcdef0123456789abcdef01234567",
+            ),
+        },
+        installed_plugins={
+            "foo@bar": InstalledPlugin(
+                name="foo@bar",
+                version="1.2.3",
+                install_path="/home/x/.claude/plugins/cache/foo/bar/1.2.3",
+                installed_at="2026-01-01T00:00:00.000Z",
+                last_updated="2026-02-01T00:00:00.000Z",
+            ),
+        },
+        blocked_plugins=["evil@bar", "malicious@qux"],
+        mcp_servers={
+            "stdio-srv": McpServer(
+                name="stdio-srv",
+                transport="stdio",
+                command="/usr/local/bin/srv",
+                args=("--stdio", "--port=8080"),
+                env={"API_KEY": "abc"},
+            ),
+            "http-srv": McpServer(
+                name="http-srv",
+                transport="http",
+                url="https://example.com/mcp",
+                extra={"headers": {"Authorization": "Bearer xyz"}},
+            ),
+        },
+    )
+    store.upsert(p)
+    loaded = next(x for x in store.load() if x.name == "PluginProfile")
+    assert loaded.enabled_plugins == p.enabled_plugins
+    assert loaded.marketplaces == p.marketplaces
+    assert loaded.installed_plugins == p.installed_plugins
+    assert loaded.blocked_plugins == p.blocked_plugins
+    assert loaded.mcp_servers == p.mcp_servers
+    # ``extra`` round-trips through .mcp.json flat — confirm the
+    # user-supplied field is preserved.
+    assert (
+        loaded.mcp_servers["http-srv"].extra["headers"]["Authorization"]
+        == "Bearer xyz"
+    )
+    print("✓ Plugin / MCP fields round-trip through ProfileStore")
+
+
+def test_mcp_server_as_dict_flattens_extra_into_top_level() -> None:
+    """``McpServer.as_dict()`` merges ``extra`` at the top level so the
+    resulting dict matches Claude Code's ``.mcp.json`` schema."""
+    from src.profiles import McpServer
+
+    srv = McpServer(
+        name="srv",
+        transport="http",
+        url="https://example.com/mcp",
+        extra={"headers": {"X-Foo": "bar"}, "oauthClientId": "client-abc"},
+    )
+    out = srv.as_dict()
+    # Modelled fields present.
+    assert out["type"] == "http"
+    assert out["url"] == "https://example.com/mcp"
+    # ``extra`` is flattened — NOT nested.
+    assert out["headers"] == {"X-Foo": "bar"}
+    assert out["oauthClientId"] == "client-abc"
+    assert "extra" not in out
+    print("✓ McpServer.as_dict flattens extra into top-level JSON")
+
+
+def test_write_profile_config_emits_plugin_and_mcp_files(tmp_path) -> None:
+    """``write_profile_config`` writes ``.mcp.json`` and the three
+    ``plugins/*.json`` files when the corresponding profile fields
+    are populated. ``settings.json`` also gets ``enabledPlugins``.
+
+    Files are skipped when the corresponding field is empty.
+    """
+    from src.profiles import (
+        ClaudeProfile,
+        InstalledPlugin,
+        MarketplaceSource,
+        McpServer,
+    )
+    from src.profiles.config_dir import write_profile_config
+
+    p = ClaudeProfile(
+        name="P",
+        slug="p",
+        enabled_plugins={"foo@bar": True},
+        marketplaces={"bar": MarketplaceSource(source="github", repo="x/y")},
+        installed_plugins={
+            "foo@bar": InstalledPlugin(
+                name="foo@bar", version="1.0", install_path="/x"
+            )
+        },
+        blocked_plugins=["evil@bar"],
+        mcp_servers={
+            "srv": McpServer(
+                name="srv", transport="stdio", command="/bin/x"
+            )
+        },
+    )
+    config_dir = write_profile_config(p, tmp_path)
+    # settings.json contains enabledPlugins.
+    settings = json.loads((config_dir / "settings.json").read_text())
+    assert settings["enabledPlugins"] == {"foo@bar": True}
+    # .mcp.json contains mcpServers.
+    mcp = json.loads((config_dir / ".mcp.json").read_text())
+    assert mcp["mcpServers"]["srv"]["command"] == "/bin/x"
+    # plugins/{installed,known,blocklist}.json all present.
+    installed = json.loads(
+        (config_dir / "plugins" / "installed_plugins.json").read_text()
+    )
+    assert installed["version"] == 2
+    assert "foo@bar" in installed["plugins"]
+    known = json.loads(
+        (config_dir / "plugins" / "known_marketplaces.json").read_text()
+    )
+    assert known["bar"]["source"]["repo"] == "x/y"
+    block = json.loads(
+        (config_dir / "plugins" / "blocklist.json").read_text()
+    )
+    assert block["plugins"] == ["evil@bar"]
+    print("✓ write_profile_config emits plugin and MCP files")
+
+
+def test_write_profile_config_omits_unused_plugin_files(tmp_path) -> None:
+    """If the profile has no plugin / MCP fields, the
+    corresponding files are *not* written — keeps the directory
+    clean for the common case."""
+    from src.profiles import ClaudeProfile
+    from src.profiles.config_dir import write_profile_config
+
+    p = ClaudeProfile(name="P", slug="p")
+    config_dir = write_profile_config(p, tmp_path)
+    assert not (config_dir / ".mcp.json").exists()
+    assert not (config_dir / "plugins" / "installed_plugins.json").exists()
+    assert not (config_dir / "plugins" / "known_marketplaces.json").exists()
+    assert not (config_dir / "plugins" / "blocklist.json").exists()
+    # settings.json still gets written, but without enabledPlugins.
+    settings = json.loads((config_dir / "settings.json").read_text())
+    assert "enabledPlugins" not in settings
+    print("✓ write_profile_config skips empty plugin / MCP files")
+
+
+# ---- Plugins / MCP UI integration (added July 2026) -----------------------
+
+
+def test_plugins_tab_populates_from_profile() -> None:
+    """The four Plugins-tab sections reflect the profile's stored
+    plugin / marketplace / blocked state on populate.
+
+    The discovery tree starts empty (no auto-fetch); the user must
+    click "Refresh marketplaces" to populate it.
+    """
+    from src.profiles import (
+        ClaudeProfile,
+        InstalledPlugin,
+        MarketplaceSource,
+        ProfileStore,
+    )
+    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+
+    _qapp()
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    default = store.ensure_default()
+    p = ClaudeProfile(
+        name="P",
+        slug="p",
+        enabled_plugins={"foo@bar": True},
+        marketplaces={"bar": MarketplaceSource(source="github", repo="x/y")},
+        installed_plugins={
+            "foo@bar": InstalledPlugin(name="foo@bar", version="1.0")
+        },
+        blocked_plugins=["evil@bar"],
+    )
+    dlg = ProfileEditorDialog(p, credential_store=store.credential_store)
+    try:
+        # Enabled plugins table has one row.
+        assert dlg.plugins_enabled_table.rowCount() == 1
+        ref_item = dlg.plugins_enabled_table.item(0, 0)
+        assert ref_item.text() == "foo@bar"
+        # Marketplaces table has one row.
+        assert dlg.marketplaces_table.rowCount() == 1
+        assert dlg.marketplaces_table.item(0, 0).text() == "bar"
+        # Blocklist list widget has one entry.
+        assert dlg.plugins_blocked_list.count() == 1
+        assert dlg.plugins_blocked_list.item(0).text() == "evil@bar"
+        # Discovery tree is empty (user must click Refresh).
+        assert dlg.plugins_tree.topLevelItemCount() == 0
+    finally:
+        dlg.deleteLater()
+    print("✓ Plugins tab populates from profile state")
+
+
+def test_mcp_servers_tab_adds_and_removes_servers() -> None:
+    """The MCP Servers tab supports programmatic add / remove and
+    exposes the resulting servers via ``_collect_mcp_servers``."""
+    from src.profiles import ClaudeProfile, McpServer, ProfileStore
+    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+
+    _qapp()
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    default = store.ensure_default()
+    p = ClaudeProfile(
+        name="P",
+        slug="p",
+        mcp_servers={
+            "stdio-srv": McpServer(
+                name="stdio-srv",
+                transport="stdio",
+                command="/bin/x",
+                args=("--foo",),
+            ),
+        },
+    )
+    dlg = ProfileEditorDialog(p, credential_store=store.credential_store)
+    try:
+        # One row populated.
+        assert dlg.mcp_servers_table.rowCount() == 1
+        # Programmatically add another.
+        dlg._on_mcp_server_add()
+        assert dlg.mcp_servers_table.rowCount() == 2
+        # Collect returns both, keyed by name.
+        collected = dlg._collect_mcp_servers()
+        assert "stdio-srv" in collected
+        assert any(name.startswith("server-") for name in collected)
+        # The stdio server round-trips its command + args.
+        stdio = collected["stdio-srv"]
+        assert stdio.command == "/bin/x"
+        assert stdio.args == ("--foo",)
+    finally:
+        dlg.deleteLater()
+    print("✓ MCP Servers tab supports add + remove + collect")
+
+
+def test_mcp_servers_tab_validates_extra_json() -> None:
+    """Invalid JSON in the Extra field disables Apply and surfaces a
+    status message rather than locking the user out."""
+    from src.profiles import ClaudeProfile, McpServer, ProfileStore
+    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+
+    _qapp()
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    p = ClaudeProfile(
+        name="P",
+        slug="p",
+        mcp_servers={"srv": McpServer(name="srv", transport="http")},
+    )
+    dlg = ProfileEditorDialog(p, credential_store=store.credential_store)
+    try:
+        dlg.mcp_servers_table.selectRow(0)
+        # Type invalid JSON into the Extra textarea.
+        dlg.mcp_extra_edit.setPlainText("{ not json")
+        # Apply state should show the parse error.
+        assert "Invalid JSON" in dlg.mcp_form_status.text()
+        assert dlg.mcp_apply_btn.isEnabled() is False
+        # Revert button still works to clear the error.
+        dlg._on_mcp_server_revert()
+        assert "Invalid JSON" not in dlg.mcp_form_status.text()
+    finally:
+        dlg.deleteLater()
+    print("✓ MCP Servers tab validates Extra JSON")
 
 
 # ---- Always-Default contract ----------------------------------------------
@@ -992,9 +1290,10 @@ def test_existing_env_keys_marks_only_known_standard_vars() -> None:
 
 
 def test_profile_editor_uses_a_qtabwidget_with_six_tabs() -> None:
-    """The dialog body is a ``QTabWidget`` with six tabs in this
-    order: General, Model Endpoints, API Key, Environment Variables,
-    Settings.JSON, Subagents."""
+    """The dialog body is a ``QTabWidget`` with nine tabs in this
+    order: General, Model Configuration, Providers, API Keys,
+    Environment Variables, Plugins, MCP Servers, Settings.JSON,
+    Subagents."""
     from PySide6.QtWidgets import QTabWidget
     from src.profiles import ProfileStore
     from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
@@ -1009,8 +1308,8 @@ def test_profile_editor_uses_a_qtabwidget_with_six_tabs() -> None:
         assert isinstance(dlg.tabs, QTabWidget), (
             f"self.tabs should be a QTabWidget, got {type(dlg.tabs).__name__}"
         )
-        assert dlg.tabs.count() == 7, (
-            f"expected 7 tabs, got {dlg.tabs.count()}"
+        assert dlg.tabs.count() == 9, (
+            f"expected 9 tabs, got {dlg.tabs.count()}"
         )
         labels = [dlg.tabs.tabText(i) for i in range(dlg.tabs.count())]
         expected = [
@@ -1019,6 +1318,8 @@ def test_profile_editor_uses_a_qtabwidget_with_six_tabs() -> None:
             "Providers",
             "API Keys",
             "Environment Variables",
+            "Plugins",
+            "MCP Servers",
             "Settings.JSON",
             "Subagents",
         ]
@@ -1027,7 +1328,7 @@ def test_profile_editor_uses_a_qtabwidget_with_six_tabs() -> None:
         )
     finally:
         dlg.deleteLater()
-    print("✓ ProfileEditorDialog is a 7-tab QTabWidget in expected order")
+    print("✓ ProfileEditorDialog is a 9-tab QTabWidget in expected order")
 
 
 def test_profile_editor_widgets_live_in_their_expected_tabs() -> None:
@@ -1057,6 +1358,11 @@ def test_profile_editor_widgets_live_in_their_expected_tabs() -> None:
             "keys_table": "API Keys",
             "key_value_edit": "API Keys",
             "env_table": "Environment Variables",
+            "plugins_enabled_table": "Plugins",
+            "marketplaces_table": "Plugins",
+            "plugins_tree": "Plugins",
+            "plugins_blocked_list": "Plugins",
+            "mcp_servers_table": "MCP Servers",
             "settings_edit": "Settings.JSON",
             "subagent_list": "Subagents",
         }

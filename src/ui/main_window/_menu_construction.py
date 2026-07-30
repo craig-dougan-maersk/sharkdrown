@@ -116,6 +116,17 @@ class MenuConstructionMixin:
             self._ui_font_family_group.addAction(action)
             ui_font_menu.addAction(action)
 
+        view_menu.addSeparator()
+
+        # World clocks — opens the manager dialog (add / edit / remove
+        # entries; master enable toggle). The dialog persists to
+        # ``QSettings``; ``_open_clocks_dialog`` calls
+        # ``clock_toolbar.refresh()`` so the bottom-left widget picks
+        # the changes up immediately.
+        self.action_clocks = QAction("&Clocks…", self)
+        self.action_clocks.triggered.connect(self._open_clocks_dialog)
+        view_menu.addAction(self.action_clocks)
+
     def _apply_theme(self, mode) -> None:
         from src.ui.theme import ThemeMode
 
@@ -212,12 +223,43 @@ class MenuConstructionMixin:
             font.setFamily(family)
         app.setFont(font)
 
+    def _open_clocks_dialog(self) -> None:
+        """Slot for View → Clocks…. Opens the manager dialog and, on
+        accept, refreshes the bottom-left toolbar widget so the user
+        sees changes immediately (no relaunch required).
+
+        The dialog persists to ``QSettings`` on accept; the toolbar's
+        :meth:`refresh` re-reads from there rather than receiving the
+        new collection directly. That's intentional — a future second
+        toolbar (or a config-import flow) can call ``refresh`` from a
+        single source of truth without round-tripping through the
+        dialog.
+        """
+        from src.ui.clocks import ClocksDialog
+
+        if ClocksDialog.open_dialog(self):
+            if hasattr(self, "clock_toolbar"):
+                self.clock_toolbar.refresh()
+            self.status.showMessage("World clocks updated.", 3000)
+
     def _init_status_bar(self) -> None:
         """Initialize the status bar."""
         from PySide6.QtCore import QSettings
 
         self.status = self.statusBar()
         self.status.showMessage("Ready")
+
+        # World-clock toolbar — bottom-LEFT of the status bar (vs the
+        # ``addPermanentWidget`` cluster on the right). ``addWidget``
+        # is the non-permanent slot; ``addPermanentWidget`` is for
+        # the right side. Hidden when no clocks are configured or the
+        # master toggle is off, so a fresh install looks the same as
+        # before this feature was added.
+        from src.ui.clocks import ClockToolbarWidget
+
+        self.clock_toolbar = ClockToolbarWidget()
+        self.clock_toolbar.refresh()
+        self.status.addWidget(self.clock_toolbar)
 
         # Session logging toggle — appears on the left of the permanent area.
         settings = QSettings("SharkDrown", "App")

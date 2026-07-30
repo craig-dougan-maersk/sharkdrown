@@ -99,6 +99,14 @@ def _build_settings(profile: ClaudeProfile) -> dict:
     The editor UI discourages setting these in the raw settings JSON.
     """
     out: dict = dict(profile.claude_settings)
+    # ``enabled_plugins`` → ``settings.json:enabledPlugins``. We
+    # merge it the same way as ``model`` / ``availableModels``: the
+    # profile's typed field wins over a stray ``claude_settings``
+    # entry, so the dialog's UI is the authoritative source.
+    if profile.enabled_plugins:
+        out["enabledPlugins"] = {
+            str(k): bool(v) for k, v in profile.enabled_plugins.items()
+        }
     aliases_flat: list[str] = []
     for endpoint in profile.model_endpoints.values():
         # Endpoints may be legacy bare-URL strings (older profiles
@@ -141,12 +149,69 @@ def write_profile_config(profile: ClaudeProfile, base_dir: Path) -> Path:
     config_dir.mkdir(parents=True, exist_ok=True)
     agents_dir = config_dir / "agents"
     agents_dir.mkdir(exist_ok=True)
+    plugins_dir = config_dir / "plugins"
+    plugins_dir.mkdir(exist_ok=True)
 
     settings = _build_settings(profile)
     (config_dir / "settings.json").write_text(
         json.dumps(settings, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+    # ---- MCP servers (``<config>/.mcp.json``) ----------------------------
+    # Only write the file when there is at least one server; Claude Code
+    # treats a missing file the same as an empty config, and a missing
+    # file is easier to round-trip cleanly through profile export /
+    # import. ``mcpServers`` is the only key Claude Code reads from
+    # this file.
+    if profile.mcp_servers:
+        mcp_payload: dict = {
+            "mcpServers": {
+                name: srv.as_dict()
+                for name, srv in profile.mcp_servers.items()
+            },
+        }
+        (config_dir / ".mcp.json").write_text(
+            json.dumps(mcp_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    # ---- Plugin marketplace / install / blocklist (``plugins/``) --------
+    # All three files are independent of each other; missing fields on
+    # the profile are skipped so we don't litter the directory with
+    # empty files when the user hasn't configured plugins yet.
+    if profile.installed_plugins:
+        installed_payload: dict = {
+            "version": 2,
+            "plugins": {
+                name: [ip.as_dict()]
+                for name, ip in profile.installed_plugins.items()
+            },
+        }
+        (plugins_dir / "installed_plugins.json").write_text(
+            json.dumps(installed_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    if profile.marketplaces:
+        mk_payload: dict = {}
+        for name, src in profile.marketplaces.items():
+            entry: dict = {"source": src.as_dict()}
+            if src.install_location:
+                entry["installLocation"] = src.install_location
+            mk_payload[name] = entry
+        (plugins_dir / "known_marketplaces.json").write_text(
+            json.dumps(mk_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    if profile.blocked_plugins:
+        (plugins_dir / "blocklist.json").write_text(
+            json.dumps(
+                {"plugins": [str(p) for p in profile.blocked_plugins]},
+                indent=2,
+                sort_keys=True,
+            ) + "\n",
+            encoding="utf-8",
+        )
 
     # Subagents: write one .md per entry, slugified.
     wanted_slugs: set[str] = set()

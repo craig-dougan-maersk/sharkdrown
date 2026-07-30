@@ -124,6 +124,13 @@ def test_keymap_bytes() -> None:
     assert key_to_bytes(Qt.Key_Backspace) == b"\x7f"
     # Tab → TAB
     assert key_to_bytes(Qt.Key_Tab) == b"\t"
+    # Shift+Tab → xterm back-tab (CSI Z), NOT a plain TAB. The Claude
+    # Code TUI uses CSI Z to cycle permission modes; sending \t would
+    # just indent the input prompt.
+    assert key_to_bytes(Qt.Key_Backtab, modifiers=Qt.ShiftModifier) == b"\x1b[Z"
+    assert (
+        key_to_bytes(Qt.Key_Tab, modifiers=Qt.ShiftModifier, text="\t") == b"\x1b[Z"
+    )
     # Plain printable text
     assert key_to_bytes(Qt.Key_A, text="a") == b"a"
     # Modifier-only (Shift alone) → None
@@ -1094,6 +1101,127 @@ def test_repaint_scrolls_to_max_when_content_overflows() -> None:
     print("✓ repaint scrolls to keep the active line visible when content overflows")
 
 
+def test_repaint_scrolls_to_max_when_cursor_is_above_last_row() -> None:
+    """Claude Code's TUI positions the cursor a few rows above the bottom
+    (above its status bar / latest output). ``ensureCursorVisible`` alone
+    won't scroll to the bottom in that case — the cursor is already
+    visible, so it does nothing — and the last few rows of output end
+    up below the viewport. The fix forces ``setValue(maximum)`` when
+    the cursor is in the bottom viewport-height of the document.
+
+    Regression test for the "active line reaches the bottom, last five
+    lines aren't viewable until the window is scrolled all the way
+    down" symptom.
+    """
+    _qapp()
+    from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+    view = TerminalSessionView(argv=["/bin/cat"])
+    view.resize(800, 600)
+    view.show()
+    _spin(50)
+    view.text_edit.viewport().resize(view.text_edit.size())
+    view.start()
+    _spin(50)
+    view._recompute_size()
+
+    try:
+        # Fill the screen, then position the cursor a few rows above
+        # the bottom — the Claude Code TUI shape.
+        for i in range(80):
+            view._stream.feed(f"Output line {i:02d}\n".encode())
+        # Move the cursor up 5 rows (ESC[<n>A), mimicking a TUI that
+        # positions its prompt above its status bar.
+        view._stream.feed(b"\x1b[5A")
+        view._repaint()
+        _spin(50)
+
+        sb = view.text_edit.verticalScrollBar()
+        vp_h = view.text_edit.viewport().height()
+        # The bottom of the document must be visible — the status-bar
+        # rows below the cursor are the whole point of this fix.
+        assert sb.maximum() > 0, (
+            f"expected scrollbar maximum > 0, got {sb.maximum()}"
+        )
+        assert sb.value() >= sb.maximum() - 1, (
+            f"cursor above last row: scrollbar should snap to maximum "
+            f"(value >= max-1), got value={sb.value()} max={sb.maximum()} "
+            f"— last rows of output are below the viewport"
+        )
+        visible_bottom_px = sb.value() + vp_h
+        assert visible_bottom_px >= sb.maximum() + vp_h - 5, (
+            f"bottom of document not visible: value={sb.value()} "
+            f"max={sb.maximum()} vp_h={vp_h}"
+        )
+    finally:
+        view.shutdown()
+    print("✓ repaint scrolls to max when cursor is positioned above the last row (TUI case)")
+
+
+def test_repaint_does_not_snap_to_max_when_no_scrollback() -> None:
+    """A fresh Claude Code session has no scrollback yet — the TUI
+    header, prompt, and status bar all live on the live screen, and
+    the cursor sits above the status bar. Snapping the scrollbar to
+    ``maximum`` there scrolls the TUI header off the top of the
+    viewport.
+
+    Regression test for the "top of the TUI window is off the top of
+    the screen by 4-5 lines when starting a Claude Code session"
+    symptom. The snap-to-max fix for the active-session case must
+    NOT fire when ``history_lines == 0`` — the ``ensureCursorVisible``
+    result (cursor in view near the top) is the correct behavior.
+    """
+    _qapp()
+    from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+    view = TerminalSessionView(argv=["/bin/cat"])
+    view.resize(800, 600)
+    view.show()
+    _spin(50)
+    view.text_edit.viewport().resize(view.text_edit.size())
+    view.start()
+    _spin(50)
+    view._recompute_size()
+
+    try:
+        # Draw a Claude-Code-shaped TUI using absolute cursor
+        # positioning (no newlines, so no scrollback accumulates):
+        #   row 0:  "╭─ Claude Code ──────────────╮"   (header)
+        #   row 5:  "❯ "                          (prompt — cursor here)
+        #   row 22: "─────────────────────────────"   (status bar)
+        #   row 23: "ctrl-c to interrupt"         (footer)
+        # This mimics the exact startup shape: cursor parked above
+        # the status bar, no scrollback yet.
+        header = b"\x1b[1;1H" + b"\xe2\x95\xad\xe2\x94\x80 Claude Code "
+        header += b"\xe2\x94\x80" * 20 + b"\xe2\x95\xae"
+        status = b"\x1b[23;1H" + b"\xe2\x94\x80" * 40
+        footer = b"\x1b[24;1Hctrl-c to interrupt"
+        prompt = b"\x1b[6;1H\xe2\x9d\xaf "
+        view._stream.feed(header + status + footer + prompt)
+        view._repaint()
+        _spin(50)
+
+        sb = view.text_edit.verticalScrollBar()
+        history_lines = len(view._screen.history.top) if hasattr(
+            view._screen, "history"
+        ) else 0
+        assert history_lines == 0, (
+            f"sanity: expected no scrollback at startup, got "
+            f"history_lines={history_lines}"
+        )
+        # With no scrollback, the snap-to-max must NOT fire — the
+        # TUI header (top of the live screen) must be visible.
+        assert sb.value() <= 1, (
+            f"fresh session: scroll position should stay near the top "
+            f"(value <= 1) so the TUI header is visible, got "
+            f"value={sb.value()} max={sb.maximum()} — top of TUI is "
+            f"scrolled off the top of the viewport"
+        )
+    finally:
+        view.shutdown()
+    print("✓ repaint does not snap to max when there is no scrollback (startup TUI)")
+
+
 def test_repaint_scrolls_to_top_for_new_session() -> None:
     """A brand-new session has the cursor at row 0 (top of document). The
     auto-scroll must put the cursor in view, not land on the blank rows
@@ -2035,6 +2163,8 @@ def main() -> None:
         test_real_mouse_event_via_viewport_sets_cell_selection,
         test_pixel_to_cell_uses_viewport_size_not_widget_size,
         test_repaint_scrolls_to_max_when_content_overflows,
+        test_repaint_scrolls_to_max_when_cursor_is_above_last_row,
+        test_repaint_does_not_snap_to_max_when_no_scrollback,
         test_repaint_scrolls_to_top_for_new_session,
         test_repaint_clears_user_scrolled_up_when_at_bottom,
     ]

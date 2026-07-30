@@ -202,6 +202,12 @@ class MainWindow(
     def closeEvent(self, event) -> None:  # type: ignore[override]
         """Stop the proxy thread cleanly before the window closes."""
         thread = self.proxy_thread
+        # Stop the clock toolbar's per-second ticker so it doesn't
+        # outlive the window. ``stop_timer`` is idempotent; safe to
+        # call whether the toolbar exists or not.
+        clock_toolbar = getattr(self, "clock_toolbar", None)
+        if clock_toolbar is not None and hasattr(clock_toolbar, "stop_timer"):
+            clock_toolbar.stop_timer()
         if self.activity_tile is not None:
             self.activity_tile.stop()
         if self.terminal_container is not None:

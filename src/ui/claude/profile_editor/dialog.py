@@ -37,6 +37,8 @@ from src.ui.claude.profile_editor._providers_tab import ProvidersTabMixin
 from src.ui.claude.profile_editor._api_keys_tab import ApiKeysTabMixin
 from src.ui.claude.profile_editor._env_vars_tab import EnvVarsTabMixin
 from src.ui.claude.profile_editor._settings_subagents_tab import SettingsSubagentsTabMixin
+from src.ui.claude.profile_editor._plugins_tab import PluginsTabMixin
+from src.ui.claude.profile_editor._mcp_servers_tab import McpServersTabMixin
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -74,6 +76,8 @@ class ProfileEditorDialog(
     ApiKeysTabMixin,
     EnvVarsTabMixin,
     SettingsSubagentsTabMixin,
+    PluginsTabMixin,
+    McpServersTabMixin,
     QDialog,
 ):
     """Edit one :class:`ClaudeProfile` plus its credential value.
@@ -127,6 +131,8 @@ class ProfileEditorDialog(
         self._build_providers_tab()
         self._build_api_key_tab()
         self._build_env_vars_tab()
+        self._build_plugins_tab()
+        self._build_mcp_servers_tab()
         self._build_settings_tab()
         self._build_subagents_tab()
 
@@ -175,6 +181,8 @@ class ProfileEditorDialog(
             if self.endpoints_table.rowCount() == 0:
                 self._append_endpoint_row("", None)
             _populate_pairs(self.env_table, list(self._profile.env_vars.items()))
+            self._populate_plugins_tab()
+            self._populate_mcp_servers_table()
             try:
                 settings_text = json.dumps(
                     self._profile.claude_settings, indent=2, sort_keys=True
@@ -424,6 +432,13 @@ class ProfileEditorDialog(
 
         # Env vars
         self._profile.env_vars = dict(_table_pairs(self.env_table))
+
+        # MCP servers — the table is rebuilt into ``mcp_servers`` so
+        # the on-disk ``.mcp.json`` mirrors exactly what the user sees.
+        # ``enabled_plugins`` / ``marketplaces`` / ``blocked_plugins``
+        # are mutated in-place by their tab handlers and need no
+        # re-gather here.
+        self._profile.mcp_servers = self._collect_mcp_servers()
 
         # Claude settings (raw JSON)
         raw = self.settings_edit.toPlainText().strip()

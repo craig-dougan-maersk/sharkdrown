@@ -82,7 +82,12 @@ def _default_providers(settings: Settings) -> dict[str, Provider]:
                 # if they want a different name.
                 continue
             providers[prov_name] = AnthropicProvider(
-                base_url=prov_cfg.url,
+                # ``prov_cfg.url`` is a Pydantic ``HttpUrl`` (see
+                # ``ProviderCfg``); ``AnthropicProvider.__init__`` expects a
+                # plain ``str`` and calls ``.rstrip("/")`` on it. Coerce at
+                # the boundary, matching the built-in ``anthropic`` /
+                # ``openai`` providers above.
+                base_url=str(prov_cfg.url),
                 timeout_seconds=read_timeout,
             )
 

@@ -159,7 +159,12 @@ def _resolve_request_target(
     if provider is None:
         return (None, None)
     return (
-        provider.url or None,
+        # ``provider.url`` is a Pydantic ``HttpUrl`` (see ``ProviderCfg``).
+        # The downstream consumer (``AnthropicProvider.forward`` →
+        # ``httpx.Request``) expects a plain ``str``; coerce at the boundary
+        # rather than relying on httpx's implicit ``__str__`` coercion, which
+        # is undocumented and brittle across httpx/pydantic versions.
+        str(provider.url) if provider.url else None,
         provider.api_key.get_secret_value() if provider.api_key else None,
     )
 

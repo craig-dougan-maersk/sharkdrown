@@ -33,7 +33,7 @@ from src.profiles.env_var_catalog import (
     sections as _catalog_sections,
     standard_env_vars as _standard_env_vars,
 )
-from src.profiles.models import Subagent
+from src.profiles.models import MarketplaceSource, Subagent
 
 
 # ---- env vars picker -------------------------------------------------------
@@ -201,6 +201,147 @@ class _SubagentEditorDialog(QDialog):
             tools=tools,
             model=model,
         )
+
+
+# ---- marketplace editor ----------------------------------------------------
+
+
+class _MarketplaceEditorDialog(QDialog):
+    """Editor for one :class:`MarketplaceSource`.
+
+    Mirrors the four ``source`` kinds Claude Code accepts
+    (``github``, ``git``, ``url``, ``git-subdir``) by showing only
+    the sub-fields relevant to the chosen kind. Validation on accept
+    refuses to OK if the kind's required field is empty.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        source: MarketplaceSource | None = None,
+        *,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Marketplace — {name or 'New'}")
+        self.resize(560, 360)
+        self._initial_name = name
+        layout = QFormLayout(self)
+
+        self.name_edit = QLineEdit(name)
+        self.name_edit.setPlaceholderText("e.g. claude-plugins-official")
+        layout.addRow("Marketplace name:", self.name_edit)
+
+        self.source_kind_combo = QComboBox()
+        for kind in ("github", "git", "url", "git-subdir"):
+            self.source_kind_combo.addItem(kind)
+        # Default new entries to github — it's the most common kind
+        # and matches the pattern in ``known_marketplaces.json`` we
+        # see on real installs.
+        self.source_kind_combo.setCurrentText(
+            source.source if source else "github"
+        )
+        self.source_kind_combo.currentTextChanged.connect(
+            self._on_kind_changed
+        )
+        layout.addRow("Source kind:", self.source_kind_combo)
+
+        self.repo_edit = QLineEdit(source.repo if source else "")
+        self.repo_edit.setPlaceholderText("owner/repo, e.g. anthropics/claude-plugins-official")
+        layout.addRow("Repo (github):", self.repo_edit)
+
+        self.url_edit = QLineEdit(source.url if source else "")
+        self.url_edit.setPlaceholderText("https://example.com/repo.git")
+        layout.addRow("URL (git / url / git-subdir):", self.url_edit)
+
+        self.path_edit = QLineEdit(source.path if source else "")
+        self.path_edit.setPlaceholderText("plugins/awesome")
+        layout.addRow("Subdir path (git-subdir):", self.path_edit)
+
+        self.ref_edit = QLineEdit(source.ref if source else "")
+        self.ref_edit.setPlaceholderText("main, v1.2.3, …")
+        layout.addRow("Ref (optional):", self.ref_edit)
+
+        self.sha_edit = QLineEdit(source.sha if source else "")
+        self.sha_edit.setPlaceholderText("40-char commit SHA")
+        layout.addRow("SHA (optional):", self.sha_edit)
+
+        self.install_location_edit = QLineEdit(
+            source.install_location if source and source.install_location else ""
+        )
+        self.install_location_edit.setPlaceholderText(
+            "(auto — ~/.claude/plugins/marketplaces/<name>)"
+        )
+        layout.addRow("Install location (optional):", self.install_location_edit)
+
+        self._on_kind_changed(self.source_kind_combo.currentText())
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.button_box.accepted.connect(self._on_accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addRow(self.button_box)
+
+    def _on_kind_changed(self, kind: str) -> None:
+        """Show only the sub-fields relevant to the chosen source kind.
+
+        ``github`` → repo. ``git`` / ``url`` → url. ``git-subdir`` →
+        url + path. ``ref`` + ``sha`` are always visible (they apply
+        to all kinds). ``install_location`` is always visible.
+        """
+        self.repo_edit.setVisible(kind == "github")
+        self.url_edit.setVisible(kind in ("git", "url", "git-subdir"))
+        self.path_edit.setVisible(kind == "git-subdir")
+
+    def _on_accept(self) -> None:
+        kind = self.source_kind_combo.currentText()
+        if kind == "github":
+            if not self.repo_edit.text().strip():
+                QMessageBox.warning(
+                    self,
+                    "Missing repo",
+                    "GitHub marketplaces require a 'owner/repo' in the Repo field.",
+                )
+                return
+        elif kind in ("git", "url", "git-subdir"):
+            if not self.url_edit.text().strip():
+                QMessageBox.warning(
+                    self,
+                    "Missing URL",
+                    f"{kind} marketplaces require a URL.",
+                )
+                return
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(
+                self,
+                "Missing name",
+                "Marketplace name cannot be empty.",
+            )
+            return
+        self.accept()
+
+    def to_source(self) -> tuple[str, MarketplaceSource]:
+        """Return ``(name, source)`` ready for insertion into the profile.
+
+        Empty optional fields become ``None`` so the serialiser drops
+        them from the on-disk JSON.
+        """
+        name = self.name_edit.text().strip()
+        kind = self.source_kind_combo.currentText()
+        src = MarketplaceSource(
+            source=kind,
+            repo=(self.repo_edit.text().strip() or None)
+            if kind == "github" else None,
+            url=(self.url_edit.text().strip() or None)
+            if kind in ("git", "url", "git-subdir") else None,
+            path=(self.path_edit.text().strip() or None)
+            if kind == "git-subdir" else None,
+            ref=(self.ref_edit.text().strip() or None),
+            sha=(self.sha_edit.text().strip() or None),
+            install_location=(self.install_location_edit.text().strip() or None),
+        )
+        return name, src
 
 
 # ---- manage profiles dialog ------------------------------------------------

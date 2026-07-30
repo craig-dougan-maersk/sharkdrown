@@ -8,6 +8,11 @@ Public surface
 - :class:`Provider` — a named upstream service (e.g. "Anthropic",
   "MiniMax") and its base URL
 - :class:`Subagent` — one ``agents/<name>.md`` entry's worth of frontmatter
+- :class:`MarketplaceSource` — one Claude Code plugin marketplace
+  (matches ``known_marketplaces.json[name]`` shape)
+- :class:`InstalledPlugin` — one entry in the per-profile installed
+  plugins registry (``installed_plugins.json``)
+- :class:`McpServer` — one entry in ``.mcp.json``'s ``mcpServers`` map
 - :func:`slugify` — derive a filesystem-safe slug from a profile name
 - :class:`CredentialStore` — read/write API keys (chmod 600 JSON)
 - :class:`ProfileStore` — read/write profiles (chmod 600 JSON) +
@@ -25,6 +30,9 @@ from src.profiles.env_builder import (
 )
 from src.profiles.models import (
     ClaudeProfile,
+    InstalledPlugin,
+    MarketplaceSource,
+    McpServer,
     ModelEndpoint,
     Provider,
     Subagent,
@@ -42,6 +50,9 @@ __all__ = [
     "CredentialStore",
     "DEFAULT_PROFILE_NAME",
     "INFRA_ENV_VARS",
+    "InstalledPlugin",
+    "MarketplaceSource",
+    "McpServer",
     "ModelEndpoint",
     "ProfileStore",
     "Provider",
