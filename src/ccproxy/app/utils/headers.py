@@ -19,6 +19,8 @@ SENSITIVE_HEADER_TOKENS: tuple[str, ...] = (
     "anthropic-api-key",
     "openai-api-key",
     "bearer",
+    "cookie",
+    "x-auth-token",
 )
 
 

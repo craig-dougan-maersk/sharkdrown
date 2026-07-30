@@ -18,7 +18,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
 
-def test_proxy_config_roundtrip_model_endpoints() -> None:
+def test_proxy_config_roundtrip_model_endpoints(tmp_path) -> None:
     """ProxyConfig should persist model_endpoints via QSettings."""
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
@@ -32,7 +32,7 @@ def test_proxy_config_roundtrip_model_endpoints() -> None:
     QSettings.setPath(
         QSettings.Format.IniFormat,
         QSettings.Scope.UserScope,
-        str(Path("/tmp/sharkdrown-endpoint-test")),
+        str(tmp_path / "settings"),
     )
     QSettings().clear()
 

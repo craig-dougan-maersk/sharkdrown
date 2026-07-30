@@ -226,5 +226,11 @@ def main() -> None:
     print("\n✅ End-to-end test passed!")
 
 
+def test_proxy_start_stop_cycle() -> None:
+    """Pytest entry-point — delegates to main() so the E2E scenario runs
+    under normal pytest collection as well as direct execution."""
+    main()
+
+
 if __name__ == "__main__":
     main()

@@ -28,6 +28,7 @@ def _make_storage(tmp_path: Path):
     from ccproxy.app.db.schema import create_tables
     from ccproxy.app.db.storage import StorageService
 
+    tmp_path.mkdir(parents=True, exist_ok=True)
     db_path = tmp_path / "test.db"
 
     async def setup() -> StorageService:
@@ -38,13 +39,13 @@ def _make_storage(tmp_path: Path):
     return setup, db_path
 
 
-def test_non_streaming_token_extraction() -> None:
+def test_non_streaming_token_extraction(tmp_path: Path) -> None:
     """Extract usage from a non-streaming Anthropic response body."""
     from ccproxy.app.db.storage import StorageService
     from ccproxy.app.models.storage import RequestLog, ResponseLog
     from datetime import UTC, datetime
 
-    setup, db_path = _make_storage(Path(tempfile.mkdtemp()))
+    setup, db_path = _make_storage(tmp_path)
     storage = asyncio.run(setup())
 
     async def go() -> None:
@@ -89,13 +90,13 @@ def test_non_streaming_token_extraction() -> None:
     print("✓ non-streaming: input_tokens=100, output_tokens=50, total=150")
 
 
-def test_streaming_token_extraction() -> None:
+def test_streaming_token_extraction(tmp_path: Path) -> None:
     """Extract usage from SSE message_start + message_delta events."""
     from ccproxy.app.db.storage import StorageService
     from ccproxy.app.models.storage import RequestLog, ResponseLog
     from datetime import UTC, datetime
 
-    setup, db_path = _make_storage(Path(tempfile.mkdtemp()))
+    setup, db_path = _make_storage(tmp_path / "s")
     storage = asyncio.run(setup())
 
     async def go() -> None:
@@ -138,13 +139,13 @@ def test_streaming_token_extraction() -> None:
     print("✓ streaming: input_tokens=200 (from message_start), output_tokens=75 (from message_delta)")
 
 
-def test_missing_usage_does_not_crash() -> None:
+def test_missing_usage_does_not_crash(tmp_path: Path) -> None:
     """Responses without usage info should leave token columns None."""
     from ccproxy.app.db.storage import StorageService
     from ccproxy.app.models.storage import RequestLog, ResponseLog
     from datetime import UTC, datetime
 
-    setup, db_path = _make_storage(Path(tempfile.mkdtemp()))
+    setup, db_path = _make_storage(tmp_path / "m")
     storage = asyncio.run(setup())
 
     async def go() -> None:
@@ -177,6 +178,7 @@ def test_missing_usage_does_not_crash() -> None:
 
 def test_template_renders_token_badge() -> None:
     """Sanity-check the Jinja template renders the token badge."""
+    from ccproxy.app.pricing import compute_cost
     from jinja2 import Environment, FileSystemLoader
 
     template_dir = (
@@ -187,6 +189,7 @@ def test_template_renders_token_badge() -> None:
         / "templates"
     )
     env = Environment(loader=FileSystemLoader(str(template_dir)))
+    env.globals["compute_cost"] = compute_cost
     tpl = env.get_template("dashboard/request_list.html")
     macros_src = (template_dir / "macros.html").read_text()
     # We don't have a real RequestLog; just render with a mock dict.

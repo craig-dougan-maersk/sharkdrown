@@ -11,23 +11,26 @@ from PySide6.QtWidgets import QApplication
 from src.ui.main_window import MainWindow
 
 
-def test_app():
+def test_app(tmp_path):
     """Test that the main window can be created."""
-    # Use an isolated QSettings store so the test never reads the user's
-    # real config (autostart would otherwise fire the proxy thread).
-    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
-    QSettings.setPath(
-        QSettings.Format.IniFormat,
-        QSettings.Scope.UserScope,
-        str(Path("/tmp/sharkdrown-test-app")),
-    )
-    QSettings().clear()
-
+    # Establish org/app identity BEFORE isolating QSettings so that
+    # QSettings().clear() targets the correct settings file.  If we set
+    # the path first, clear() runs under ("", "") and the real user plist
+    # (which may have autostart=True) remains uncleared; MainWindow then
+    # reads it and fires QTimer.singleShot(0, _start_server), hanging forever.
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
     app.setOrganizationName("Sharkdrown")
     app.setApplicationName("PandasMarkdownEditor")
+
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(
+        QSettings.Format.IniFormat,
+        QSettings.Scope.UserScope,
+        str(tmp_path / "settings"),
+    )
+    QSettings().clear()
 
     window = MainWindow()
     window.show()
@@ -77,10 +80,21 @@ def test_app():
     # being passed as ``content`` to ``_create_new_tab``. (The toolbar
     # ``tb_new`` action it used to call was removed along with the
     # toolbar — File → New is the only entry point now.)
+    #
+    # NewFileDialog.ask() calls dlg.exec() which blocks waiting for user
+    # input — in headless test runs there is no one to click OK. Patch
+    # the static method so it returns "markdown" immediately without
+    # showing a modal dialog.
+    from unittest.mock import patch
+
     initial_tabs = window.editor_tabs.count()
-    window.action_new.trigger()
-    window.action_new.trigger()
-    window.action_new.trigger()
+    with patch(
+        "src.ui.dialogs.new_file_dialog.NewFileDialog.ask",
+        return_value="markdown",
+    ):
+        window.action_new.trigger()
+        window.action_new.trigger()
+        window.action_new.trigger()
     assert window.editor_tabs.count() == initial_tabs + 3, (
         f"expected {initial_tabs + 3} tabs after 3 New clicks, "
         f"got {window.editor_tabs.count()}"

@@ -603,19 +603,6 @@ class OpenAIProvider(Provider):
         # participate in the desktop's per-profile routing).
         effective_api_key = target_api_key if target_api_key else self._api_key
         if effective_api_key:
-            # Same prefix/suffix diagnostic as AnthropicProvider:
-            # opening-key-mgmt copy-pastes often carry trailing
-            # whitespace, which OpenRouter (and others) reject with a
-            # 401 "Missing Authentication header" before the auth path
-            # even runs. Printing the key shape lets us attribute a
-            # 401 to a known prefix vs. a silently corrupted one.
-            key_prefix = effective_api_key[:4]
-            key_suffix = effective_api_key[-4:] if len(effective_api_key) > 8 else "***"
-            print(
-                f"openai forward: target_api_key prefix={key_prefix!r} "
-                f"suffix={key_suffix!r} len={len(effective_api_key)}",
-                file=sys.stderr,
-            )
             out_headers["authorization"] = f"Bearer {effective_api_key}"
         out_headers["content-type"] = "application/json"
         out_headers["accept-encoding"] = "gzip"

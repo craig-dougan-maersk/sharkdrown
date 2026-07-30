@@ -22,6 +22,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 _PROJECT_ROOT = Path(__file__).parent.parent
@@ -29,24 +31,22 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
 
-# ``QMessageBox.warning`` is a *modal* dialog. Under the offscreen
-# Qt platform plugin it blocks indefinitely waiting for a click that
-# never comes — which silently wedges the test suite whenever a
-# validation path surfaces a popup. Stub it at import time so
-# validation failures are silent (rather than fatal) and the test
-# runner still observes the post-validation state to detect the
-# regression (e.g. ``dlg._on_accept`` not raising + button
-# remaining enabled when the user wants to confirm).
 from PySide6.QtWidgets import QMessageBox
-
-_original_warning = QMessageBox.warning
 
 
 def _silent_warning(*_args, **_kwargs):
     return QMessageBox.StandardButton.Yes
 
 
-QMessageBox.warning = staticmethod(_silent_warning)
+@pytest.fixture(autouse=True)
+def _stub_qmessagebox_warning(monkeypatch):
+    """Stub QMessageBox.warning for every test in this module.
+
+    The offscreen Qt platform plugin blocks indefinitely on modal dialogs.
+    monkeypatch ensures the original is restored after each test so the
+    stub does not leak into other test files.
+    """
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(_silent_warning))
 
 
 def _qapp():

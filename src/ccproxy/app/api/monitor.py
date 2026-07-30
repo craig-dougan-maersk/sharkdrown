@@ -9,8 +9,6 @@ from ccproxy.app.models.storage import RequestLog, ResponseLog
 
 router = APIRouter(prefix="/api")
 
-router = APIRouter(prefix="/api")
-
 
 @router.get("/stats")
 async def stats(request: Request) -> JSONResponse:

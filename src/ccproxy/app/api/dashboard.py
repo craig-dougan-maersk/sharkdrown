@@ -311,8 +311,19 @@ async def replay_request(request_id: str, request: Request):
     }
     for key, values in (original.headers or {}).items():
         lower = key.lower()
-        if lower in ("anthropic-version", "x-api-key"):
+        if lower == "anthropic-version":
             replay_headers[lower] = values[0] if values else ""
+        elif lower == "x-api-key":
+            stored = values[0] if values else ""
+            if stored.startswith("sha256:"):
+                return JSONResponse(
+                    {
+                        "error": "Cannot replay: stored API key is redacted. "
+                                 "Configure live credentials in the active profile to replay."
+                    },
+                    status_code=422,
+                )
+            replay_headers[lower] = stored
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=request.app),

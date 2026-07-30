@@ -1,7 +1,7 @@
 [project]
-name = "pandas-markdown-editor"
+name = "sharkdrown"
 version = "0.1.0"
-description = "A desktop editor for Markdown, JSON, and YAML files with pandas table support"
+description = "PySide6 desktop IDE for Claude Code sessions with embedded FastAPI proxy"
 readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}
@@ -16,7 +16,7 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
-    "Topic :: Text Editors",
+    "Topic :: Software Development :: Debuggers",
 ]
 dependencies = [
     # Editor
@@ -43,6 +43,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "pytest-asyncio>=0.23",
     "pytest-cov>=4.0",
     "black>=23.0",
     "ruff>=0.1.0",
@@ -53,7 +54,7 @@ keyring = [
 ]
 
 [project.scripts]
-markdown-editor = "src.main:main"
+sharkdrown = "src.main:main"
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
@@ -71,6 +72,9 @@ target-version = ["py312"]
 line-length = 88
 target-version = "py312"
 
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
@@ -78,7 +82,18 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*", "src/main.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+
 [tool.mypy]
 python_version = "3.12"
+disallow_untyped_defs = true
+check_untyped_defs = true
+ignore_missing_imports = true
 warn_return_any = true
 warn_unused_configs = true

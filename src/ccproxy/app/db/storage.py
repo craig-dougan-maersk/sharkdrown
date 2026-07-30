@@ -608,26 +608,6 @@ def cast(t: Any, v: Any) -> Any:
     return v
 
 
-# ---- Factory used by FastAPI dependencies (Phase 6) -------------------------
-
-
-_storage_singleton: StorageService | None = None
-
-
-async def get_storage_service() -> AsyncIterator[StorageService]:
-    """FastAPI dependency yielding a StorageService.
-
-    For Phase 3 we open one per request; Phase 6 will swap this for an
-    ``app.state``-backed instance so the connection lives for the process.
-    """
-    svc = StorageService("requests.db")
-    await svc.connect()
-    try:
-        yield svc
-    finally:
-        await svc.close()
-
-
 @asynccontextmanager
 async def open_storage(db_path: str | Path) -> AsyncIterator[StorageService]:
     """Async context manager for tests and scripts."""

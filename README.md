@@ -13,7 +13,9 @@ SharkDrown combines three workspaces in a single application:
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"         # installs pytest, ruff, black, mypy
+pip install -e ".[keyring]"     # optional: system keyring backend
 ```
 
 ## Usage
@@ -76,6 +78,9 @@ The embedded proxy intercepts Claude Code API traffic and provides:
 - **Protocol conversion** — Automatic Anthropic ↔ OpenAI format translation
 - **Streaming capture** — Full request/response logging without breaking SSE streams
 - **Token tracking** — Input/output/total token counting per request
+- **Rate limiting** — Dual-bucket token rate limiting for LLM and admin paths
+- **SSRF protection** — Provider URLs restricted to HTTP/HTTPS via Pydantic validation
+- **Sensitive header sanitization** — API keys, cookies, and auth tokens SHA-256 redacted before storage
 
 ## Keyboard Shortcuts
 
@@ -160,11 +165,22 @@ src/
 
 ## Development
 
-Run tests:
-
 ```bash
-QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest test_terminal.py -q
+# Run the full test suite (QT offscreen mode set automatically by conftest.py)
+.venv/bin/pytest
+
+# Run a specific file
+.venv/bin/pytest tests/test_openai_conversion.py -v
+
+# With coverage report
+.venv/bin/pytest --cov=src --cov-report=term-missing
+
+# Run the embedded proxy standalone (no Qt)
+uvicorn ccproxy.app.main:app --port 3001
 ```
+
+Known pre-existing test failures (do not investigate as regressions):
+- `tests/test_claude*.py` and `tests/test_terminal.py` — some layout/behaviour tests are in-progress
 
 ## License
 

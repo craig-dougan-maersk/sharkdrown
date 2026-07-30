@@ -264,7 +264,15 @@ class _LineNumberArea(QWidget):
         if not self._editor_widget.line_numbers_enabled:
             return
         editor = self._editor_widget.editor
-        block = editor.firstVisibleBlock()
+
+        # QTextEdit exposes block geometry via the document layout rather
+        # than QPlainTextEdit's firstVisibleBlock()/contentOffset()/
+        # blockBoundingGeometry() API.
+        layout = editor.document().documentLayout()
+        scroll_y = editor.verticalScrollBar().value()
+
+        # Find the first block whose bottom edge is at or below the viewport.
+        block = editor.document().begin()
         if not block.isValid():
             return
 
@@ -276,33 +284,25 @@ class _LineNumberArea(QWidget):
         painter.setPen(gutter_fg)
         painter.setFont(editor.font())
 
-        # Walk down through visible blocks, painting each line number at
-        # the y-coordinate derived from the editor's content offset.
-        content_offset = editor.contentOffset().y()
-        viewport_top = editor.viewport().rect().top()
         height = editor.fontMetrics().height()
+        event_bottom = event.rect().bottom()
+        event_top = event.rect().top()
 
-        block_number = block.blockNumber() + 1
         while block.isValid():
-            block_geom = editor.blockBoundingGeometry(block).translated(
-                0, content_offset - viewport_top
-            )
-            if block_geom.top() > event.rect().bottom():
+            block_rect = layout.blockBoundingRect(block)
+            block_top = int(block_rect.y()) - scroll_y
+            block_bottom = block_top + int(block_rect.height())
+
+            if block_top > event_bottom:
                 break
-            if block_geom.bottom() >= event.rect().top():
-                rect = QRect(
-                    0,
-                    int(block_geom.top()),
-                    self.width() - 4,
-                    int(height),
-                )
+            if block_bottom >= event_top:
+                rect = QRect(0, block_top, self.width() - 4, height)
                 painter.drawText(
                     rect,
                     int(Qt.AlignRight | Qt.AlignVCenter),
-                    str(block_number),
+                    str(block.blockNumber() + 1),
                 )
             block = block.next()
-            block_number += 1
 
         painter.end()
 

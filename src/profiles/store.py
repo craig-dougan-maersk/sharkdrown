@@ -101,9 +101,15 @@ class ProfileStore:
         then everything else in their on-disk order.
         """
         with self._lock:
-            return self._load_unlocked()
+            profiles, _ = self._load_unlocked()
+            return profiles
 
-    def _load_unlocked(self) -> list[ClaudeProfile]:
+    def _load_unlocked(self) -> tuple[list[ClaudeProfile], dict | None]:
+        """Return (profiles, raw_data_dict) from a single disk read.
+
+        Returning the raw data avoids a second _read_raw() call in callers
+        that also need active_profile — both come from the same snapshot.
+        """
         data = self._read_raw()
         if data is None:
             # First launch (or someone deleted the file). Always
@@ -112,7 +118,7 @@ class ProfileStore:
             seeded = self._seed_from_legacy_or_default()
             self._save_raw(seeded)
             profiles = self._parse_profiles(seeded["profiles"])
-            return self._ensure_default_present(profiles)
+            return self._ensure_default_present(profiles), None
         profiles = self._parse_profiles(data.get("profiles", []))
         had_default = any(p.name == DEFAULT_PROFILE_NAME for p in profiles)
         profiles = self._ensure_default_present(profiles)
@@ -126,7 +132,7 @@ class ProfileStore:
                 "active_profile": active_name,
                 "profiles": [_serialize_profile(p) for p in profiles],
             })
-        return profiles
+        return profiles, data
 
     def get_active_name(self) -> str | None:
         """Name of the currently-active profile (``None`` if unset/missing)."""
@@ -140,8 +146,7 @@ class ProfileStore:
     def get_active(self) -> ClaudeProfile | None:
         """Return the active profile or ``None`` if unset / not found."""
         with self._lock:
-            profiles = self._load_unlocked()
-            data = self._read_raw()
+            profiles, data = self._load_unlocked()
             active_name = data.get("active_profile") if data else None
             active_name = active_name if isinstance(active_name, str) and active_name else None
             if active_name is None:
@@ -196,7 +201,7 @@ class ProfileStore:
         the change.
         """
         with self._lock:
-            profiles = self._load_unlocked()
+            profiles, _ = self._load_unlocked()
             if not any(p.name == name for p in profiles):
                 raise KeyError(f"no profile named {name!r}")
             self.save(profiles, active_name=name)
@@ -211,8 +216,7 @@ class ProfileStore:
         itself).
         """
         with self._lock:
-            profiles = self._load_unlocked()
-            data = self._read_raw()
+            profiles, data = self._load_unlocked()
             active_name = data.get("active_profile") if data else None
             active_name = active_name if isinstance(active_name, str) and active_name else None
             replaced = False
@@ -243,7 +247,7 @@ class ProfileStore:
                 # Belt-and-braces: the Manage Profiles dialog disables
                 # the Delete button, but guard the underlying API too.
                 return
-            profiles = self._load_unlocked()
+            profiles, _ = self._load_unlocked()
             kept = [p for p in profiles if p.name != name]
             if len(kept) == len(profiles):
                 return
@@ -260,7 +264,7 @@ class ProfileStore:
         without a write race.
         """
         with self._lock:
-            profiles = self._load_unlocked()
+            profiles, _ = self._load_unlocked()
             for p in profiles:
                 if p.name == DEFAULT_PROFILE_NAME:
                     return p

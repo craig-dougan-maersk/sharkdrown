@@ -143,7 +143,6 @@ class CredentialStore:
         empty (deletion).
         """
         cleaned = value.strip()
-        cleaned = "".join(cleaned.split())
         with self._lock:
             data = self._read()
             creds = data.setdefault("credentials", {})

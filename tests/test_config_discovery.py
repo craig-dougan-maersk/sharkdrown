@@ -15,6 +15,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 # Add both the project root and src/ so ``src.proxy.paths`` and
 # ``ccproxy.app.config`` are importable regardless of CWD.
 _PROJECT_ROOT = Path(__file__).parent.parent
@@ -71,8 +73,7 @@ def test_settings_loads_discovered_config() -> None:
     """Settings should use the upstream URL from the discovered YAML."""
     yaml_path = find_config_yaml()
     if yaml_path is None:
-        print("⚠ no config.yaml discovered in candidate dirs — skipping")
-        return
+        pytest.skip("no config.yaml discovered in candidate dirs")
     print(f"✓ discovered config.yaml at {yaml_path}")
     from ccproxy.app.config import Settings
 

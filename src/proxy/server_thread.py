@@ -39,6 +39,23 @@ from src.proxy.paths import find_config_yaml, find_env_file
 logger = logging.getLogger("sharkdrown.proxy")
 
 
+class _SignaledServer(uvicorn.Server):
+    """uvicorn.Server subclass that fires an asyncio.Event when startup completes.
+
+    Overrides the public ``startup()`` coroutine (not the private ``started``
+    attribute) so callers can ``await started_event.wait()`` instead of
+    polling an internal field.
+    """
+
+    def __init__(self, config: uvicorn.Config, started_event: asyncio.Event) -> None:
+        super().__init__(config)
+        self._started_event = started_event
+
+    async def startup(self, sockets=None) -> None:  # type: ignore[override]
+        await super().startup(sockets=sockets)
+        self._started_event.set()
+
+
 class ProxyServerThread(QThread):
     """A QThread that runs uvicorn with its own asyncio loop.
 
@@ -135,7 +152,8 @@ class ProxyServerThread(QThread):
             # automatically on next start.
             timeout_graceful_shutdown=5,
         )
-        server = uvicorn.Server(config)
+        started_event = asyncio.Event()
+        server = _SignaledServer(config, started_event)
         # Don't let uvicorn register SIGTERM/SIGINT handlers — Qt owns the
         # process signal handling in a desktop app. Without this we'd
         # race the GUI loop's signal disposition on shutdown.
@@ -145,33 +163,27 @@ class ProxyServerThread(QThread):
         serve_task = asyncio.create_task(server.serve())
         try:
             # Wait for uvicorn to finish startup (or fail) before emitting.
-            # Cap the wait at 30 seconds; a bound that wasn't in uvicorn 0.30+
-            # would otherwise spin forever.
-            _startup_deadline = 30.0
-            _startup_elapsed = 0.0
-            _POLL_INTERVAL = 0.05
-            while not serve_task.done():
-                if getattr(server, "started", False):
-                    bound_port = self._resolve_bound_port(server)
-                    self._port = bound_port
-                    self.started_ok.emit(bound_port)
-                    break
-                await asyncio.sleep(_POLL_INTERVAL)
-                _startup_elapsed += _POLL_INTERVAL
-                if _startup_elapsed >= _startup_deadline:
-                    self.failed.emit("server did not become ready within 30 s")
-                    serve_task.cancel()
-                    return
-            # If startup failed before ``started`` flipped, surface the error.
-            if not getattr(server, "started", False):
+            # asyncio.wait_for caps the wait at 30 s; if the task exits before
+            # the event fires, we fall through to the failure check below.
+            try:
+                await asyncio.wait_for(started_event.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                self.failed.emit("server did not become ready within 30 s")
+                serve_task.cancel()
+                return
+            # If serve_task finished (crashed) before startup completed, report.
+            if serve_task.done():
                 try:
                     await serve_task
                 except Exception as exc:  # noqa: BLE001
-                    logger.exception("startup failed before started")
+                    logger.exception("startup failed before server became ready")
                     self.failed.emit(f"startup failed: {exc}")
                     return
                 self.failed.emit("server exited before becoming ready")
                 return
+            bound_port = self._resolve_bound_port(server)
+            self._port = bound_port
+            self.started_ok.emit(bound_port)
             # Now just wait for uvicorn to drain on shutdown.
             await serve_task
         except Exception as exc:  # noqa: BLE001

@@ -78,9 +78,46 @@ When a keyring backend is active, `CredentialStore.set()` stores the real secret
 ### o-series model detection
 Uses `re.compile(r"^o\d+(?:-|$)")` — avoids the `"o10".startswith("o1")` false-positive that a prefix-list approach would produce.
 
+### Uvicorn startup signalling (`_SignaledServer`)
+`ProxyServerThread` uses a `_SignaledServer` subclass of `uvicorn.Server` that overrides the public `startup()` coroutine and sets an `asyncio.Event` once uvicorn has finished binding. The serve task runs concurrently; the thread waits on the event with a 30 s timeout and emits `started_ok` or `failed` accordingly. This avoids polling the private `server.started` attribute.
+
+### Rate limiting — dual-bucket token system
+`RateLimitMiddleware` uses two independent `_TokenBucket` instances: one for LLM-equivalent paths (`POST /v1/messages`, `POST /api/replay/*`) and one for admin/destructive paths (`DELETE /api/requests`, `GET /api/providers/health`). Each bucket refills at its own `max_tokens / refill_seconds` rate. The `retry_after()` method returns the exact seconds until the next token is available for the `Retry-After` header.
+
+### Sensitive header sanitization
+`utils/headers.py` defines `SENSITIVE_HEADER_TOKENS` — a set of lowercase substrings checked against each header name. Matching headers are SHA-256 hashed before SQLite storage. Covered names include `authorization`, `x-api-key`, `cookie`, `x-auth-token`, and others. The redacted value is the hex digest of the original, prefixed with `sha256:`.
+
+### Replay sentinel guard
+The `/api/replay/{id}` endpoint checks whether the stored `x-api-key` starts with `sha256:` before forwarding. If so, it returns a 400 immediately rather than sending the redacted hash to the upstream provider as a (silently-rejected) API key.
+
+### Path traversal prevention — conversations API
+`ConversationReader` validates every user-supplied path segment (`project`, `session_id`) with `Path.is_relative_to(self.base.resolve())` before opening any file. Any segment that resolves outside the base directory is rejected with a 400.
+
+### EventBusBridge thread safety
+`EventBusBridge.stop()` captures `loop, stop = self._loop, self._stop_event` into locals *before* the None check. The actual `loop.call_soon_threadsafe(stop.set)` call uses the locals. This closes a TOCTOU window where the background thread could assign `self._loop = None` between the None-check and the method call.
+
+### PTY double-waitpid prevention
+`PtySession` holds a `threading.Lock` (`_reap_lock`) and a `_reaped: bool` flag. All calls to `os.waitpid` in `is_alive`, `_reap_in_thread`, and `terminate_child` acquire the lock and check `_reaped` first. Once a reap completes, `_reaped` is set to `True` so subsequent callers return without calling `waitpid` again.
+
+### ProfileStore single-read guarantee
+`_load_unlocked()` returns a `(dict[str, Profile], raw_dict)` tuple. Callers that previously called `_load_unlocked()` then `_read_raw()` separately (to extract the `active_profile` key) now extract it from the already-parsed `raw_dict`. This eliminates a second disk read that could produce an inconsistent snapshot under concurrent writes.
+
 ## Caveats
 
 - `QT_QPA_PLATFORM=offscreen` is set automatically in `tests/conftest.py`; tests don't need a display.
 - The proxy must be started before Claude Code connects. The Qt app starts it automatically; for standalone use start uvicorn first.
 - `src/proxy/paths.py` uses `QStandardPaths` which requires `setOrganizationName` / `setApplicationName` to be called on the `QApplication` before `data_dir()` is invoked.
 - `ProviderCfg` uses `extra="forbid"` — YAML typos in provider blocks raise a validation error at startup rather than silently being ignored.
+- `ProviderCfg.url` uses Pydantic `HttpUrl` — `file://`, `ftp://`, and link-local URLs raise a `ValidationError` at config load time.
+
+## Known test issues
+
+These failures exist on the original codebase and are not caused by recent changes:
+
+| Test | Status | Cause |
+|------|--------|-------|
+| `tests/test_claude.py::test_claude_container_flush_pending_launches` | fails | In-progress UI behaviour change |
+| `tests/test_claude_tab_layout.py` (4 tests) | fail | In-progress layout change |
+| `tests/test_terminal.py::test_pixel_to_cell_maps_to_visual_position` | fails | In-progress renderer change |
+
+When running the full suite and seeing these, do not investigate as regressions. Focus on any failures not in this list.

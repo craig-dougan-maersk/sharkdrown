@@ -55,6 +55,20 @@ class ConversationReader:
     def __init__(self, base_path: Path | None = None) -> None:
         self.base = Path(base_path) if base_path else Path.home() / ".claude" / "projects"
 
+    def _safe_child(self, *parts: str) -> Path | None:
+        """Return ``base / parts`` only if it resolves within ``base``.
+
+        Returns None when any part contains ``..`` or an absolute path that
+        would escape the base directory — callers treat None as "not found".
+        """
+        candidate = (self.base / Path(*parts)).resolve()
+        try:
+            candidate.relative_to(self.base.resolve())
+        except ValueError:
+            logger.warning("path traversal attempt blocked: %s", parts)
+            return None
+        return candidate
+
     # ---- listing ----------------------------------------------------------
 
     def list_conversations(
@@ -106,8 +120,8 @@ class ConversationReader:
         hide_empty: bool = False,
     ) -> list[Conversation]:
         """All sessions under ``base/<project_path>/``."""
-        proj_dir = self.base / project_path
-        if not proj_dir.is_dir():
+        proj_dir = self._safe_child(project_path)
+        if proj_dir is None or not proj_dir.is_dir():
             return []
         out: list[Conversation] = []
         for jsonl in proj_dir.glob("*.jsonl"):
@@ -125,8 +139,8 @@ class ConversationReader:
 
     def get_conversation(self, session_id: str, project_path: str) -> Conversation | None:
         """Parse a single session's JSONL fully (every message)."""
-        path = self.base / project_path / f"{session_id}.jsonl"
-        if not path.is_file():
+        path = self._safe_child(project_path, f"{session_id}.jsonl")
+        if path is None or not path.is_file():
             return None
         return self._build_full(path)
 
@@ -149,7 +163,8 @@ class ConversationReader:
         results: list[dict[str, Any]] = []
 
         if project_path:
-            search_dirs = [self.base / project_path]
+            safe = self._safe_child(project_path)
+            search_dirs = [safe] if safe is not None else []
         else:
             search_dirs = [d for d in self.base.iterdir() if d.is_dir()] if self.base.is_dir() else []
 

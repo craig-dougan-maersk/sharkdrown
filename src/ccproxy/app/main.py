@@ -52,14 +52,17 @@ def _default_providers(settings: Settings) -> dict[str, Provider]:
         gateways use Anthropic's wire format). Each one gets its
         own HTTP client so closing one doesn't disrupt another.
     """
+    read_timeout = float(settings.server.timeouts.read)
     providers: dict[str, Provider] = {
         "anthropic": AnthropicProvider(
             base_url=str(settings.providers.anthropic.base_url),
             version=settings.providers.anthropic.version,
+            timeout_seconds=read_timeout,
         ),
         "openai": OpenAIProvider(
             base_url=str(settings.providers.openai.base_url),
             api_key=settings.providers.openai.api_key.get_secret_value(),
+            timeout_seconds=read_timeout,
         ),
     }
     # User-defined providers (per-profile). All current AI gateways
@@ -80,6 +83,7 @@ def _default_providers(settings: Settings) -> dict[str, Provider]:
                 continue
             providers[prov_name] = AnthropicProvider(
                 base_url=prov_cfg.url,
+                timeout_seconds=read_timeout,
             )
 
     # Discover drop-in provider plugins from the plugins directory and

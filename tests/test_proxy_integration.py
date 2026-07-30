@@ -31,11 +31,6 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from src.proxy.server_thread import ProxyServerThread  # noqa: E402
 
 
-def _find_free_port() -> int:
-    """Ask the OS for an unused TCP port."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _wait_for_health(url: str, timeout: float = 10.0) -> bool:
@@ -72,8 +67,8 @@ def host() -> str:
 
 
 @pytest.fixture()
-def port() -> int:
-    return _find_free_port()
+def port(free_port: int) -> int:
+    return free_port
 
 
 def test_proxy_thread_lifecycle(tmp_db: Path, host: str, port: int) -> None:

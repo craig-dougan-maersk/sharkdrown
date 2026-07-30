@@ -70,6 +70,12 @@
 | Activity tile | Real-time traffic indicator in status bar |
 | Auto-start | Optional automatic proxy launch on app start |
 | Dashboard API | RESTful endpoints for request history and monitoring |
+| Dual-bucket rate limiting | Separate token buckets for LLM paths and admin/replay paths |
+| Sensitive header sanitization | SHA-256 redaction of Authorization, Cookie, X-Auth-Token, and related headers before storage |
+| SSRF prevention | `ProviderCfg.url` restricted to HTTP/HTTPS via Pydantic `HttpUrl` validation at config load |
+| Replay safety guard | Replay endpoint rejects SHA-256-redacted API keys with a clear error instead of forwarding them |
+| Path traversal prevention | Conversations API validates `project`/`session_id` against base directory before opening files |
+| Configurable upstream timeouts | `settings.server.timeouts.read` applied to all provider HTTP clients |
 
 ## Application Chrome
 

@@ -205,7 +205,7 @@ class ProviderCfg(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    url: str
+    url: HttpUrl
     api_key: SecretStr | None = None
     available_models: list[str] = Field(default_factory=list)
 

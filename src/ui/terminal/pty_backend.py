@@ -38,6 +38,7 @@ import select
 import signal
 import struct
 import termios
+import threading
 from typing import Sequence
 
 from PySide6.QtCore import QThread, Signal
@@ -108,9 +109,11 @@ class PtySession(QThread):
         self._wake_w: int = -1
         # Stop flag — checked at the top of each reader iteration.
         self._stopped = False
-        # Reap-once flag so multiple SIGCHLD signals (rare but possible)
-        # don't double-waitpid.
+        # Reap-once flag + lock: both the GUI thread (is_alive) and the
+        # reader QThread (_reap_in_thread) call os.waitpid(); the lock makes
+        # the check-then-waitpid atomic so only one call ever lands.
         self._reaped = False
+        self._reap_lock = threading.Lock()
 
     # ---- public API ---------------------------------------------------------
 
@@ -179,18 +182,17 @@ class PtySession(QThread):
         """True if the child process is still running (or being reaped)."""
         if self._pid <= 0:
             return False
-        if self._reaped:
-            return False
-        # SIGCHLD won't be delivered to the parent unless we ignore it or
-        # install a handler; the reader loop reaps on its own.
-        try:
-            wpid, _ = os.waitpid(self._pid, os.WNOHANG)
-            if wpid == self._pid:
+        with self._reap_lock:
+            if self._reaped:
+                return False
+            try:
+                wpid, _ = os.waitpid(self._pid, os.WNOHANG)
+                if wpid == self._pid:
+                    self._reaped = True
+                    return False
+            except ChildProcessError:
                 self._reaped = True
                 return False
-        except ChildProcessError:
-            self._reaped = True
-            return False
         return True
 
     def write(self, data: bytes) -> None:
@@ -238,13 +240,17 @@ class PtySession(QThread):
     def terminate_child(self) -> None:
         """SIGHUP → SIGKILL the child, then reap it. Idempotent."""
         pid = self._pid
-        if pid <= 0 or self._reaped:
+        if pid <= 0:
             return
+        with self._reap_lock:
+            if self._reaped:
+                return
         for sig in (signal.SIGHUP, signal.SIGKILL):
             try:
                 os.kill(pid, sig)
             except ProcessLookupError:
-                self._reaped = True
+                with self._reap_lock:
+                    self._reaped = True
                 break
             except PermissionError:
                 # Not our child — best-effort terminate.
@@ -252,16 +258,19 @@ class PtySession(QThread):
             # Give the child a brief window to die between SIGHUP and
             # SIGKILL. Don't busy-wait.
             for _ in range(20):  # ~200ms total
-                try:
-                    wpid, status = os.waitpid(pid, os.WNOHANG)
-                    if wpid == pid:
-                        self._reaped = True
-                        self.process_exited.emit(self._encode_status(status))
+                with self._reap_lock:
+                    if self._reaped:
                         return
-                except ChildProcessError:
-                    self._reaped = True
-                    self.process_exited.emit(0)
-                    return
+                    try:
+                        wpid, status = os.waitpid(pid, os.WNOHANG)
+                        if wpid == pid:
+                            self._reaped = True
+                            self.process_exited.emit(self._encode_status(status))
+                            return
+                    except ChildProcessError:
+                        self._reaped = True
+                        self.process_exited.emit(0)
+                        return
                 import time as _t
 
                 _t.sleep(0.01)
@@ -324,19 +333,22 @@ class PtySession(QThread):
 
     def _reap_in_thread(self) -> None:
         """Reap the child if it has exited. Safe to call multiple times."""
-        if self._pid <= 0 or self._reaped:
+        if self._pid <= 0:
             return
-        try:
-            wpid, status = os.waitpid(self._pid, os.WNOHANG)
-        except ChildProcessError:
-            self._reaped = True
-            self.process_exited.emit(0)
-            return
-        except OSError:
-            return
-        if wpid == self._pid:
-            self._reaped = True
-            self.process_exited.emit(self._encode_status(status))
+        with self._reap_lock:
+            if self._reaped:
+                return
+            try:
+                wpid, status = os.waitpid(self._pid, os.WNOHANG)
+            except ChildProcessError:
+                self._reaped = True
+                self.process_exited.emit(0)
+                return
+            except OSError:
+                return
+            if wpid == self._pid:
+                self._reaped = True
+                self.process_exited.emit(self._encode_status(status))
 
     @staticmethod
     def _encode_status(status: int) -> int:

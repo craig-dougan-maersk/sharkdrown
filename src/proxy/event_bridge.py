@@ -58,9 +58,14 @@ class EventBusBridge(QObject):
             # Timeout guards against the thread dying before it reaches that
             # point — in that case we still clean up via join below.
             self._started.wait(timeout=5.0)
-            if self._loop is not None and self._stop_event is not None:
+            # Capture references as locals before the conditional so the
+            # background thread cannot set self._loop = None between the
+            # None-check and the call_soon_threadsafe invocation (which
+            # would raise AttributeError rather than RuntimeError).
+            loop, stop = self._loop, self._stop_event
+            if loop is not None and stop is not None:
                 try:
-                    self._loop.call_soon_threadsafe(self._stop_event.set)
+                    loop.call_soon_threadsafe(stop.set)
                 except RuntimeError:
                     # Loop already closed — thread is exiting naturally (#25).
                     pass

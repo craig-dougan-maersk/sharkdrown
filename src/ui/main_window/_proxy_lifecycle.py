@@ -127,7 +127,7 @@ class ProxyLifecycleMixin:
         """Called by the worker thread once uvicorn is listening."""
         self.proxy_port = port
         self.proxy_status_label.setText(f"Proxy: running on {self.proxy_host}:{port}")
-        self.action_start_proxy.setEnabled(True)
+        self.action_start_proxy.setEnabled(False)
         self.action_stop_proxy.setEnabled(True)
         self.action_show_dashboard.setEnabled(True)
         self.action_show_recent.setEnabled(True)

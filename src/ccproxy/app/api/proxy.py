@@ -245,7 +245,7 @@ async def post_v1_messages(
     is empty — the request reached us, parsing or routing bailed
     silently.
     """
-    body: bytes = request.state.body_bytes  # populated by BodyCaptureMiddleware
+    body: bytes = getattr(request.state, "body_bytes", b"")  # set by BodyCaptureMiddleware
     # ``logger.info`` is suppressed by uvicorn's dictConfig; the
     # startup banner (``main.py``) already uses ``print(..., file=sys.stderr)``
     # for the same reason. We do the same here so the line shows up
