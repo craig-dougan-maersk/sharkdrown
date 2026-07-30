@@ -25,6 +25,7 @@ from src.profiles.store import ProfileStore
 from src.proxy.proxy_config import ProxyConfig
 from src.proxy.server_thread import ProxyServerThread
 from src.ui.claude.claude_container_view import ClaudeContainerView
+from src.ui.diagrams.diagram_container_view import DiagramContainerView
 from src.ui.terminal.terminal_container_view import TerminalContainerView
 
 from src.ui.main_window._document_ops import DocumentOpsMixin
@@ -60,14 +61,19 @@ class MainWindow(
         self.activity_tile = None
         self.terminal_container: TerminalContainerView | None = None
         self.claude_container: ClaudeContainerView | None = None
+        self.diagram_container: DiagramContainerView | None = None
         self.profile_store: ProfileStore | None = None
         self._proxy_autostart_fired = False
         self._restart_after_stop = False
 
         # Initialize components
+        # NOTE: menu-bar order is *call* order — QMenuBar.addMenu appends.
+        # Main + View come from _init_menu; the rest follow in sequence,
+        # giving: Main | View | Code | Diagrams | Terminal | Claude.
         self._init_central_widget()
         self._init_menu()
         self._init_code_menu()
+        self._init_diagrams_menu()
         self._init_terminal_menu()
         self._init_claude_menu()
         self._init_status_bar()
@@ -131,15 +137,20 @@ class MainWindow(
         self.doc_vsplitter.setStretchFactor(0, 4)
         self.doc_vsplitter.setStretchFactor(1, 1)
 
-        # ---- Top-level view tabs (Documents / Terminals / Claude) ------
+        # ---- Top-level view tabs (Documents / Diagrams / Terminals /
+        # ---- Claude) ---------------------------------------------------
         self.view_tabs = QTabWidget()
         self.view_tabs.setDocumentMode(True)
         self.view_tabs.setTabsClosable(False)
         self.view_tabs.setMovable(False)
 
+        # Tab order mirrors the menu bar (Code | Diagrams | Terminal |
+        # Claude). These constants are the single source of truth for
+        # index comparisons — nothing should hard-code a literal.
         self._TAB_INDEX_DOCUMENTS = 0
-        self._TAB_INDEX_TERMINALS = 1
-        self._TAB_INDEX_CLAUDE = 2
+        self._TAB_INDEX_DIAGRAMS = 1
+        self._TAB_INDEX_TERMINALS = 2
+        self._TAB_INDEX_CLAUDE = 3
 
         # Page 1: Documents
         documents_page = QWidget()
@@ -151,11 +162,15 @@ class MainWindow(
         self.view_tabs.addTab(documents_page, "Documents")
         self.view_tabs.currentChanged.connect(self._on_view_tab_changed)
 
-        # Page 2: Terminals
+        # Page 2: Diagrams
+        self.diagram_container = DiagramContainerView()
+        self.view_tabs.addTab(self.diagram_container, "Diagrams")
+
+        # Page 3: Terminals
         self.terminal_container = TerminalContainerView()
         self.view_tabs.addTab(self.terminal_container, "Terminals")
 
-        # Page 3: Claude
+        # Page 4: Claude
         self.claude_container = ClaudeContainerView()
         self.claude_container.set_proxy_callbacks(
             is_proxy_running=self._is_proxy_running,
@@ -177,6 +192,9 @@ class MainWindow(
         if index == getattr(self, "_TAB_INDEX_CLAUDE", -1):
             if self.claude_container is not None:
                 self.claude_container.focus_active_session()
+        if index == getattr(self, "_TAB_INDEX_DIAGRAMS", -1):
+            if self.diagram_container is not None:
+                self.diagram_container.focus_active_diagram()
 
     # ------------------------------------------------------------------
     # Window lifecycle
@@ -190,6 +208,8 @@ class MainWindow(
             self.terminal_container.shutdown()
         if self.claude_container is not None:
             self.claude_container.shutdown()
+        if self.diagram_container is not None:
+            self.diagram_container.shutdown()
         if thread is not None and thread.isRunning():
             thread.request_stop()
             if not thread.wait(3000):

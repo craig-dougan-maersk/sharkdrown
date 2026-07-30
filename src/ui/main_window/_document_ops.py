@@ -249,6 +249,14 @@ class DocumentOpsMixin:
         from src.ui.widgets.editor_widget import EditorWidget
         editor = EditorWidget()
         editor.document = doc_tab
+        # Honour the user's line-number preference for new tabs. If the
+        # preference changes after this tab opens, ``Code → Show Line
+        # Numbers`` rebroadcasts via ``set_line_numbers_enabled`` on every
+        # open editor (see ``_on_show_line_numbers_toggled``), so we
+        # don't need to react to settings changes here.
+        editor.set_line_numbers_enabled(
+            getattr(self, "_line_numbers_enabled_pref", True)
+        )
 
         index = self.editor_tabs.addTab(editor, "")
         # Route the title through ``_update_tab_title`` so the format

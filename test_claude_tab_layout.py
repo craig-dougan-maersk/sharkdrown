@@ -41,9 +41,11 @@ def _qapp():
 # ---- Top-level view tab structure -----------------------------------------
 
 
-def test_top_level_view_tabs_only_has_three_tabs() -> None:
-    """MainWindow exposes exactly Documents, Terminals, and Claude
-    at the top level — no standalone Dashboard or Recent Activity."""
+def test_top_level_view_tabs_only_has_four_tabs() -> None:
+    """MainWindow exposes exactly Documents, Diagrams, Terminals, and
+    Claude at the top level — no standalone Dashboard or Recent
+    Activity. Diagrams sits second so the tab order mirrors the menu
+    bar (Code | Diagrams | Terminal | Claude)."""
     _qapp()
     from src.ui.main_window import MainWindow
 
@@ -52,16 +54,18 @@ def test_top_level_view_tabs_only_has_three_tabs() -> None:
         labels = [
             w.view_tabs.tabText(i) for i in range(w.view_tabs.count())
         ]
-        assert labels == ["Documents", "Terminals", "Claude"], (
-            f"expected ['Documents', 'Terminals', 'Claude'], got {labels}"
+        expected = ["Documents", "Diagrams", "Terminals", "Claude"]
+        assert labels == expected, (
+            f"expected {expected}, got {labels}"
         )
         # Tab-index constants match the actual layout.
         assert w._TAB_INDEX_DOCUMENTS == 0
-        assert w._TAB_INDEX_TERMINALS == 1
-        assert w._TAB_INDEX_CLAUDE == 2
+        assert w._TAB_INDEX_DIAGRAMS == 1
+        assert w._TAB_INDEX_TERMINALS == 2
+        assert w._TAB_INDEX_CLAUDE == 3
     finally:
         w.close()
-    print("✓ top-level view tabs are Documents, Terminals, Claude")
+    print("✓ top-level view tabs are Documents, Diagrams, Terminals, Claude")
 
 
 def test_top_level_view_tabs_are_not_closable() -> None:
@@ -821,7 +825,7 @@ def test_show_recent_menu_action_in_main_window() -> None:
 
 def main() -> None:
     tests = [
-        test_top_level_view_tabs_only_has_three_tabs,
+        test_top_level_view_tabs_only_has_four_tabs,
         test_top_level_view_tabs_are_not_closable,
         test_split_and_preview_default_deselected,
         test_toggle_split_works_independently_of_toggle_preview,

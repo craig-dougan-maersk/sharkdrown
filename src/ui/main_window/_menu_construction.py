@@ -1,4 +1,5 @@
-"""Menu construction mixin — File/View/Terminal/Claude menus and status bar."""
+"""Menu construction mixin — Main/View/Code/Diagrams/Terminal/Claude
+menus and status bar."""
 
 from __future__ import annotations
 
@@ -20,71 +21,30 @@ class MenuConstructionMixin:
     """Builds the menu bar, status bar, and terminal session slots."""
 
     def _init_menu(self) -> None:
-        """Initialize the menu bar."""
-        from PySide6.QtCore import Qt
+        """Initialize the menu bar (Main + View).
 
+        ``Main`` is the former ``File`` menu. Its document actions
+        (New/Open/Save/Save All/Close) now live on the ``Code`` menu —
+        they act on source documents, so they belong beside the other
+        code actions. What remains on ``Main`` is application-level:
+        quitting the app.
+
+        ``View`` likewise shed the split-layout actions (Toggle Split
+        View / Side By Side / Stacked) to ``Code``; View now governs
+        theme and font chrome only.
+        """
         menubar = self.menuBar()
 
-        # File menu
-        file_menu = menubar.addMenu("&File")
-
-        self.action_new = QAction("&New", self)
-        self.action_new.setShortcut("Ctrl+N")
-        self.action_new.triggered.connect(lambda _checked=False: self._new_file_with_dialog())
-        file_menu.addAction(self.action_new)
-
-        self.action_open = QAction("&Open...", self)
-        self.action_open.setShortcut("Ctrl+O")
-        self.action_open.triggered.connect(self._open_file)
-        file_menu.addAction(self.action_open)
-
-        self.action_save = QAction("&Save", self)
-        self.action_save.setShortcut("Ctrl+S")
-        self.action_save.triggered.connect(self._save_file)
-        file_menu.addAction(self.action_save)
-
-        self.action_save_all = QAction("Save &All", self)
-        self.action_save_all.setShortcut("Ctrl+Shift+S")
-        self.action_save_all.triggered.connect(self._save_all)
-        file_menu.addAction(self.action_save_all)
-
-        file_menu.addSeparator()
-
-        self.action_close = QAction("&Close", self)
-        self.action_close.setShortcut("Ctrl+W")
-        self.action_close.triggered.connect(self._close_current_tab)
-        file_menu.addAction(self.action_close)
-
-        file_menu.addSeparator()
+        # Main menu (formerly "File")
+        main_menu = menubar.addMenu("&Main")
 
         self.action_exit = QAction("E&xit", self)
         self.action_exit.setShortcut("Ctrl+Q")
         self.action_exit.triggered.connect(self.close)
-        file_menu.addAction(self.action_exit)
+        main_menu.addAction(self.action_exit)
 
         # View menu
         view_menu = menubar.addMenu("&View")
-
-        self.action_toggle_split = QAction("&Toggle Split View", self)
-        self.action_toggle_split.setShortcut("Ctrl+D")
-        self.action_toggle_split.setCheckable(True)
-        self.action_toggle_split.setChecked(False)
-        self.action_toggle_split.triggered.connect(self._toggle_split)
-        view_menu.addAction(self.action_toggle_split)
-
-        view_menu.addSeparator()
-
-        self.action_side_by_side = QAction("Side &By Side", self)
-        self.action_side_by_side.setShortcut("Ctrl+1")
-        self.action_side_by_side.triggered.connect(lambda: self._set_split_orientation(Qt.Horizontal))
-        view_menu.addAction(self.action_side_by_side)
-
-        self.action_stacked = QAction("&Stacked", self)
-        self.action_stacked.setShortcut("Ctrl+2")
-        self.action_stacked.triggered.connect(lambda: self._set_split_orientation(Qt.Vertical))
-        view_menu.addAction(self.action_stacked)
-
-        view_menu.addSeparator()
 
         # Theme submenu
         from src.ui.theme import ThemeManager, ThemeMode
@@ -386,6 +346,27 @@ class MenuConstructionMixin:
         if sess is not None:
             sess.set_logging_enabled(checked)
 
+    def _on_show_line_numbers_toggled(self, checked: bool) -> None:
+        """Apply the line-number preference to every open editor.
+
+        Iterates over ``editor_tabs`` rather than only the active
+        editor so users with multiple documents open see consistent
+        behaviour across all tabs. New tabs pick up the same
+        preference via ``_line_numbers_enabled_pref`` in
+        ``_document_ops.py``.
+        """
+        from PySide6.QtCore import QSettings
+
+        checked = bool(checked)
+        self._line_numbers_enabled_pref = checked
+        QSettings("SharkDrown", "App").setValue(
+            "line_numbers_enabled", checked
+        )
+        for i in range(self.editor_tabs.count()):
+            editor = self.editor_tabs.widget(i)
+            if editor is not None and hasattr(editor, "set_line_numbers_enabled"):
+                editor.set_line_numbers_enabled(checked)
+
     def _on_font_slider_changed(self, value: int) -> None:
         """Set the content font to the slider's value."""
         self.font_size_value_label.setText(f"{value}pt")
@@ -431,18 +412,83 @@ class MenuConstructionMixin:
         self.font_size_value_label.setText(f"{size}pt")
 
     def _init_code_menu(self) -> None:
-        """Add the Code menu between View and Terminal.
+        """Add the Code menu between View and Diagrams.
 
-        The Code menu owns the source-editing / code-analysis actions
-        that used to live on the View menu: ``Toggle Preview`` and
-        ``Toggle Lint Panel``. They were moved off View because they
-        are about *the code*, not the chrome — View now strictly
-        governs the application UI (split, theme, fonts).
+        The Code menu is the home for everything that acts on source
+        documents:
+
+        * document lifecycle — ``New``, ``Open``, ``Save``,
+          ``Save All``, ``Close`` (moved off the former ``File`` menu,
+          now ``Main``, which keeps only ``Exit``);
+        * split layout — ``Toggle Split View``, ``Side By Side``,
+          ``Stacked`` (moved off ``View``);
+        * code analysis — ``Toggle Preview`` and ``Toggle Lint Panel``.
+
+        ``View`` is left governing application chrome only (theme,
+        fonts).
+
+        Mnemonics are unique *within this menu*: N/O/S/A/C for the
+        document group, T/B/K for the layout group, P/L for the
+        analysis group. Duplicates would make Qt cycle candidates on
+        each keypress instead of activating the item outright — note
+        ``Stac&ked`` avoids colliding with ``&Save``, and ``Toggle
+        &Preview`` avoids colliding with ``&Toggle Split View``.
         """
         menubar = self.menuBar()
         code_menu = menubar.addMenu("&Code")
 
-        self.action_toggle_preview = QAction("&Toggle Preview", self)
+        # ---- Document lifecycle (moved from File/Main) -----------------
+        self.action_new = QAction("&New", self)
+        self.action_new.setShortcut("Ctrl+N")
+        self.action_new.triggered.connect(lambda _checked=False: self._new_file_with_dialog())
+        code_menu.addAction(self.action_new)
+
+        self.action_open = QAction("&Open...", self)
+        self.action_open.setShortcut("Ctrl+O")
+        self.action_open.triggered.connect(self._open_file)
+        code_menu.addAction(self.action_open)
+
+        self.action_save = QAction("&Save", self)
+        self.action_save.setShortcut("Ctrl+S")
+        self.action_save.triggered.connect(self._save_file)
+        code_menu.addAction(self.action_save)
+
+        self.action_save_all = QAction("Save &All", self)
+        self.action_save_all.setShortcut("Ctrl+Shift+S")
+        self.action_save_all.triggered.connect(self._save_all)
+        code_menu.addAction(self.action_save_all)
+
+        code_menu.addSeparator()
+
+        self.action_close = QAction("&Close", self)
+        self.action_close.setShortcut("Ctrl+W")
+        self.action_close.triggered.connect(self._close_current_tab)
+        code_menu.addAction(self.action_close)
+
+        code_menu.addSeparator()
+
+        # ---- Split layout (moved from View) ---------------------------
+        self.action_toggle_split = QAction("&Toggle Split View", self)
+        self.action_toggle_split.setShortcut("Ctrl+D")
+        self.action_toggle_split.setCheckable(True)
+        self.action_toggle_split.setChecked(False)
+        self.action_toggle_split.triggered.connect(self._toggle_split)
+        code_menu.addAction(self.action_toggle_split)
+
+        self.action_side_by_side = QAction("Side &By Side", self)
+        self.action_side_by_side.setShortcut("Ctrl+1")
+        self.action_side_by_side.triggered.connect(lambda: self._set_split_orientation(Qt.Horizontal))
+        code_menu.addAction(self.action_side_by_side)
+
+        self.action_stacked = QAction("Stac&ked", self)
+        self.action_stacked.setShortcut("Ctrl+2")
+        self.action_stacked.triggered.connect(lambda: self._set_split_orientation(Qt.Vertical))
+        code_menu.addAction(self.action_stacked)
+
+        code_menu.addSeparator()
+
+        # ---- Code analysis --------------------------------------------
+        self.action_toggle_preview = QAction("Toggle &Preview", self)
         self.action_toggle_preview.setShortcut("Ctrl+P")
         self.action_toggle_preview.setCheckable(True)
         self.action_toggle_preview.setChecked(False)
@@ -457,6 +503,51 @@ class MenuConstructionMixin:
         self.action_toggle_lint.setChecked(False)
         self.action_toggle_lint.triggered.connect(self._toggle_lint_panel)
         code_menu.addAction(self.action_toggle_lint)
+
+        code_menu.addSeparator()
+
+        # ---- View options ------------------------------------------------
+        # ``Show Line Numbers`` is a global preference, not a per-tab
+        # setting, so toggling it rebroadcasts to every open editor and
+        # the preference is persisted via QSettings so new tabs honour
+        # it on creation (see ``_document_ops.py``).
+        from PySide6.QtCore import QSettings
+
+        settings = QSettings("SharkDrown", "App")
+        self._line_numbers_enabled_pref = settings.value(
+            "line_numbers_enabled", True, type=bool
+        )
+        self.action_show_line_numbers = QAction("Show &Line Numbers", self)
+        self.action_show_line_numbers.setCheckable(True)
+        self.action_show_line_numbers.setChecked(self._line_numbers_enabled_pref)
+        self.action_show_line_numbers.triggered.connect(
+            self._on_show_line_numbers_toggled
+        )
+        code_menu.addAction(self.action_show_line_numbers)
+
+    def _init_diagrams_menu(self) -> None:
+        """Add the Diagrams menu between Code and Terminal.
+
+        Called from ``MainWindow.__init__`` between ``_init_code_menu``
+        and ``_init_terminal_menu`` — ``QMenuBar.addMenu`` appends, so
+        call order *is* menu-bar order.
+
+        Shortcuts mirror the Terminal/Claude convention:
+        ``Ctrl+Alt+<key>`` opens a new item, ``Ctrl+Alt+Shift+<key>``
+        focuses the tab.
+        """
+        menubar = self.menuBar()
+        diagrams_menu = menubar.addMenu("&Diagrams")
+
+        self.action_new_diagram = QAction("&New Diagram", self)
+        self.action_new_diagram.setShortcut("Ctrl+Alt+D")
+        self.action_new_diagram.triggered.connect(self._new_diagram)
+        diagrams_menu.addAction(self.action_new_diagram)
+
+        self.action_focus_diagrams = QAction("Focus &Diagrams Tab", self)
+        self.action_focus_diagrams.setShortcut("Ctrl+Alt+Shift+D")
+        self.action_focus_diagrams.triggered.connect(self._focus_diagrams_tab)
+        diagrams_menu.addAction(self.action_focus_diagrams)
 
     def _init_terminal_menu(self) -> None:
         """Add the Terminal menu."""
@@ -598,6 +689,24 @@ class MenuConstructionMixin:
     def _focus_terminals_tab(self) -> None:
         """Slot for Terminal -> Focus Terminals Tab."""
         idx = getattr(self, "_TAB_INDEX_TERMINALS", None)
+        if idx is not None:
+            self.view_tabs.setCurrentIndex(idx)
+
+    # ------------------------------------------------------------------
+    # Diagram slots
+    # ------------------------------------------------------------------
+
+    def _new_diagram(self) -> None:
+        """Open a new diagram in the Diagrams tab and switch to it."""
+        if self.diagram_container is None:
+            return
+        self.diagram_container.new_diagram()
+        self.view_tabs.setCurrentIndex(self._TAB_INDEX_DIAGRAMS)
+        self.diagram_container.focus_active_diagram()
+
+    def _focus_diagrams_tab(self) -> None:
+        """Slot for Diagrams -> Focus Diagrams Tab."""
+        idx = getattr(self, "_TAB_INDEX_DIAGRAMS", None)
         if idx is not None:
             self.view_tabs.setCurrentIndex(idx)
 
