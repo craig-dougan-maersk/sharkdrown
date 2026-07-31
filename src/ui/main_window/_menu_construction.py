@@ -586,6 +586,18 @@ class MenuConstructionMixin:
         self.action_new_diagram.triggered.connect(self._new_diagram)
         diagrams_menu.addAction(self.action_new_diagram)
 
+        self.action_open_diagram = QAction("&Open Diagram...", self)
+        self.action_open_diagram.setShortcut("Ctrl+Alt+O")
+        self.action_open_diagram.triggered.connect(self._open_diagram)
+        diagrams_menu.addAction(self.action_open_diagram)
+
+        self.action_save_diagram = QAction("&Save Diagram", self)
+        self.action_save_diagram.setShortcut("Ctrl+Alt+S")
+        self.action_save_diagram.triggered.connect(self._save_diagram)
+        diagrams_menu.addAction(self.action_save_diagram)
+
+        diagrams_menu.addSeparator()
+
         self.action_focus_diagrams = QAction("Focus &Diagrams Tab", self)
         self.action_focus_diagrams.setShortcut("Ctrl+Alt+Shift+D")
         self.action_focus_diagrams.triggered.connect(self._focus_diagrams_tab)
@@ -746,6 +758,55 @@ class MenuConstructionMixin:
         self.view_tabs.setCurrentIndex(self._TAB_INDEX_DIAGRAMS)
         self.diagram_container.focus_active_diagram()
 
+    def _open_diagram(self) -> None:
+        """Open an existing .mmd diagram file."""
+        from pathlib import Path
+        from PySide6.QtWidgets import QFileDialog
+
+        if self.diagram_container is None:
+            return
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Diagram",
+            str(Path.home()),
+            "Mermaid Diagrams (*.mmd);;All Files (*)",
+        )
+        if not file_path:
+            return
+        self.diagram_container.open_diagram(Path(file_path))
+        self.view_tabs.setCurrentIndex(self._TAB_INDEX_DIAGRAMS)
+        self.diagram_container.focus_active_diagram()
+
+    def _save_diagram(self) -> None:
+        """Save the currently active diagram."""
+        from pathlib import Path
+        from PySide6.QtWidgets import QFileDialog
+
+        if self.diagram_container is None:
+            return
+        from src.ui.diagrams.diagram_pane import DiagramPane
+
+        widget = self.diagram_container.diagram_tabs.currentWidget()
+        if not isinstance(widget, DiagramPane):
+            return
+
+        if widget.file_path is None:
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Diagram",
+                str(Path.home() / f"{widget.title().strip('* ')}.mmd"),
+                "Mermaid Diagrams (*.mmd);;All Files (*)",
+            )
+            if not file_path:
+                return
+            path = Path(file_path)
+        else:
+            path = widget.file_path
+
+        widget.save(path)
+        idx = self.diagram_container.diagram_tabs.currentIndex()
+        self.diagram_container.diagram_tabs.setTabText(idx, widget.title())
+
     def _focus_diagrams_tab(self) -> None:
         """Slot for Diagrams -> Focus Diagrams Tab."""
         idx = getattr(self, "_TAB_INDEX_DIAGRAMS", None)
@@ -832,14 +893,22 @@ class MenuConstructionMixin:
         from src.ui.terminal.settings_dialog import TerminalSettingsDialog
 
         if TerminalSettingsDialog.open_dialog(self):
-            # Apply the new theme immediately to any future repaints.
-            from src.ui.terminal.settings_dialog import get_terminal_theme
-            from src.ui.terminal.renderer import apply_theme
+            from src.ui.terminal.settings_dialog import get_terminal_theme, load_terminal_settings
+            from src.ui.terminal.renderer import apply_theme, set_font_family
+            from src.ui.terminal.terminal_session_view import TerminalSessionView
 
             apply_theme(get_terminal_theme())
-            # Force a repaint on the active terminal session so the user
-            # sees the change immediately.
-            sess = self._active_terminal_session()
-            if sess is not None:
-                sess._repaint()
+            ts = load_terminal_settings()
+            set_font_family(ts["font_family"])
+
+            # Apply font + theme to every open terminal session.
+            sessions: list[TerminalSessionView] = []
+            if self.terminal_container is not None:
+                sessions.extend(self.terminal_container._sessions)
+            claude_container = getattr(self, "claude_container", None)
+            if claude_container is not None:
+                sessions.extend(claude_container._sessions)
+            for sess in sessions:
+                sess.apply_font_settings(ts["font_family"], ts["font_size"])
+
             self.status.showMessage("Terminal settings saved.", 3000)

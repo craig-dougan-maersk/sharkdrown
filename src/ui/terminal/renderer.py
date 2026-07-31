@@ -71,11 +71,30 @@ _16_COLOR_HEX: dict[str, str] = {
 # the hardcoded dark palette above is used (backward-compatible default).
 _active_theme: "dict[str, str] | None" = None
 
+# Active font-family override — set by ``set_font_family()`` at runtime.
+# Empty string means use the hardcoded fallback stack.
+_active_font_family: str = ""
+
 
 def apply_theme(theme: "dict[str, str] | None") -> None:
     """Set the active terminal colour theme (or None to reset to default)."""
     global _active_theme
     _active_theme = theme
+
+
+def set_font_family(family: str) -> None:
+    """Set the CSS font-family used in rendered terminal HTML.
+
+    Pass an empty string to revert to the built-in monospace fallback stack.
+    """
+    global _active_font_family
+    _active_font_family = family or ""
+
+
+def _get_font_family() -> str:
+    if _active_font_family:
+        return f"{_active_font_family},Menlo,Consolas,monospace"
+    return "Menlo,Consolas,monospace"
 
 
 def _get_fg() -> str:
@@ -283,7 +302,7 @@ def screen_to_html(
     bg = _get_bg()
     out: list[str] = [
         '<pre style="'
-        'font-family:Menlo,Consolas,monospace;'
+        f'font-family:{_get_font_family()};'
         f'--term-fg:{fg};'
         f'--term-bg:{bg};'
         'margin:0;padding:0;'

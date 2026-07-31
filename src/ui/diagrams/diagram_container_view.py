@@ -4,14 +4,11 @@ Hosts a closable ``QTabWidget`` of ``DiagramPane`` instances plus an
 empty-state placeholder. This widget is the page inserted into
 ``view_tabs`` as the second top-level tab in
 ``src/ui/main_window/window.py``.
-
-Structural scaffold only: ``DiagramPane`` reserves the editor/render
-surface but does not yet render anything. Rendering will need a backend
-(QtWebEngine for Mermaid, or a Graphviz subprocess), which is a
-dependency decision deliberately left out of this change.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence
@@ -22,42 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-
-class DiagramPane(QWidget):
-    """A single diagram document surface.
-
-    Deliberately inert for now. It owns a ``name`` so the container can
-    label its tab, and a centred placeholder so an open diagram tab
-    reads as "not implemented" rather than as a rendering bug.
-    """
-
-    def __init__(self, name: str, parent=None) -> None:
-        super().__init__(parent)
-        self._name = name
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        self.placeholder = QLabel(
-            f"<b>{name}</b><br><br>"
-            "Diagram rendering is not wired up yet."
-        )
-        self.placeholder.setAlignment(Qt.AlignCenter)
-        self.placeholder.setStyleSheet("color: gray; font-size: 12px;")
-        layout.addWidget(self.placeholder, 1)
-
-    def title(self) -> str:
-        """Tab label for this pane."""
-        return self._name
-
-    def shutdown(self) -> None:
-        """Release any per-pane resources.
-
-        A no-op today, but the container's ``shutdown`` calls it so that
-        adding a render subprocess or web engine view later needs no
-        change at the MainWindow level.
-        """
+from .diagram_pane import DiagramPane
 
 
 class DiagramContainerView(QWidget):
@@ -119,6 +81,18 @@ class DiagramContainerView(QWidget):
             name = f"untitled-{self._untitled_counter}.mmd"
 
         pane = DiagramPane(name, parent=self)
+        pane.document_modified.connect(self._on_pane_modified)
+        index = self.diagram_tabs.addTab(pane, pane.title())
+        self.diagram_tabs.setCurrentIndex(index)
+        self._panes.append(pane)
+        self._update_empty_state()
+        return pane
+
+    def open_diagram(self, path: Path) -> DiagramPane:
+        """Open an existing .mmd file in a new diagram tab."""
+        pane = DiagramPane(path.name, parent=self)
+        pane.load(path)
+        pane.document_modified.connect(self._on_pane_modified)
         index = self.diagram_tabs.addTab(pane, pane.title())
         self.diagram_tabs.setCurrentIndex(index)
         self._panes.append(pane)
@@ -177,6 +151,13 @@ class DiagramContainerView(QWidget):
                 self._panes.remove(widget)
             widget.deleteLater()
         self._update_empty_state()
+
+    def _on_pane_modified(self) -> None:
+        """Update the tab title when a pane's dirty state changes."""
+        for i in range(self.diagram_tabs.count()):
+            pane = self.diagram_tabs.widget(i)
+            if isinstance(pane, DiagramPane):
+                self.diagram_tabs.setTabText(i, pane.title())
 
     def _update_empty_state(self) -> None:
         """Swap between the placeholder and the tab strip."""

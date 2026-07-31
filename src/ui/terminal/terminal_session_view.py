@@ -1193,6 +1193,29 @@ class TerminalSessionView(QWidget):
             self._session.resize(self._rows, self._cols)
         self._repaint()
 
+    def apply_font_settings(self, font_family: str, font_size: int) -> None:
+        """Apply saved terminal font settings to this live session.
+
+        Called when the settings dialog is accepted so existing sessions
+        update immediately without needing to be recreated.
+        """
+        if font_family:
+            from PySide6.QtGui import QFont
+            new_font = QFont(font_family)
+        else:
+            new_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        size = font_size if font_size > 0 else max(self._base_font.pointSize(), 10)
+        size = max(self.MIN_FONT_POINT_SIZE, min(self.MAX_FONT_POINT_SIZE, size))
+        new_font.setPointSize(size)
+        self._base_font = new_font
+        self.text_edit.setFont(self._base_font)
+        if self.text_edit.has_selection():
+            self.text_edit.clear_selection()
+        self._recompute_size()
+        if self._session is not None and self._started and not self._exited:
+            self._session.resize(self._rows, self._cols)
+        self._repaint()
+
     # ---- UI construction ---------------------------------------------------
 
     def _build_ui(self) -> None:
