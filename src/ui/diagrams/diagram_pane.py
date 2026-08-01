@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 
 from .codegen.mermaid_generator import MermaidCodeGenerator
 from .io.file_io import load_diagram, save_diagram
+from .model.connector_types import EndingType, LineStyle
 from .model.diagram_document import DiagramDocument
 from .model.free_text_model import FreeTextModel
 from .palette.shape_palette import ShapePalette
@@ -21,6 +22,7 @@ from .preview.code_preview import CodePreview
 from .preview.minimap import MiniMap
 from .scene.diagram_scene import DiagramScene
 from .scene.diagram_view import DiagramView
+from .scene.items.connector_item import ConnectorItem
 from .scene.items.node_item import DiagramNodeItem
 from .toolbar.diagram_toolbar import DiagramToolbar
 
@@ -141,6 +143,19 @@ class DiagramPane(QWidget):
         self._toolbar.fill_color_picked.connect(self._apply_fill_color)
         self._toolbar.outline_color_picked.connect(self._apply_outline_color)
         self._toolbar.add_text_requested.connect(self._add_free_text)
+        self._toolbar.connector_mode_toggled.connect(self._scene.set_connector_mode)
+
+        # Connector style drawer
+        drawer = self._toolbar._style_drawer
+        drawer.line_style_changed.connect(self._apply_connector_style)
+        drawer.weight_changed.connect(self._apply_connector_weight)
+        drawer.color_changed.connect(self._apply_connector_color)
+        drawer.start_ending_changed.connect(self._apply_start_ending)
+        drawer.end_ending_changed.connect(self._apply_end_ending)
+        drawer.label_changed.connect(self._apply_connector_label)
+
+        self._scene.selectionChanged.connect(self._on_selection_changed)
+        self._scene.connector_label_edited.connect(self._on_connector_label_edited)
 
     def _on_document_changed(self) -> None:
         self._dirty = True
@@ -162,6 +177,78 @@ class DiagramPane(QWidget):
             if isinstance(item, DiagramNodeItem):
                 item.set_outline_color(color)
         self._scene.document_changed.emit()
+
+    def _on_selection_changed(self) -> None:
+        selected = self._scene.selectedItems()
+        connector_items = [it for it in selected if isinstance(it, ConnectorItem)]
+        self._toolbar.set_connector_selection(len(connector_items))
+        if connector_items:
+            self._toolbar.populate_style_drawer(connector_items[0].model)
+
+    def _on_connector_label_edited(self, connector_id: str, new_text: str) -> None:
+        # The model has already been mutated by ConnectorItem.focusOutEvent.
+        # document_changed has been emitted via the scene signal.
+        del connector_id, new_text
+
+    def _selected_connector_items(self) -> list[ConnectorItem]:
+        return [
+            it for it in self._scene.selectedItems() if isinstance(it, ConnectorItem)
+        ]
+
+    def _apply_connector_style(self, style_value: str) -> None:
+        try:
+            style = LineStyle(style_value)
+        except ValueError:
+            return
+        for item in self._selected_connector_items():
+            item.set_line_style(style)
+            self._document.update_connector(item.model)
+        if self._selected_connector_items():
+            self._scene.document_changed.emit()
+
+    def _apply_connector_weight(self, weight: float) -> None:
+        for item in self._selected_connector_items():
+            item.set_weight(weight)
+            self._document.update_connector(item.model)
+        if self._selected_connector_items():
+            self._scene.document_changed.emit()
+
+    def _apply_connector_color(self, color: str) -> None:
+        for item in self._selected_connector_items():
+            item.set_color(color)
+            self._document.update_connector(item.model)
+            self._toolbar._style_drawer.set_color(color)
+        if self._selected_connector_items():
+            self._scene.document_changed.emit()
+
+    def _apply_start_ending(self, ending_value: str) -> None:
+        try:
+            ending = EndingType(ending_value)
+        except ValueError:
+            return
+        for item in self._selected_connector_items():
+            item.set_start_ending(ending)
+            self._document.update_connector(item.model)
+        if self._selected_connector_items():
+            self._scene.document_changed.emit()
+
+    def _apply_end_ending(self, ending_value: str) -> None:
+        try:
+            ending = EndingType(ending_value)
+        except ValueError:
+            return
+        for item in self._selected_connector_items():
+            item.set_end_ending(ending)
+            self._document.update_connector(item.model)
+        if self._selected_connector_items():
+            self._scene.document_changed.emit()
+
+    def _apply_connector_label(self, new_label: str) -> None:
+        for item in self._selected_connector_items():
+            item.set_label(new_label)
+            self._document.update_connector(item.model)
+        if self._selected_connector_items():
+            self._scene.document_changed.emit()
 
     def _add_free_text(self) -> None:
         center = self._view.mapToScene(

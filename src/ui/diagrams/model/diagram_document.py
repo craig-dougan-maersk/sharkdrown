@@ -43,6 +43,19 @@ class DiagramDocument:
     def remove_connector(self, connector_id: str) -> None:
         self.connectors = [c for c in self.connectors if c.id != connector_id]
 
+    def update_connector(self, connector: ConnectorModel) -> None:
+        """Replace a connector in-place by id. No-op if not found."""
+        for i, c in enumerate(self.connectors):
+            if c.id == connector.id:
+                self.connectors[i] = connector
+                return
+
+    def get_connector(self, connector_id: str) -> ConnectorModel | None:
+        for c in self.connectors:
+            if c.id == connector_id:
+                return c
+        return None
+
     def add_free_text(self, text: FreeTextModel) -> None:
         self.free_texts.append(text)
 

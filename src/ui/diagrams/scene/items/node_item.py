@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 
 from ...model.node_model import NodeModel
 from ...model.shape_types import ShapeType
+from .anchor_point import ANCHOR_NEW, AnchorPoint
 
 
 class DiagramNodeItem(QGraphicsObject):
@@ -45,6 +46,7 @@ class DiagramNodeItem(QGraphicsObject):
         self._center_text()
 
         self._hovered = False
+        self._anchors: list[AnchorPoint] = []
 
     @property
     def model(self) -> NodeModel:
@@ -207,6 +209,28 @@ class DiagramNodeItem(QGraphicsObject):
         """Find the anchor point closest to a given scene coordinate."""
         anchors = self.get_anchor_points()
         return min(anchors, key=lambda a: _distance(a, scene_point))
+
+    def ensure_connection_anchors(self) -> list[AnchorPoint]:
+        """Idempotently create 4 AnchorPoints (top/right/bottom/left)."""
+        if self._anchors:
+            return self._anchors
+        for local in (
+            QPointF(self._width / 2, 0),  # top
+            QPointF(self._width, self._height / 2),  # right
+            QPointF(self._width / 2, self._height),  # bottom
+            QPointF(0, self._height / 2),  # left
+        ):
+            anchor = AnchorPoint(local, self, role=ANCHOR_NEW)
+            self._anchors.append(anchor)
+        return self._anchors
+
+    def show_connection_anchors(self) -> None:
+        for anchor in self.ensure_connection_anchors():
+            anchor.show_anchor()
+
+    def hide_connection_anchors(self) -> None:
+        for anchor in self._anchors:
+            anchor.hide_anchor()
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionHasChanged:

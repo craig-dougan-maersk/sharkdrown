@@ -17,6 +17,9 @@ class ConnectorModel:
     start_ending: EndingType = EndingType.OPEN
     end_ending: EndingType = EndingType.ARROW
     label: str = ""
+    # Display-only attributes (not part of Mermaid syntax).
+    color: str = "#555555"
+    weight: float = 2.0
 
     def to_dict(self) -> dict:
         return {
@@ -27,6 +30,8 @@ class ConnectorModel:
             "start_ending": self.start_ending.value,
             "end_ending": self.end_ending.value,
             "label": self.label,
+            "color": self.color,
+            "weight": self.weight,
         }
 
     @classmethod
@@ -39,4 +44,6 @@ class ConnectorModel:
             start_ending=EndingType(data.get("start_ending", "open")),
             end_ending=EndingType(data.get("end_ending", "arrow")),
             label=data.get("label", ""),
+            color=data.get("color", "#555555"),
+            weight=data.get("weight", 2.0),
         )

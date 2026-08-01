@@ -73,8 +73,20 @@ class DiagramView(QGraphicsView):
             self._pan_start = event.position()
             self.setCursor(Qt.ClosedHandCursor)
             event.accept()
-        else:
-            super().mousePressEvent(event)
+            return
+        if (
+            event.button() == Qt.LeftButton
+            and event.modifiers() == Qt.NoModifier
+        ):
+            scene_pos = self.mapToScene(event.position().toPoint())
+            item_under = self.itemAt(event.position().toPoint())
+            scene = self.scene()
+            if isinstance(scene, DiagramScene) and scene.handle_left_click(
+                scene_pos, item_under
+            ):
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
         if self._panning:
@@ -87,16 +99,37 @@ class DiagramView(QGraphicsView):
                 self.verticalScrollBar().value() - int(delta.y())
             )
             event.accept()
-        else:
-            super().mouseMoveEvent(event)
+            return
+        scene = self.scene()
+        if isinstance(scene, DiagramScene):
+            scene_pos = self.mapToScene(event.position().toPoint())
+            scene.handle_mouse_move(scene_pos)
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MiddleButton and self._panning:
             self._panning = False
             self.setCursor(Qt.ArrowCursor)
             event.accept()
-        else:
-            super().mouseReleaseEvent(event)
+            return
+        if event.button() == Qt.LeftButton:
+            scene = self.scene()
+            if isinstance(scene, DiagramScene):
+                scene_pos = self.mapToScene(event.position().toPoint())
+                item_under = self.itemAt(event.position().toPoint())
+                if scene.handle_mouse_release(scene_pos, item_under):
+                    event.accept()
+                    return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Escape:
+            scene = self.scene()
+            if isinstance(scene, DiagramScene):
+                scene.cancel_creation()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasFormat(SHAPE_MIME_TYPE):

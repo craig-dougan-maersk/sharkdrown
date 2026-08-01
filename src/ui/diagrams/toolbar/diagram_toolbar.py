@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .connector_style_drawer import ConnectorStyleDrawer
+
 
 class DiagramToolbar(QToolBar):
     """Toolbar for the diagram editor canvas."""
@@ -41,6 +43,8 @@ class DiagramToolbar(QToolBar):
         self._build_connector_toggle()
         self.addSeparator()
         self._build_color_controls()
+        self.addSeparator()
+        self._build_connector_style_drawer()
         self.addSeparator()
         self._build_text_button()
 
@@ -108,6 +112,18 @@ class DiagramToolbar(QToolBar):
         text_btn.setToolTip("Add a free text annotation")
         text_btn.clicked.connect(self.add_text_requested.emit)
         self.addWidget(text_btn)
+
+    def _build_connector_style_drawer(self) -> None:
+        self._style_drawer = ConnectorStyleDrawer()
+        self.addWidget(self._style_drawer)
+
+    def set_connector_selection(self, count: int) -> None:
+        """Enable/disable the connector style drawer based on selection."""
+        self._style_drawer.set_enabled(count > 0)
+
+    def populate_style_drawer(self, model) -> None:
+        """Preload the style drawer from a connector model."""
+        self._style_drawer.populate(model)
 
     def update_zoom_display(self, zoom: float) -> None:
         pct = int(zoom * 100)
