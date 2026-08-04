@@ -19,7 +19,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QTabWidget,
     QTableWidget,
@@ -31,14 +33,12 @@ from PySide6.QtWidgets import (
 from src.profiles.credential_store import CredentialStore
 from src.profiles.models import ClaudeProfile, ModelEndpoint, Provider, slugify
 
-from src.ui.claude.profile_editor._general_tab import GeneralTabMixin
 from src.ui.claude.profile_editor._endpoints_tab import EndpointsTabMixin
-from src.ui.claude.profile_editor._providers_tab import ProvidersTabMixin
-from src.ui.claude.profile_editor._api_keys_tab import ApiKeysTabMixin
 from src.ui.claude.profile_editor._env_vars_tab import EnvVarsTabMixin
 from src.ui.claude.profile_editor._settings_subagents_tab import SettingsSubagentsTabMixin
 from src.ui.claude.profile_editor._plugins_tab import PluginsTabMixin
 from src.ui.claude.profile_editor._mcp_servers_tab import McpServersTabMixin
+from src.ui.claude.profile_editor._container_tab import ContainerTabMixin
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -70,14 +70,12 @@ def _populate_pairs(table: QTableWidget, pairs: list[tuple[str, str]]) -> None:
 
 
 class ProfileEditorDialog(
-    GeneralTabMixin,
     EndpointsTabMixin,
-    ProvidersTabMixin,
-    ApiKeysTabMixin,
     EnvVarsTabMixin,
     SettingsSubagentsTabMixin,
     PluginsTabMixin,
     McpServersTabMixin,
+    ContainerTabMixin,
     QDialog,
 ):
     """Edit one :class:`ClaudeProfile` plus its credential value.
@@ -98,6 +96,8 @@ class ProfileEditorDialog(
         profile: ClaudeProfile,
         *,
         credential_store: CredentialStore,
+        global_settings_store: "GlobalSettingsStore | None" = None,
+        global_settings_loader: "Callable[[], GlobalSettings] | None" = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -105,6 +105,24 @@ class ProfileEditorDialog(
         self.resize(720, 720)
         self._profile = copy.deepcopy(profile)
         self._creds = credential_store
+        # Stash the credential store on every tab mixin so the
+        # Model Configuration tab's read-only "API Key" column
+        # can resolve the row's provider's ``key_ref`` against the
+        # global credential registry (the same store the Claude
+        # > Settings > API Keys tab edits).
+        self._credential_store = credential_store
+        # Optional GlobalSettingsStore injection — lets tests
+        # point the dialog at a fixture store instead of the
+        # production ``data_dir()`` location. The production app
+        # never passes this kwarg; it relies on the loader to
+        # read from ``data_dir()`` indirectly.
+        self._global_settings_store = global_settings_store
+        # Optional loader (preferred over ``global_settings_store``
+        # in production) — installed by the main window so the
+        # dialog sees live global state without the user having
+        # to commit Claude > Settings first. Falls back to the
+        # injected store, then the on-disk default.
+        self._global_settings_loader = global_settings_loader
         self._cred_edited_by_key: dict[str, str | bool] = {}
         self._key_renames: dict[str, str] = {}
         self._initial_key_names: set[str] = set(self._creds.all_refs().keys())
@@ -116,25 +134,36 @@ class ProfileEditorDialog(
         layout = QVBoxLayout(self)
 
         intro = QLabel(
-            "Configure a Claude Code session profile. The proxy will route "
-            "requests for each model to its configured endpoint. Sessions "
-            "always go through the embedded proxy at localhost."
+            "Configure a Claude Code session profile. Providers, API keys, "
+            "proxy bind/port and the global CLAUDE.md are managed at "
+            "Claude → Settings; everything here is per-profile."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
+        # The profile name is the only "general" field that stayed
+        # per-profile — it's the identity of the record. Bind /
+        # port / config_dir / session CWD moved to Claude > Settings.
+        name_row = QHBoxLayout()
+        name_label = QLabel("Profile name:")
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("e.g. Default")
+        name_row.addWidget(name_label)
+        name_row.addWidget(self.name_edit, 1)
+        name_container = QWidget()
+        name_container.setLayout(name_row)
+        layout.addWidget(name_container)
+
         self.tabs = QTabWidget(self)
         layout.addWidget(self.tabs, 1)
 
-        self._build_general_tab()
         self._build_endpoints_tab()
-        self._build_providers_tab()
-        self._build_api_key_tab()
         self._build_env_vars_tab()
         self._build_plugins_tab()
         self._build_mcp_servers_tab()
         self._build_settings_tab()
         self._build_subagents_tab()
+        self._build_container_tab()
 
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -153,6 +182,93 @@ class ProfileEditorDialog(
         container_layout.addWidget(inner)
         return container
 
+    def _wrap_in_scroll(
+        self, widget: QWidget, *, max_height: int
+    ) -> "QScrollArea":
+        """Wrap ``widget`` in a fixed-height scroll area.
+
+        Used by per-tab builders to cap the vertical real estate a
+        table / tree view can claim before its own scrollbar
+        appears. Extracted into a small wrapper so the moved
+        ``GeneralTabMixin`` (which lived here before the menu
+        restructure) doesn't drag this helper with it.
+        """
+        from src.ui.claude._qt_helpers import wrap_in_scroll
+
+        return wrap_in_scroll(widget, max_height=max_height)
+
+    def _remove_selected_rows(self, table: QTableWidget) -> None:
+        """Remove the selected rows from ``table`` and reset the form.
+
+        Shared by the Endpoints and Env Vars tabs (both have a
+        "Remove Selected" button). The endpoints and env tabs each
+        track their selected row on a different attribute — both
+        tabs share one ``_selected_*_row`` integer plus a
+        ``_on_*_selection_changed`` slot that mirrors the table
+        selection into the form. To clear the form after a delete,
+        we look up the right resetter by table identity.
+
+        Iteration: ``QTableWidget.removeRow`` re-indexes every row
+        below the removed one, so we delete in *reverse* order — a
+        forward pass would shift the row indices as we go and skip
+        every other row. After the deletion, the form's snapshot
+        (``_endpoint_row_snapshot`` / ``_env_row_snapshot``) is
+        stale (the row it pointed at may now be a different row,
+        or the table may have fewer rows), so we clear it and let
+        the table's selection-changed signal repopulate.
+
+        Edge case: removing the last row leaves the table empty
+        rather than automatically seeding a blank one. That's
+        intentional — the API Keys / Providers tab's "default
+        row pinned" pattern doesn't apply here, and the user can
+        always click Add to get a fresh blank row.
+        """
+        # The tabs that use this helper all expose ``_selected_X_row``
+        # and a ``_on_X_selection_changed`` slot. Build a tiny
+        # mapping from table-widget identity to those symbols so we
+        # can dispatch the right reset after the deletion. The
+        # ``getattr`` is defensive — a tab that hasn't wired the
+        # selection signal yet still gets a clean removal.
+        table_to_reset = {
+            self.endpoints_table: "_selected_endpoint_row",
+            self.env_table: "_selected_env_row",
+        }
+        sel_model = table.selectionModel()
+        if sel_model is None:
+            return
+        # ``selectedRows`` returns the index column for each row in
+        # selection order; sort descending so deletion doesn't
+        # re-index past us.
+        rows = sorted(
+            (idx.row() for idx in sel_model.selectedRows()),
+            reverse=True,
+        )
+        if not rows:
+            return
+        for row in rows:
+            if row < 0 or row >= table.rowCount():
+                continue
+            table.removeRow(row)
+        # Reset the per-tab selection tracker and clear any open
+        # form snapshot. The selection-changed signal will fire
+        # (with no rows selected) and update the form to
+        # "Select a row to edit" — but we set the tracker first
+        # so the on-change handler sees ``-1`` and resets the
+        # snapshot.
+        attr = table_to_reset.get(table)
+        if attr is not None:
+            setattr(self, attr, -1)
+        if table is self.endpoints_table:
+            self._endpoint_row_snapshot = None
+            self._set_endpoint_form_enabled(False)
+            self.endpoint_form_status.setText("Select a row to edit")
+            self._refresh_endpoint_apply_state()
+        elif table is self.env_table:
+            self._env_row_snapshot = None
+            self._set_env_form_enabled(False)
+            self.env_form_status.setText("Select a row to edit")
+            self._refresh_env_apply_state()
+
     # ---- population (coordinates order across tabs) ----
 
     def _populate(self) -> None:
@@ -165,16 +281,10 @@ class ProfileEditorDialog(
                 self._populate_default_model_combo()
             finally:
                 self.default_model_combo.blockSignals(False)
-            self.cwd_edit.setText(self._profile.session_cwd or "")
-            self.bind_edit.setText(self._profile.bind_address or "127.0.0.1")
-            self.port_edit.setValue(int(self._profile.port or 0))
-            self.config_dir_edit.setText(self._profile.config_dir or "")
-            # API Keys first (endpoint combos need key names)
-            self._populate_keys_table()
-            # Providers next (endpoint combos need provider names)
-            self._populate_providers_table()
-            # Endpoints (depends on both keys and providers)
-            self._maybe_seed_endpoints_from_provider_catalog()
+            # Endpoints. Providers are global now so seeding from a
+            # per-profile catalog no longer applies — the user adds
+            # endpoints explicitly. We still materialise whatever's
+            # already on the profile.
             self.endpoints_table.setRowCount(0)
             for model_name, endpoint in self._profile.model_endpoints.items():
                 self._append_endpoint_row(model_name, endpoint)
@@ -191,13 +301,10 @@ class ProfileEditorDialog(
                 settings_text = ""
             self.settings_edit.setPlainText(settings_text)
             self._refresh_subagent_list()
+            self._populate_container_tab()
         finally:
             self._populating = False
         # Auto-select first row in each table
-        if self.keys_table.rowCount() > 0:
-            self.keys_table.selectRow(0)
-        if self.providers_table.rowCount() > 0:
-            self.providers_table.selectRow(0)
         if self.endpoints_table.rowCount() > 0:
             self.endpoints_table.selectRow(0)
         if self.env_table.rowCount() > 0:
@@ -206,22 +313,18 @@ class ProfileEditorDialog(
     # ---- accept (validation + save) ----
 
     def _on_accept(self) -> None:
-        # Snap-apply pending form edits
+        # Snap-apply pending form edits. The endpoints + env-vars
+        # tabs own their own row state (see ``_endpoints_tab.py``
+        # and ``_env_vars_tab.py``); provider + key rows used to
+        # live here too, but those tabs moved to
+        # ``Claude > Settings`` (see
+        # ``src/ui/claude/global_settings/``) and their snap-apply
+        # blocks ran there.
         if (
             getattr(self, "_selected_endpoint_row", -1) >= 0
             and self._endpoint_form_values_diverge_from_row()
         ):
             self._on_endpoint_apply()
-        if (
-            getattr(self, "_selected_provider_row", -1) >= 0
-            and self._provider_form_values_diverge_from_row()
-        ):
-            self._on_provider_apply()
-        if (
-            getattr(self, "_selected_key_row", -1) >= 0
-            and self._key_form_values_diverge_from_row()
-        ):
-            self._on_key_apply()
         if (
             getattr(self, "_selected_env_row", -1) >= 0
             and self._env_form_values_diverge_from_row()
@@ -236,67 +339,61 @@ class ProfileEditorDialog(
         self._profile.name = name
         self._profile.slug = slugify(name)
 
-        # API Keys: validate uniqueness + persist
-        key_names = self._current_key_names()
-        if "default" not in key_names:
-            QMessageBox.warning(
-                self,
-                "Missing default key",
-                "The 'default' API key cannot be removed. "
-                "Re-add it before saving.",
-            )
-            return
-        seen: set[str] = set()
-        dups: list[str] = []
-        for n in key_names:
-            if n in seen:
-                dups.append(n)
-            seen.add(n)
-        if dups:
-            QMessageBox.warning(
-                self,
-                "Duplicate API key names",
-                f"Each API key must have a unique name. Duplicates: {dups!r}.",
-            )
-            return
-        # Process deletions
-        for ref_name in list(self._cred_edited_by_key.keys()):
-            if ref_name.startswith("__deleted__"):
-                deleted_name = ref_name[len("__deleted__"):]
-                try:
-                    self._creds.delete(deleted_name)
-                except (OSError, json.JSONDecodeError):
-                    pass
-        # Apply renames
-        for new_name, old_name in self._key_renames.items():
-            try:
-                existing = self._creds.get(old_name)
-                if existing is not None:
-                    self._creds.set(new_name, existing)
-                self._creds.delete(old_name)
-            except (OSError, json.JSONDecodeError):
-                pass
-        # Apply value edits
-        for ref_name, value in list(self._cred_edited_by_key.items()):
-            if ref_name.startswith("__deleted__"):
-                continue
-            if not isinstance(value, str):
-                continue
-            if value == "":
-                continue
-            try:
-                self._creds.set(ref_name, value)
-            except (OSError, json.JSONDecodeError):
-                pass
+        # API Keys live in the global settings store now; the
+        # profile editor only references them by name via the
+        # provider's ``key_ref``. The default-key + uniqueness
+        # invariants are enforced by GlobalSettingsDialog's own
+        # accept handler — duplicating the check here would
+        # briefly accept a malformed global state during the
+        # window between Claude > Settings save and a profile
+        # save, and we'd need a stale-key error path that the
+        # user has no UI to fix from. Trust the global store.
+        #
+        # The ``_cred_edited_by_key`` / ``_key_renames`` dicts
+        # used to be mutated here too; they're now owned by the
+        # global settings dialog and never touched from this
+        # class. ``_initial_key_names`` is kept on the instance
+        # for symmetry with the global dialog (and so future
+        # edits to the sensitive-header sanitizer can still find
+        # the baseline) but is unused here.
 
-        # Providers
-        providers = self._collect_providers()
+        # Providers live in the global settings store now; the
+        # profile editor only references them by name. Read the
+        # registry from the global store for the validation checks
+        # below — adding new providers is done in Claude > Settings.
+        #
+        # Resolution order, mirroring the live loader the main
+        # window installs:
+        #   1. ``self._global_settings_loader`` (a callable that
+        #      returns the live ``GlobalSettings`` — the production
+        #      app installs this so the dialog sees edits the user
+        #      made in Claude > Settings without an intermediate
+        #      save).
+        #   2. ``self._global_settings_store`` (a direct
+        #      ``GlobalSettingsStore`` instance — the test path;
+        #      keeps the read inside the test's tmp dir rather than
+        #      touching the user's real ``data_dir()``).
+        #   3. The production ``data_dir()`` path. The widget never
+        #      has to explicitly construct this — the imported
+        #      factory inside the ``else`` branch does.
+        if self._global_settings_loader is not None:
+            global_settings = self._global_settings_loader()
+        elif self._global_settings_store is not None:
+            global_settings = self._global_settings_store.load()
+        else:
+            from src.profiles.global_settings import GlobalSettingsStore
+            from src.proxy.paths import data_dir
+
+            global_settings = GlobalSettingsStore(
+                data_dir() / "claude_global.json"
+            ).load()
+        providers = global_settings.providers or {}
         if "default" not in providers:
             QMessageBox.warning(
                 self,
                 "Missing default provider",
-                "A 'default' provider is required. Re-add it on the "
-                "Providers tab before saving.",
+                "A 'default' provider is required. Add one on the "
+                "Claude > Settings > Providers tab before saving.",
             )
             return
         seen_prov: set[str] = set()
@@ -312,7 +409,6 @@ class ProfileEditorDialog(
                 f"Each provider must have a unique name. Duplicates: {dups_prov!r}.",
             )
             return
-        self._profile.providers = providers
 
         # Endpoints
         endpoints = self._collect_endpoints()
@@ -332,10 +428,9 @@ class ProfileEditorDialog(
                 self,
                 "Missing provider references",
                 "These model/endpoint rows reference a provider that "
-                "no longer exists. The row's Provider dropdown has "
-                "been reset to '(no provider)' — re-add the provider "
-                "on the Providers tab or pick another provider, then "
-                "save again.\n\n"
+                "no longer exists in the global registry. Add the "
+                "provider on Claude > Settings > Providers or pick "
+                "another provider, then save again.\n\n"
                 f"Rows: {stale_providers!r}",
             )
             return
@@ -345,7 +440,11 @@ class ProfileEditorDialog(
             provider = providers.get(ep.provider_name)
             if provider is None:
                 continue
-            catalog = tuple(provider.available_models or ())
+            catalog = tuple(
+                provider.get("available_models") or []
+                if isinstance(provider, dict)
+                else (getattr(provider, "available_models", ()) or ())
+            )
             if catalog and model not in catalog:
                 stale_models.append(
                     f"{model!r} not in {ep.provider_name!r}.available_models"
@@ -357,7 +456,8 @@ class ProfileEditorDialog(
                 "Each model must appear in the catalog of the "
                 "provider that hosts it. Add the model to the "
                 "provider's Available Models field on the "
-                "Providers tab, or pick a different provider.\n\n"
+                "Claude > Settings > Providers tab, or pick a "
+                "different provider.\n\n"
                 f"Models: {stale_models!r}",
             )
             return
@@ -414,21 +514,22 @@ class ProfileEditorDialog(
                 return
         self._profile.model_endpoints = endpoints
 
-        # Default model
+        # Default model — stored under ``claude_settings["model"]`` so
+        # the per-profile ``settings.json`` writes the same key Claude
+        # Code reads. Previously a first-class dataclass field.
         default_model: str | None = self.default_model_combo.currentData()
         if default_model is not None:
             default_model = str(default_model).strip() or None
-        self._profile.default_model = default_model
+        if not isinstance(self._profile.claude_settings, dict):
+            self._profile.claude_settings = {}
+        if default_model:
+            self._profile.claude_settings["model"] = default_model
+        else:
+            self._profile.claude_settings.pop("model", None)
 
-        # Session CWD
-        cwd = self.cwd_edit.text().strip() or None
-        self._profile.session_cwd = cwd
-
-        # Proxy / network
-        bind = self.bind_edit.text().strip() or "127.0.0.1"
-        self._profile.bind_address = bind
-        self._profile.port = int(self.port_edit.value())
-        self._profile.config_dir = self.config_dir_edit.text().strip()
+        # Bind / port / config_dir / session CWD are global now —
+        # no per-profile copies. The General tab moved to
+        # ``Claude > Settings``.
 
         # Env vars
         self._profile.env_vars = dict(_table_pairs(self.env_table))
@@ -440,7 +541,21 @@ class ProfileEditorDialog(
         # re-gather here.
         self._profile.mcp_servers = self._collect_mcp_servers()
 
-        # Claude settings (raw JSON)
+        # Container — ``run_in_container`` + image + name. The
+        # ``Container`` tab mutates ``self._profile`` in place via
+        # ``_collect_container_tab``; we just call it here so the
+        # accept handler commits the user's changes.
+        self._collect_container_tab()
+
+        # Claude settings (raw JSON) — merge the parsed JSON on top
+        # of the dict we've accumulated so far (the Default model
+        # combo writes ``model`` *before* this block runs; the
+        # Plugins / MCP / Subagents tab handlers mutate specific
+        # keys the same way). Replacing the dict wholesale would
+        # silently drop those writes, so the JSON editor's
+        # contents is treated as *additive* — the form is the
+        # source of truth for the structured keys, and the JSON
+        # is the escape hatch for everything else.
         raw = self.settings_edit.toPlainText().strip()
         if raw:
             try:
@@ -459,8 +574,13 @@ class ProfileEditorDialog(
                     "Claude Settings must be a JSON object (not a list or scalar).",
                 )
                 return
-            self._profile.claude_settings = parsed
-        else:
+            merged = dict(self._profile.claude_settings)
+            merged.update(parsed)
+            self._profile.claude_settings = merged
+        elif not self._profile.claude_settings:
+            # Both the JSON editor and the form says nothing — keep
+            # an empty dict rather than wiping whatever the form
+            # handlers may have written.
             self._profile.claude_settings = {}
 
         self.accept()

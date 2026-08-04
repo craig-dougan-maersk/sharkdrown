@@ -712,7 +712,7 @@ class MenuConstructionMixin:
         claude_menu.addSeparator()
 
         # ---- Profile submenu ------------------------------------------
-        self.profile_menu = QMenu("&Profile", self)
+        self.profile_menu = QMenu("&Profiles", self)
         self.profile_group = QActionGroup(self)
         self.profile_group.setExclusive(True)
         claude_menu.addMenu(self.profile_menu)
@@ -728,6 +728,15 @@ class MenuConstructionMixin:
         self.profile_menu.addAction(self.action_manage_profiles)
 
         self.profile_menu.aboutToShow.connect(self._refresh_profile_menu)
+
+        # ---- Global Settings (sibling of Profiles submenu) ------------
+        # Holds truly-global Claude Code state: proxy bind/port, the
+        # provider registry, the global credential store, and the
+        # ``~/.claude/CLAUDE.md`` editor. Lives outside the Profiles
+        # submenu because the same settings apply to every profile.
+        self.action_global_settings = QAction("&Settings…", self)
+        self.action_global_settings.triggered.connect(self._show_global_settings)
+        claude_menu.addAction(self.action_global_settings)
 
     # ------------------------------------------------------------------
     # Terminal session slots

@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import dataclasses
 from dataclasses import dataclass
 from typing import Callable
 
@@ -111,6 +112,8 @@ class ClaudeContainerView(QWidget):
         self._is_proxy_running: Callable[[], bool] = lambda: False
         self._get_proxy_base_url: Callable[[], str] = lambda: ""
         self._request_proxy_start: Callable[[], None] = lambda: None
+        # Global-settings loader — installed by the main window.
+        self._load_global_settings: Callable[[], object] | None = None
         # Profile store — created lazily so the widget is importable
         # without a QApplication (the data_dir() call requires one).
         self._profile_store: ProfileStore | None = None
@@ -129,6 +132,110 @@ class ClaudeContainerView(QWidget):
         self._build_ui()
 
     # ---- public API --------------------------------------------------------
+
+    def set_global_settings_loader(
+        self, loader: Callable[[], "GlobalSettings | None"]
+    ) -> None:
+        """Install a callback that returns the current global settings.
+
+        Used by ``_global_session_cwd`` to read the *truly global*
+        default session CWD (formerly ``profile.session_cwd`` on
+        each individual profile). Installed by the main window;
+        defaults to ``None`` so tests don't need to wire it up.
+        """
+        self._load_global_settings = loader
+
+    def _global_session_cwd(self) -> str | None:
+        """Resolve the default session CWD from the global settings.
+
+        Returns ``None`` when no loader is installed (test mode) or
+        the global settings store is missing — falls through to the
+        GUI process's inherited cwd, which is what
+        :class:`PtySession` uses anyway when ``cwd`` is ``None``.
+        """
+        loader = getattr(self, "_load_global_settings", None)
+        if loader is None:
+            return None
+        try:
+            settings = loader()
+        except (OSError, ValueError):
+            return None
+        if settings is None:
+            return None
+        return settings.session_cwd or None
+
+    def _resolve_launch_mode(self, profile) -> str:
+        """Decide whether to launch Docker or local PTY.
+
+        Returns ``"docker"`` only when both the profile opts in
+        (``profile.run_in_container``) and the configured
+        container runtime CLI is on PATH. Otherwise returns
+        ``"pty"`` so the user gets a working session rather than
+        a silent ``claude (exited)`` tab.
+
+        Reads the runtime name from the live global settings
+        (via the installed ``_load_global_settings`` callback)
+        on **every** call so a runtime switch in
+        Claude > Settings — e.g. ``docker`` → ``podman`` — takes
+        effect on the next launch without an app restart. The
+        previous implementation cached the binary-availability
+        result on ``self._docker_available``; that cache pinned
+        the answer to whatever PATH looked like the first time
+        the launcher ran, so a user who installed / switched
+        runtimes mid-session kept seeing the stale
+        *"docker CLI not found on PATH"* fallback even after
+        Claude > Settings was updated. ``shutil.which`` is just
+        a stat per PATH entry — fast enough to call per launch.
+
+        Falls back to ``"docker"`` when no loader is installed
+        (test mode).
+        """
+        if not getattr(profile, "run_in_container", False):
+            return "pty"
+        import shutil
+
+        runtime = "docker"
+        loader = getattr(self, "_load_global_settings", None)
+        if loader is not None:
+            try:
+                settings = loader()
+                if settings is not None:
+                    runtime = settings.container_runtime or "docker"
+            except (OSError, ValueError):
+                pass
+        available = bool(shutil.which(runtime))
+        # ``set_runtime_binary`` keeps the docker_session module
+        # in sync with the global setting so ``ensure_container``
+        # uses the same binary.
+        try:
+            from src.ui.claude import docker_session
+
+            docker_session.set_runtime_binary(runtime)
+        except ImportError:
+            pass
+        return "docker" if available else "pty"
+
+    def _notify_docker_fallback(self, profile_name: str, reason: str) -> None:
+        """Surface a one-line warning when Docker was requested but unavailable.
+
+        Goes via the parent's status bar (``MainWindow.status.showMessage``)
+        if the container has a parent with one; otherwise logs to
+        the standard logger. ``ClaudeContainerView`` is also
+        constructed standalone in some tests, where the parent
+        has no status bar.
+        """
+        parent = self.parent()
+        msg = (
+            f"Profile {profile_name!r} requested Docker but "
+            f"{reason}; launching locally instead."
+        )
+        if parent is not None and hasattr(parent, "statusBar"):
+            try:
+                parent.statusBar().showMessage(msg, 5000)
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        logger.warning(msg)
 
     def set_proxy_callbacks(
         self,
@@ -237,8 +344,10 @@ class ClaudeContainerView(QWidget):
         # sentinel (Claude Code refuses to start without an
         # ``ANTHROPIC_API_KEY``) and warn the user.
         api_key = resolve_api_key(profile, self.profile_store.credential_store)
-        if api_key is None and profile.default_model:
-            endpoint = profile.model_endpoints.get(profile.default_model)
+        # ``default_model`` moved to ``claude_settings["model"]``.
+        default_model = (profile.claude_settings or {}).get("model") if hasattr(profile, "claude_settings") else None
+        if api_key is None and default_model:
+            endpoint = profile.model_endpoints.get(default_model)
             if endpoint and endpoint.key_ref and not self._suppress_dialogs:
                 QMessageBox.warning(
                     self,
@@ -390,23 +499,71 @@ class ClaudeContainerView(QWidget):
         *,
         api_key: str | None,
     ) -> TerminalSessionView:
-        """Actually fork the claude process in a PTY and add a tab.
+        """Fork / docker-exec the claude process and add a tab.
 
-        Caller has already validated ``claude`` on PATH and the proxy
-        running. This method:
+        Caller has already validated ``claude`` on PATH (or the
+        container image is available) and the proxy running. This
+        method:
           1. Writes the profile's config dir (settings.json + agents/).
-          2. Assembles the env via ``build_claude_session_env``.
-          3. Constructs a TerminalSessionView with the env + cwd.
-          4. Wires ``exited``, addTab, focus, tracks in self._sessions.
+          2. Optionally syncs the global CLAUDE.md into the
+             profile-scoped copy (no-op when ``profile.run_in_container``
+             is False but the sync is harmless either way).
+          3. Assembles the env via ``build_claude_session_env`` —
+             Docker mode rewrites ``ANTHROPIC_BASE_URL`` and
+             ``CLAUDE_CONFIG_DIR`` to in-container paths.
+          4. Constructs a ``TerminalSessionView`` with the env +
+             cwd. In Docker mode the view delegates to
+             :class:`DockerSession` via a session factory; otherwise
+             the default ``PtySession`` path is used.
+          5. Wires ``exited``, addTab, focus, tracks in self._sessions.
         """
         config_dir_path = write_profile_config(
             profile, base_dir=profile_config_base_dir()
         )
+        # Resolve the effective container image: per-profile value
+        # overrides the global default. The per-profile editor
+        # shows the resolved value live so the user can verify
+        # what will actually be used.
+        if not profile.container_image:
+            loader = getattr(self, "_load_global_settings", None)
+            if loader is not None:
+                try:
+                    settings = loader()
+                    if settings is not None and settings.default_claude_image:
+                        # Mutate a deepcopy so the original
+                        # profile object isn't dirtied — the
+                        # dataclass on disk stays as the user
+                        # wrote it.
+                        profile = dataclasses.replace(
+                            profile,
+                            container_image=settings.default_claude_image,
+                        )
+                except (OSError, ValueError):
+                    pass
+
+        # Sync the global CLAUDE.md into the profile-scoped copy
+        # BEFORE the container is launched so the in-container file
+        # is fresh on every start. Only needed in Docker mode; the
+        # CLAUDE.md editor flow for non-Docker sessions is unchanged.
+        if profile.run_in_container:
+            try:
+                from src.ui.claude.docker_claude_md import sync_profile_claude_md
+
+                sync_profile_claude_md(profile)
+            except OSError as exc:
+                logger.warning("could not sync profile CLAUDE.md: %s", exc)
         env = build_claude_session_env(
             profile=profile,
             proxy_base_url=self._get_proxy_base_url(),
             config_dir=str(config_dir_path),
             api_key=api_key,
+            # ``container_aware`` follows the *user's preference* —
+            # the URL/CLAUDE_CONFIG_DIR rewrites happen even when
+            # Docker turns out to be unavailable at runtime (the
+            # session will then run locally with Docker-style paths,
+            # which may not resolve — but the alternative is to
+            # silently swap behaviour, which is worse).
+            container_aware=profile.run_in_container,
         )
         # Surface the resolved proxy URL so the user can verify
         # Claude Code will route through us. If ``ANTHROPIC_BASE_URL``
@@ -424,11 +581,46 @@ class ClaudeContainerView(QWidget):
             proxy_url or "(EMPTY — claude will hit api.anthropic.com)",
         )
 
+        # Decide between Docker and local-PTY launch. ``run_in_container``
+        # is the user's opt-in; ``_resolve_launch_mode`` checks whether
+        # the docker CLI is actually present so a missing binary doesn't
+        # silently kill the session (the prior behaviour was a tab
+        # titled ``claude (exited)`` with no diagnostic).
+        session_factory = None
+        actual_mode = self._resolve_launch_mode(profile)
+        if profile.run_in_container and actual_mode != "docker":
+            # User asked for Docker but the binary is missing — fall
+            # back to local PTY and surface the reason in the status
+            # bar so the tab doesn't just die.
+            self._notify_docker_fallback(profile.name, "docker CLI not on PATH")
+        if actual_mode == "docker":
+            from src.ui.claude.docker_session import DockerSession
+
+            def _docker_factory(
+                argv, env, cwd, label, parent
+            ) -> DockerSession:
+                return DockerSession(
+                    profile,
+                    argv=argv,
+                    env=env,
+                    cwd=cwd,
+                    parent=parent,
+                )
+
+            session_factory = _docker_factory
+            if profile.run_in_container:
+                # Honour the user's preference but warn that the
+                # fallback happened. The status-bar message is short
+                # enough to skim; the proxy log captures the
+                # full exception for postmortem.
+                self._notify_docker_fallback(profile.name, "docker CLI not found on PATH")
+
         view = TerminalSessionView(
             argv=["claude"],
             env=env,
-            cwd=profile.session_cwd,
+            cwd=self._global_session_cwd(),
             session_label="claude",
+            session_factory=session_factory,
             parent=self,
         )
         view.exited.connect(lambda v=view: self._on_session_exited(v))

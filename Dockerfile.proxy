@@ -1,0 +1,87 @@
+# Dockerfile for the SharkDrown embedded FastAPI proxy.
+#
+# Builds a container that runs the proxy on its default port
+# (3001). Used when ``Claude > Settings > Container Runtime >
+# Run proxy in container`` is enabled — the proxy is then
+# spawned via ``docker run -p <port>:<port> sharkdrown-proxy:latest``
+# and the host's Claude Code sessions talk to it via the
+# published port.
+#
+# Usage:
+#
+#     docker build -f Dockerfile.proxy -t sharkdrown-proxy:latest .
+#
+# The image is intentionally minimal — no shell pipeline, no
+# apt cache. The proxy is a FastAPI app and only needs its
+# Python dependencies baked in. The container exposes the
+# configured port (default 3001) on 0.0.0.0 so the host's
+# Claude Code sessions (running locally or in their own
+# container) can reach it via the docker bridge.
+
+ARG PYTHON_VERSION=3.12-slim
+
+FROM python:${PYTHON_VERSION}
+
+# Install the proxy's runtime deps. The proxy lives at
+# ``src/ccproxy/`` — we copy the minimal set of files it needs
+# to import and the pyproject so ``pip install -e`` can resolve
+# the install_requires. The repo's own pyproject is the source
+# of truth for the dependency list — we install *only* the
+# runtime deps here (no dev / docs / test extras) to keep the
+# image lean.
+WORKDIR /app
+
+# The project ships the proxy code under ``src/ccproxy/`` — a
+# ``src/``-layout that the existing ``pyproject.toml`` doesn't
+# install as a top-level ``ccproxy`` package (its
+# ``[tool.setuptools.packages.find]`` block uses
+# ``where = ["."]`` which would install ``src`` as a namespace
+# package, not ``ccproxy``). Rather than rewrite the packaging
+# (which would also touch the GUI's ``src.main`` script entry
+# point), we add ``/app/src`` to ``PYTHONPATH`` so
+# ``import ccproxy.app.main`` resolves naturally.
+COPY src/ ./src/
+
+# Pin just the proxy's runtime deps. The full ``pyproject.toml``
+# pulls in PySide6, pandas, etc. — those aren't needed in the
+# proxy image (the GUI runs on the host; the container only
+# serves FastAPI + the ccproxy app). Smaller image, fewer CVEs.
+RUN pip install --no-cache-dir \
+        fastapi>=0.115 \
+        'uvicorn[standard]>=0.30' \
+        pydantic>=2.7 \
+        pydantic-settings>=2.4 \
+        httpx>=0.27 \
+        aiosqlite>=0.20 \
+        Jinja2>=3.1 \
+        python-dotenv>=1.0 \
+        humanize>=4.9 \
+    && pip check
+
+ENV PYTHONPATH=/app/src
+
+# Expose the proxy port (matches the default in
+# ``src/ccproxy/app/config.py``). The host's docker run / compose
+# file is responsible for publishing this port to the host's
+# network namespace (``-p 3001:3001`` on docker run).
+EXPOSE 3001
+
+# Bind to 0.0.0.0 so the host's network namespace can reach the
+# proxy. The default in ``src/proxy/server_thread.py`` is
+# 127.0.0.1; the runtime flips this automatically when
+# ``run_proxy_in_container`` is enabled.
+ENV ANTHROPIC_PROXY_BIND=0.0.0.0
+ENV ANTHROPIC_PROXY_PORT=3001
+
+# ``uvicorn`` is the entry point — the proxy module exposes a
+# ``create_app()`` factory (not a module-level ``app`` instance;
+# the embedded Qt host deliberately defers construction so it
+# can pass in mock providers / a tmp SQLite path). ``--factory``
+# tells uvicorn to invoke the factory on each worker startup.
+# ``--proxy-headers`` makes uvicorn honour ``X-Forwarded-Proto``
+# / ``X-Forwarded-For`` (helpful when the host puts the
+# container behind a reverse proxy on the host).
+CMD ["uvicorn", "ccproxy.app.main:create_app", \
+     "--factory", \
+     "--host", "0.0.0.0", "--port", "3001", \
+     "--proxy-headers"]

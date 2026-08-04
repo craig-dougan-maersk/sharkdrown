@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import subprocess
 from pathlib import Path
 
 from PySide6.QtCore import QTimer
@@ -10,6 +12,8 @@ from PySide6.QtWidgets import QMessageBox
 from src.proxy.event_bridge import EventBusBridge
 from src.proxy.paths import default_db_path
 from src.proxy.server_thread import ProxyServerThread
+
+logger = logging.getLogger(__name__)
 
 
 class ProxyLifecycleMixin:
@@ -23,20 +27,25 @@ class ProxyLifecycleMixin:
 
         Safe to call when the thread is already running — the early return
         prevents a double-start. The thread's bind address, port, config
-        dir, and model endpoints are read from the **active profile**
-        (the per-profile proxy settings replaced the legacy
-        ``ProxyConfig``). The profile is the single source of truth:
-        switching active profile naturally causes a restart with new
-        routing and bind settings.
+        dir, and provider registry are read from the **global settings**
+        (post-restructuring — Claude > Settings). The active profile
+        contributes per-profile ``model_endpoints`` and aliases; the
+        proxy merges both into its routing tables.
         """
         if self.proxy_thread is not None and self.proxy_thread.isRunning():
             return
 
         active = self._profile_store().get_active() or self._profile_store().ensure_default()
-        host = active.bind_address or "127.0.0.1"
-        port = int(active.port or 3001)
+        # Global state (bind / port / config_dir / providers) lives in
+        # the global settings store. Falls back to the dataclass
+        # defaults when the file is missing.
+        global_settings = self._global_settings_store().load()
+        host = global_settings.bind_address or "127.0.0.1"
+        port = int(global_settings.port or 3001)
         config_dir_path = (
-            Path(active.config_dir) if active.config_dir else None
+            Path(global_settings.config_dir)
+            if global_settings.config_dir
+            else None
         )
         default_endpoint = ""
         if isinstance(active.claude_settings, dict):
@@ -45,20 +54,31 @@ class ProxyLifecycleMixin:
             )
 
         # ---- Build proxy-side inputs ---------------------------------
+        # Providers come from the global registry, not the active
+        # profile. Endpoints + aliases still come from the active
+        # profile so each profile can route to different providers
+        # for different models.
         proxy_providers: dict[str, dict] = {}
-        providers_map: dict[str, object] = dict(active.providers or {})
+        providers_map: dict[str, object] = dict(global_settings.providers or {})
         credential_store = self._profile_store().credential_store
         for name, prov in providers_map.items():
-            key_ref = getattr(prov, "key_ref", None)
+            if isinstance(prov, dict):
+                key_ref = prov.get("key_ref")
+                url = str(prov.get("url") or "")
+                available_models = list(prov.get("available_models") or ())
+            else:
+                key_ref = getattr(prov, "key_ref", None)
+                url = str(getattr(prov, "url", "") or "")
+                available_models = list(
+                    getattr(prov, "available_models", ()) or ()
+                )
             api_key: str | None = None
             if isinstance(key_ref, str) and key_ref:
                 api_key = credential_store.get(key_ref)
             proxy_providers[str(name)] = {
-                "url": str(getattr(prov, "url", "") or ""),
+                "url": url,
                 "api_key": api_key,
-                "available_models": list(
-                    getattr(prov, "available_models", ()) or ()
-                ),
+                "available_models": available_models,
             }
 
         proxy_endpoints: dict[str, str] = {}
@@ -98,6 +118,82 @@ class ProxyLifecycleMixin:
         self.action_start_proxy.setEnabled(False)
         self.action_stop_proxy.setEnabled(True)
 
+        # Honour ``run_proxy_in_container``: when set, the proxy
+        # runs in a published container instead of a local
+        # ``QThread``. Falls back to the local thread if the
+        # container can't be started — never silently fails.
+        global_settings = self._global_settings_store().load()
+        if global_settings.run_proxy_in_container:
+            try:
+                from src.ui.claude.docker_proxy import (
+                    start_proxy_container,
+                    wait_for_proxy_ready,
+                    get_container_logs,
+                )
+
+                handle = start_proxy_container(
+                    global_settings, bind_port=port or 3001
+                )
+                self.proxy_status_label.setText(
+                    f"Proxy: container {handle.container_name} starting…"
+                )
+                # Block until uvicorn has bound and /health
+                # responds. ``docker run -d`` returns as soon
+                # as the container exists — uvicorn's import-time
+                # work (DB migrations, schema validation) can take
+                # several seconds, and the rest of the app
+                # immediately tries to reach the proxy on
+                # 127.0.0.1:<port>. Without this wait the user
+                # sees "cannot connect to the proxy" while the
+                # container is still booting.
+                ready = wait_for_proxy_ready(
+                    self.proxy_host, handle.host_port
+                )
+                if not ready:
+                    # Surface the container's stdout in the
+                    # status bar so the user can see *why* the
+                    # proxy didn't come up (uvicorn import error,
+                    # missing config, DB migration failure).
+                    logs = get_container_logs(global_settings)
+                    tail = logs.strip().splitlines()[-5:]
+                    snippet = (
+                        " | ".join(line.strip() for line in tail)
+                        if tail
+                        else "(no logs)"
+                    )
+                    self.proxy_status_label.setText(
+                        f"Proxy: container failed to start — {snippet}"
+                    )
+                    logger.warning(
+                        "proxy container did not become ready; "
+                        "falling back to local QThread. Last logs: %s",
+                        snippet,
+                    )
+                    # Drop into the local-thread fallback below.
+                else:
+                    self.proxy_port = handle.host_port
+                    self.proxy_status_label.setText(
+                        f"Proxy: container {handle.container_name} on "
+                        f"http://{self.proxy_host}:{handle.host_port}"
+                    )
+                    # Mark as "running" so the UI enables the
+                    # downstream consumers (dashboard, sessions,
+                    # browser button). We don't have a thread
+                    # object to track — ``stop_server`` routes
+                    # through ``_stop_proxy_container`` instead.
+                    self.proxy_thread = None
+                    self._on_proxy_started(handle.host_port)
+                    return
+            except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+                logger.warning(
+                    "could not start proxy container (%s); "
+                    "falling back to local QThread", exc
+                )
+                self.proxy_status_label.setText(
+                    f"Proxy: container start failed ({exc}); "
+                    "falling back to local…"
+                )
+
         thread = ProxyServerThread(
             host=host,
             port=port,
@@ -116,8 +212,23 @@ class ProxyLifecycleMixin:
         thread.start()
 
     def _stop_server(self) -> None:
-        """Ask the proxy thread to shut down (non-blocking)."""
+        """Ask the proxy thread (or container) to shut down.
+
+        Routes to the right path based on which is running.
+        When the proxy is in a container (``run_proxy_in_container``),
+        ``self.proxy_thread`` is ``None`` and we call
+        ``stop_proxy_container``; otherwise we route to the
+        ``QThread.request_stop`` path.
+        """
         if self.proxy_thread is None:
+            # Possibly running in a container.
+            try:
+                from src.ui.claude.docker_proxy import stop_proxy_container
+
+                stop_proxy_container(self._global_settings_store().load())
+                self.proxy_status_label.setText("Proxy: container stopped.")
+            except ImportError:
+                pass
             return
         self.proxy_status_label.setText("Proxy: stopping…")
         self.action_stop_proxy.setEnabled(False)

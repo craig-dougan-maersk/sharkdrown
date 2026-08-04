@@ -460,11 +460,12 @@ def test_write_profile_config_prunes_stale_agents():
 def test_env_builder_includes_infra_vars():
     from src.profiles import ClaudeProfile, build_claude_session_env
 
+    # ``default_model`` moved to ``claude_settings["model"]``.
     p = ClaudeProfile(
         name="P",
         slug="p",
         model_endpoints={},
-        default_model="claude-opus-4-8",
+        claude_settings={"model": "claude-opus-4-8"},
     )
     env = build_claude_session_env(
         profile=p,
@@ -656,10 +657,19 @@ def test_terminal_session_view_title_for_claude_argv():
 
 
 def _container_with_proxy_callbacks(
-    *, running: bool = False, base_url: str = ""
+    *, running: bool = False, base_url: str = "", session_cwd: str | None = None
 ):
-    """Build a ClaudeContainerView with stub proxy callbacks."""
+    """Build a ClaudeContainerView with stub proxy callbacks.
+
+    ``session_cwd`` (when non-None) is installed as the global
+    default session CWD via a one-shot ``set_global_settings_loader``.
+    Default session CWD moved from per-profile
+    (``profile.session_cwd``) to the global settings store as part
+    of the menu restructure; tests that need to drive it install
+    a stub loader here.
+    """
     from src.ui.claude.claude_container_view import ClaudeContainerView
+    from src.profiles.global_settings import GlobalSettings
 
     cv = ClaudeContainerView()
     cv._suppress_dialogs = True  # headless: skip modal QMessageBox
@@ -668,6 +678,10 @@ def _container_with_proxy_callbacks(
         get_proxy_base_url=lambda: base_url,
         request_proxy_start=lambda: None,
     )
+    if session_cwd is not None:
+        cv.set_global_settings_loader(
+            lambda: GlobalSettings(session_cwd=session_cwd)
+        )
     return cv
 
 
@@ -714,7 +728,10 @@ def test_claude_container_flush_pending_launches():
         name="X",
         slug="x",
         model_endpoints={},
-        session_cwd=str(tmp),
+        # Docker is off by default for tests — the test environment
+        # has no docker binary, so a default-ON profile would route
+        # through :class:`DockerSession` and never reach the shim.
+        run_in_container=False,
     )
     # Patch shutil.which to find our fake "claude" wrapper. We use
     # /bin/sh -c "<check>" as the wrapper — the existing
@@ -738,7 +755,9 @@ def test_claude_container_flush_pending_launches():
     os.environ["PATH"] = f"{shim_dir}:{saved_path}"
     try:
         cv = _container_with_proxy_callbacks(
-            running=False, base_url="http://127.0.0.1:3001"
+            running=False,
+            base_url="http://127.0.0.1:3001",
+            session_cwd=str(tmp),
         )
         cv.new_session(profile=p)  # queues
         # Now flip the proxy to "running" and flush.

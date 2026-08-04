@@ -24,7 +24,9 @@ to call before ``start()``, safe to call from the GUI thread.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
+from typing import TYPE_CHECKING, Callable
+
+from PySide6.QtCore import QEvent, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QFont,
     QFontDatabase,
@@ -926,6 +928,7 @@ class TerminalSessionView(QWidget):
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         session_label: str = "terminal",
+        session_factory: "Callable[[list[str], dict[str, str] | None, str | None, str, QWidget | None], QThread] | None" = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -943,6 +946,13 @@ class TerminalSessionView(QWidget):
         # before exec, so this is observed by the spawned process but
         # does not affect the GUI process.
         self._cwd = cwd
+        # Optional session factory: a callable that constructs an
+        # alternate session (e.g. ``DockerSession``) instead of the
+        # default local ``PtySession``. The factory returns the
+        # constructed ``QThread``-derived session; the view wires
+        # the data / exit signals the same way regardless. Passing
+        # ``None`` keeps the existing PTY-fork behaviour.
+        self._session_factory = session_factory
         self._started = False
         self._stopped = False
         self._exited = False
@@ -952,8 +962,9 @@ class TerminalSessionView(QWidget):
         # pyte state — created in start().
         self._screen = None
         self._stream = None
-        # The PtySession is created in start(); declared here so type
-        # checkers don't complain in shutdown().
+        # The session (PtySession or a factory-built alt) is created
+        # in start(); declared here so type checkers don't complain
+        # in shutdown().
         self._session = None  # type: ignore[assignment]
         # Repaint debounce timer.
         self._repaint_timer = QTimer(self)
@@ -1018,20 +1029,38 @@ class TerminalSessionView(QWidget):
         self._screen = pyte.HistoryScreen(self._cols, self._rows, history=5000)
         self._stream = pyte.ByteStream(self._screen)
 
-        from src.ui.terminal.pty_backend import PtySession
+        # Either the factory-built session (e.g. ``DockerSession``)
+        # or the default ``PtySession`` — same signal contract, so
+        # the rest of the view doesn't care which one it is.
+        if self._session_factory is not None:
+            self._session = self._session_factory(
+                self._argv or [],
+                self._env,
+                self._cwd,
+                self._session_label,
+                self,
+            )
+        else:
+            from src.ui.terminal.pty_backend import PtySession
 
-        self._session = PtySession(
-            argv=self._argv,
-            rows=self._rows,
-            cols=self._cols,
-            env=self._env,
-            cwd=self._cwd,
-            parent=self,
-        )
+            self._session = PtySession(
+                argv=self._argv,
+                rows=self._rows,
+                cols=self._cols,
+                env=self._env,
+                cwd=self._cwd,
+                parent=self,
+            )
         self._session.data_received.connect(self._on_data)
         self._session.process_exited.connect(self._on_exited)
         self._session.read_error.connect(self._on_read_error)
-        self._session.start_pty()
+        # PtySession exposes ``start_pty()``; the factory-built
+        # session exposes ``start()`` (a QThread.start). Branch on
+        # which one is present.
+        if hasattr(self._session, "start_pty"):
+            self._session.start_pty()
+        else:
+            self._session.start()
 
         # Start plain-text logging if enabled in settings.
         self._start_logging_if_enabled()

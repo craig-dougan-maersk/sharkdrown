@@ -6,8 +6,9 @@ import copy
 
 from PySide6.QtWidgets import QInputDialog, QMessageBox
 
+from src.profiles.global_settings import GlobalSettingsStore
 from src.profiles.store import ProfileStore
-from src.proxy.paths import default_db_path
+from src.proxy.paths import data_dir, default_db_path
 
 
 class ProfileManagementMixin:
@@ -110,6 +111,12 @@ class ProfileManagementMixin:
         dlg = ProfileEditorDialog(
             copy.deepcopy(active),
             credential_store=store.credential_store,
+            # Live loader: the dialog reads Claude > Settings >
+            # Providers / API Keys state via this callable on every
+            # refresh. Without it the dialog reads the on-disk
+            # file, which is empty until the user has saved Claude
+            # > Settings at least once.
+            global_settings_loader=lambda: self._global_settings_store().load(),
             parent=self,
         )
         if dlg.exec() != dlg.DialogCode.Accepted:
@@ -123,6 +130,43 @@ class ProfileManagementMixin:
         if was_running:
             self.status.showMessage(
                 "Restarting proxy to apply profile changes…", 3000
+            )
+            self._restart_after_stop = True
+            self._stop_server()
+
+    def _global_settings_store(self) -> GlobalSettingsStore:
+        """Lazy-init the :class:`GlobalSettingsStore`.
+
+        Resolves to ``<data_dir>/claude_global.json`` (chmod 600).
+        Requires a :class:`QApplication` for :func:`data_dir`; tests
+        that need this must run inside the ``qapp`` fixture.
+        """
+        store = getattr(self, "_global_settings_store_ref", None)
+        if store is None:
+            store = GlobalSettingsStore(data_dir() / "claude_global.json")
+            self._global_settings_store_ref = store
+        return store
+
+    def _show_global_settings(self) -> None:
+        """Slot for Claude > Settings… — opens the global settings dialog."""
+        from src.ui.claude.global_settings import GlobalSettingsDialog
+
+        store = self._profile_store()
+        dlg = GlobalSettingsDialog(
+            self._global_settings_store(),
+            parent=self,
+        )
+        # Stash the credential store on the dialog so the Providers +
+        # API Keys tabs hydrate from the same store the profile
+        # editor already uses (one global ``credentials.json``).
+        dlg._credential_store = store.credential_store
+        was_running = self._is_proxy_running()
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+        # Global bind/port changes invalidate the running proxy.
+        if was_running:
+            self.status.showMessage(
+                "Restarting proxy to apply global settings…", 3000
             )
             self._restart_after_stop = True
             self._stop_server()

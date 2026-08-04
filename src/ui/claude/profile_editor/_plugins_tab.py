@@ -282,9 +282,63 @@ class PluginsTabMixin:
 
     def _populate_plugins_enabled_table(self) -> None:
         self.plugins_enabled_table.setRowCount(0)
+        # Enabled plugins live in ``claude_settings["enabledPlugins"]``
+        # — the same key Claude Code reads from
+        # ``settings.json``. The typed ``enabled_plugins`` field on
+        # :class:`ClaudeProfile` is deprecated; we mirror it as a
+        # property so any code that still reads
+        # ``profile.enabled_plugins`` keeps working.
+        enabled = self._get_enabled_plugins()
         # Sort by reference so the row order is stable across opens.
-        for ref in sorted(self._profile.enabled_plugins):
-            self._append_plugins_enabled_row(ref, self._profile.enabled_plugins[ref])
+        for ref in sorted(enabled):
+            self._append_plugins_enabled_row(ref, enabled[ref])
+
+    def _get_enabled_plugins(self) -> dict[str, bool]:
+        """Read enabled plugins from ``claude_settings["enabledPlugins"]``.
+
+        ``ClaudeProfile.claude_settings`` is the canonical store
+        (it round-trips through ``settings.json``). Older profiles
+        written before this refactor had a top-level
+        ``enabled_plugins`` field — fall back to that for the
+        duration of the migration window so the test suite (and
+        any in-flight legacy profiles.json files) still populate
+        correctly.
+
+        Precedence: ``claude_settings["enabledPlugins"]`` first;
+        only fall back to ``enabled_plugins`` if the settings
+        key is missing or empty (a non-empty ``claude_settings``
+        with an absent ``enabledPlugins`` key is treated as "user
+        deliberately cleared the list" — falling back to the
+        legacy field would resurrect entries the user removed).
+        """
+        settings = getattr(self._profile, "claude_settings", None)
+        if isinstance(settings, dict) and "enabledPlugins" in settings:
+            raw = settings["enabledPlugins"]
+            if isinstance(raw, dict):
+                return {
+                    str(k): bool(v)
+                    for k, v in raw.items()
+                    if isinstance(k, str) and k
+                }
+            return {}
+        # Fallback: legacy typed field (deprecated; preserved for
+        # the migration window).
+        legacy = getattr(self._profile, "enabled_plugins", None)
+        if isinstance(legacy, dict) and legacy:
+            return {
+                str(k): bool(v)
+                for k, v in legacy.items()
+                if isinstance(k, str) and k
+            }
+        return {}
+
+    def _set_enabled_plugins(self, enabled: dict[str, bool]) -> None:
+        """Write enabled plugins into ``claude_settings["enabledPlugins"]``."""
+        if not isinstance(self._profile.claude_settings, dict):
+            self._profile.claude_settings = {}
+        self._profile.claude_settings["enabledPlugins"] = {
+            str(k): bool(v) for k, v in enabled.items()
+        }
 
     def _append_plugins_enabled_row(self, ref: str, enabled: bool) -> None:
         row = self.plugins_enabled_table.rowCount()
@@ -344,10 +398,23 @@ class PluginsTabMixin:
     # ---- enabled plugins table slots ---------------------------------
 
     def _on_plugin_enabled_toggled(self, row: int, checked: bool) -> None:
+        """Persist a checkbox toggle to ``claude_settings["enabledPlugins"]``.
+
+        Previously this only updated the row's cached ``UserRole``
+        value — the dict on the profile wasn't touched, so the toggle
+        was lost on dialog close. We now write through to the same
+        settings key the add/remove/toggle-discovery handlers use.
+        """
         ref_item = self.plugins_enabled_table.item(row, 0)
         if ref_item is None:
             return
+        ref = ref_item.text().strip()
+        if not ref:
+            return
         ref_item.setData(Qt.ItemDataRole.UserRole, checked)
+        enabled = self._get_enabled_plugins()
+        enabled[ref] = checked
+        self._set_enabled_plugins(enabled)
 
     def _on_plugin_enabled_add(self) -> None:
         ref, ok = QInputDialog.getText(
@@ -365,12 +432,14 @@ class PluginsTabMixin:
                 "Plugin references must be of the form 'plugin@marketplace'.",
             )
             return
-        if ref in self._profile.enabled_plugins:
+        enabled = self._get_enabled_plugins()
+        if ref in enabled:
             QMessageBox.information(
                 self, "Already enabled", f"{ref} is already in the enabled list."
             )
             return
-        self._profile.enabled_plugins[ref] = True
+        enabled[ref] = True
+        self._set_enabled_plugins(enabled)
         self._append_plugins_enabled_row(ref, True)
 
     def _on_plugin_enabled_remove(self) -> None:
@@ -382,7 +451,9 @@ class PluginsTabMixin:
             return
         ref = ref_item.text()
         self.plugins_enabled_table.removeRow(row)
-        self._profile.enabled_plugins.pop(ref, None)
+        enabled = self._get_enabled_plugins()
+        enabled.pop(ref, None)
+        self._set_enabled_plugins(enabled)
 
     # ---- marketplaces table slots -------------------------------------
 
@@ -625,9 +696,12 @@ class PluginsTabMixin:
         )
         if ok:
             # Auto-enable on successful install — that's the UX most
-            # users want. ``enabled_plugins`` is the in-memory dict
-            # the OK handler will write out.
-            self._profile.enabled_plugins[ref] = True
+            # users want. ``enabledPlugins`` lives under
+            # ``claude_settings`` so the same key Claude Code reads
+            # in ``settings.json`` is what gets updated.
+            enabled = self._get_enabled_plugins()
+            enabled[ref] = True
+            self._set_enabled_plugins(enabled)
             self._populate_plugins_enabled_table()
 
     def _on_plugin_toggle_enable(self) -> None:
@@ -654,7 +728,9 @@ class PluginsTabMixin:
             success_msg=f"{'Enabled' if enable else 'Disabled'} {ref}.",
             failure_msg=f"Failed to {'enable' if enable else 'disable'} {ref}.",
         )
-        self._profile.enabled_plugins[ref] = enable
+        enabled = self._get_enabled_plugins()
+        enabled[ref] = enable
+        self._set_enabled_plugins(enabled)
         self._populate_plugins_enabled_table()
 
     def _on_plugin_uninstall(self) -> None:
@@ -683,7 +759,9 @@ class PluginsTabMixin:
             failure_msg=f"Failed to uninstall {ref}.",
         )
         if ok:
-            self._profile.enabled_plugins.pop(ref, None)
+            enabled = self._get_enabled_plugins()
+            enabled.pop(ref, None)
+            self._set_enabled_plugins(enabled)
             self._populate_plugins_enabled_table()
 
     def _run_claude_subprocess(

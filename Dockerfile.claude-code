@@ -1,0 +1,75 @@
+# Dockerfile for Claude Code CLI sessions launched by SharkDrown.
+#
+# Builds a container image with the Claude Code CLI installed and a
+# non-root ``claude`` user whose home is the bind-mount target for
+# the per-profile ``~/.claude`` directory.
+#
+# Usage from a fresh SharkDrown install:
+#
+#     docker build -f Dockerfile.claude-code -t claude-code:latest .
+#
+# Or override the tag via the ``IMAGE_TAG`` build-arg to bake a
+# specific Claude Code release into the image.
+#
+# Inside the container the Claude Code binary lives at
+# ``/usr/local/bin/claude`` (PATH is set via the profile's
+# ``.bashrc`` snippet below). SharkDrown spawns this binary via
+# ``docker exec -i <container> claude …`` — see
+# ``src/ui/claude/docker_session.py``.
+#
+# The bind-mount target is ``/home/claude/.claude``; the
+# ``sync_profile_claude_md`` helper prepends the global
+# ``~/.claude/CLAUDE.md`` content into that directory before
+# each container start.
+
+ARG NODE_VERSION=20-slim
+
+FROM node:${NODE_VERSION}
+
+# Install only the runtime deps the Claude Code CLI needs. Most
+# Claude Code installations need git for plugin management and
+# curl for plugin marketplace fetches; ``ca-certificates`` is
+# required for HTTPS to Anthropic's API.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user so the host can bind-mount
+# ``/home/claude/.claude`` without the UID/GID mismatch that
+# would otherwise leave files owned by root on the host.
+RUN groupadd --gid 3000 claude \
+    && useradd  --uid 3000 --gid 3000 --shell /bin/bash \
+                --create-home --home-dir /home/claude claude
+
+# Install the Claude Code CLI globally. The Anthropic installer
+# typically pulls a pinned npm tarball, so this step is
+# reproducible once the upstream URL is stable. The build-arg
+# ``CLAUDE_CODE_VERSION`` lets CI pin a specific release; the
+# default ``latest`` tag is what most users want.
+ARG CLAUDE_CODE_VERSION=latest
+
+# If you have a private mirror of the Claude Code npm tarball,
+# point ``CLAUDE_CODE_TARBALL`` at it; otherwise the upstream
+# registry is used. The official Anthropic npm package is
+# ``@anthropic-ai/claude-code``.
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
+    && claude --version
+
+USER claude
+WORKDIR /home/claude
+
+# Make the bind-mount target explicit in the image so an
+# out-of-the-box ``docker run`` mounts the right path even
+# without SharkDrown's bind-mount flag.
+RUN mkdir -p /home/claude/.claude
+
+# Hint to the spawned Claude Code CLI that the bind mount lives
+# at this path; harmless if the host uses a different layout.
+ENV CLAUDE_CONFIG_DIR=/home/claude/.claude
+ENV TERM=xterm-256color
+ENV COLORTERM=truecolor
+
+CMD ["claude"]

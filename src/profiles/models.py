@@ -416,15 +416,45 @@ class ClaudeProfile:
     slug: str
     providers: dict[str, Provider] = field(default_factory=dict)
     model_endpoints: dict[str, ModelEndpoint] = field(default_factory=dict)
-    default_model: str | None = None
     env_vars: dict[str, str] = field(default_factory=dict)
     claude_settings: dict = field(default_factory=dict)
     subagents: list[Subagent] = field(default_factory=list)
+    is_default: bool = False
+    # ---- Docker session launching (added August 2026) ----------------
+    #
+    # When ``run_in_container`` is True, every Claude Code session of
+    # this profile runs inside a per-profile Docker container (named
+    # by ``container_name`` — defaults to the profile slug at save
+    # time) whose ``~/.claude`` is a bind-mount of the profile's
+    # scoped ``<data_dir>/profiles/<slug>/.claude`` directory.
+    #
+    # ``container_image`` defaults to ``"claude-code:latest"`` — a
+    # placeholder the user replaces with whatever image they've
+    # published locally (``docker build -t claude-code:latest .`` in
+    # the Claude Code repo, typically). The container must have the
+    # ``claude`` CLI on its ``PATH``.
+    #
+    # Note: the host's proxy must be reachable from inside the
+    # container — the convention is to rebind the proxy to
+    # ``0.0.0.0`` on the host and use ``host.docker.internal`` as
+    # the in-container hostname. The launch path performs that
+    # rewrite via ``env_builder.build_claude_session_env``.
+    run_in_container: bool = True
+    container_image: str = "claude-code:latest"
+    container_name: str = ""
+    # ---- Deprecated per-profile proxy / session fields ---------------
+    #
+    # These were first-class fields on the General tab before the
+    # menu restructure. They're now global (see
+    # :class:`src.profiles.global_settings.GlobalSettings`) but the
+    # dataclass still accepts them for round-trip safety with
+    # existing ``profiles.json`` files. The proxy launcher ignores
+    # them — global settings are the source of truth.
+    default_model: str | None = None
     session_cwd: str | None = None
     bind_address: str = "127.0.0.1"
     port: int = 3001
     config_dir: str = ""
-    is_default: bool = False
     # ---- Claude Code plugin / MCP configuration (added July 2026) -------
     #
     # These are first-class dataclass fields (not free-form ``claude_settings``

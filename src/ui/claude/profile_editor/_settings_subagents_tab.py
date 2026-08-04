@@ -121,8 +121,28 @@ class SettingsSubagentsTabMixin:
         self._profile.subagents = [s for s in self._profile.subagents if s is not sa]
         self._refresh_subagent_list()
 
+    def _current_model_aliases(self) -> tuple[str, ...]:
+        """Union of every alias across the profile's endpoints.
+
+        Drives the model dropdown in ``_SubagentEditorDialog`` —
+        subagents typically pick an alias (not a real upstream ID)
+        so the proxy can route them like any other request.
+        """
+        out: list[str] = []
+        for endpoint in self._profile.model_endpoints.values():
+            if endpoint is None:
+                continue
+            for alias in (getattr(endpoint, "aliases", ()) or ()):
+                if isinstance(alias, str) and alias.strip():
+                    out.append(alias)
+        return tuple(dict.fromkeys(out))
+
     def _edit_subagent_in_place(self, sa: Subagent) -> bool:
-        dlg = _SubagentEditorDialog(sa, parent=self)
+        dlg = _SubagentEditorDialog(
+            sa,
+            model_aliases=self._current_model_aliases(),
+            parent=self,
+        )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             updated = dlg.to_subagent()
             sa.name = updated.name

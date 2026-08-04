@@ -151,9 +151,29 @@ class StandardEnvVarsDialog(QDialog):
 
 
 class _SubagentEditorDialog(QDialog):
-    """Tiny editor for one :class:`Subagent`."""
+    """Tiny editor for one :class:`Subagent`.
 
-    def __init__(self, subagent: Subagent, parent: QWidget | None = None) -> None:
+    Form fields (the same five Claude Code reads as frontmatter):
+
+    - **Name** — ``QLineEdit``; required.
+    - **Description** — ``QLineEdit``; required.
+    - **Tools** — ``QLineEdit`` (comma-separated); parsed to ``list[str]``.
+    - **Model** — ``QComboBox`` populated from the parent profile's
+      aliases, with ``"(inherit session default)"`` as the empty
+      sentinel. Selecting a real model writes the alias name to the
+      subagent's ``model`` field; the proxy's alias-rewrite layer
+      translates it back to the real upstream model at request time.
+    - **Detail (system prompt)** — ``QPlainTextEdit``; the file body
+      after the YAML frontmatter.
+    """
+
+    def __init__(
+        self,
+        subagent: Subagent,
+        *,
+        model_aliases: tuple[str, ...] = (),
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Subagent — {subagent.name or 'New'}")
         self.resize(560, 480)
@@ -170,16 +190,43 @@ class _SubagentEditorDialog(QDialog):
         self.tools_edit.setPlaceholderText("comma-separated, e.g. Read, Edit, Bash")
         layout.addRow("Tools:", self.tools_edit)
 
-        self.model_edit = QLineEdit(self._sa.model or "")
-        self.model_edit.setPlaceholderText("(inherit session default)")
-        layout.addRow("Model:", self.model_edit)
+        # Model dropdown. ``"(inherit session default)"`` is the empty
+        # sentinel — corresponds to ``model = None`` on the
+        # :class:`Subagent`. Aliases are deduplicated + sorted, then
+        # any ``(real model: X)`` legacy value is appended last so the
+        # user's existing choice round-trips through save.
+        from PySide6.QtWidgets import QComboBox
+
+        self.model_combo = QComboBox()
+        self.model_combo.setEditable(False)
+        self.model_combo.addItem("(inherit session default)", "")
+        for alias in sorted(dict.fromkeys(model_aliases)):
+            self.model_combo.addItem(alias, alias)
+        # Legacy: if the subagent has a model that isn't a known
+        # alias (e.g. a real upstream ID stored by an older version),
+        # surface it as a labeled last-resort entry.
+        existing_model = self._sa.model
+        if existing_model:
+            match = False
+            for i in range(self.model_combo.count()):
+                if self.model_combo.itemData(i) == existing_model:
+                    self.model_combo.setCurrentIndex(i)
+                    match = True
+                    break
+            if not match:
+                self.model_combo.addItem(
+                    f"(real model: {existing_model})", existing_model
+                )
+                self.model_combo.setCurrentIndex(self.model_combo.count() - 1)
+        layout.addRow("Model:", self.model_combo)
 
         self.prompt_edit = QPlainTextEdit(self._sa.system_prompt)
         self.prompt_edit.setPlaceholderText("System prompt body…")
         layout.addRow(self.prompt_edit)
 
         self.button_box = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
         )
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
@@ -193,7 +240,12 @@ class _SubagentEditorDialog(QDialog):
             if tools_raw
             else None
         )
-        model = self.model_edit.text().strip() or None
+        model_value = self.model_combo.currentData()
+        model = (
+            str(model_value).strip() or None
+            if model_value is not None
+            else None
+        )
         return Subagent(
             name=name,
             description=self.desc_edit.text(),
@@ -482,10 +534,22 @@ class ManageProfilesDialog(QDialog):
         after_save,
     ) -> None:
         from src.ui.claude.profile_editor.dialog import ProfileEditorDialog
+        from src.profiles.global_settings import GlobalSettingsStore
+        from src.proxy.paths import data_dir
 
+        # Inject the on-disk global settings store so the profile
+        # editor's Model Configuration tab can populate its
+        # Provider combo from Claude > Settings > Providers — the
+        # Manage Profiles dialog doesn't have a live loader
+        # installed, but the on-disk fallback in
+        # ``_global_settings_for_validation`` does the right thing
+        # when the user has saved Claude > Settings at least
+        # once.
+        gs_store = GlobalSettingsStore(data_dir() / "claude_global.json")
         dlg = ProfileEditorDialog(
             draft,
             credential_store=self._store.credential_store,
+            global_settings_store=gs_store,
             parent=self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:

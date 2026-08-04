@@ -60,12 +60,32 @@ class EndpointsTabMixin:
         ep_help.setStyleSheet("color: gray; font-size: 11px;")
         tab_layout.addWidget(ep_help)
 
+        # Default Model — moved from the old General tab. Stored
+        # under ``claude_settings["model"]`` on save (the
+        # per-profile ``settings.json`` writes the same key Claude
+        # Code reads). The combo is populated by
+        # ``_populate_default_model_combo`` which the dialog calls
+        # from its own ``_populate`` step.
+        from PySide6.QtWidgets import QFormLayout
+
+        default_box = QWidget()
+        default_layout = QFormLayout(default_box)
+        default_layout.setContentsMargins(0, 0, 0, 0)
+        self.default_model_combo = QComboBox()
+        self.default_model_combo.setEditable(False)
+        default_layout.addRow("Default model:", self.default_model_combo)
+        tab_layout.addWidget(default_box)
+
         self.endpoints_table = QTableWidget(0, 3)
-        # Aliases-first column order. Aliases are the user-facing
-        # identity of the row (the real upstream model ID is the
-        # ``Model`` column at the far right). ``UserRole`` on the
-        # Provider cell still carries ``provider_name`` as the
-        # stable identity; aliases are read back via cell text.
+        # Column order: Aliases | Provider | Model.
+        # The profile editor only sees the *Provider*; the
+        # provider's ``key_ref`` (set in Claude > Settings >
+        # Providers) carries the implicit auth — the profile
+        # editor deliberately has no API Key column so users
+        # don't edit credentials per-profile. API key values
+        # live in Claude > Settings > API Keys; the per-provider
+        # ``key_ref`` in Claude > Settings > Providers picks
+        # which one to use at request time.
         self.endpoints_table.setHorizontalHeaderLabels(
             ["Aliases", "Provider", "Model"]
         )
@@ -82,10 +102,11 @@ class EndpointsTabMixin:
         # Read-only: no in-place editing of any column. The form
         # below is the editor — this is what avoids the segfault.
         self.endpoints_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        # Highlight the API Key cell with a yellow background when
-        # the row's stored ``key_ref`` doesn't match any defined key
-        # (stale reference); the table's still read-only, the hint
-        # is just visual.
+        # No API Key column — auth lives on the provider's
+        # ``key_ref`` (set in Claude > Settings > Providers).
+        # Stale-ref highlighting isn't surfaced in the profile
+        # editor; the proxy launcher surfaces missing keys via
+        # the ``ANTHROPIC_API_KEY`` sentinel.
         self.endpoints_table.itemSelectionChanged.connect(
             self._on_endpoint_selection_changed
         )
@@ -367,6 +388,9 @@ class EndpointsTabMixin:
         model_item = QTableWidgetItem(model_name)
         model_item.setFlags(model_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         self.endpoints_table.setItem(row, 2, model_item)
+        # No API Key column — auth lives on the provider's
+        # ``key_ref`` (set in Claude > Settings > Providers);
+        # the profile editor doesn't surface credentials.
 
     def _on_endpoint_add(self) -> None:
         """Append a blank endpoint row and select it."""
@@ -375,6 +399,87 @@ class EndpointsTabMixin:
         # into the editor form below.
         new_row = self.endpoints_table.rowCount() - 1
         self.endpoints_table.selectRow(new_row)
+
+    def _current_provider_names(self) -> list[str]:
+        """Snapshot of provider names from the global settings store.
+
+        Pre-restructure this read from a per-profile ``providers``
+        table on the deleted Providers tab; now we read from the
+        global store. The form's provider combo and the auto-seed
+        helper both consume this.
+        """
+        names: list[str] = []
+        settings = self._global_settings_for_validation()
+        providers = settings.providers or {}
+        for name in providers.keys():
+            if isinstance(name, str) and name not in names:
+                names.append(name)
+        return names
+
+    def _current_provider_url(self, name: str) -> str | None:
+        """URL of the named provider in the global registry, or ``None``."""
+        settings = self._global_settings_for_validation()
+        prov = (settings.providers or {}).get(name)
+        if prov is None:
+            return None
+        if isinstance(prov, dict):
+            url = str(prov.get("url") or "")
+        else:
+            url = str(getattr(prov, "url", "") or "")
+        return url or None
+
+    def _current_provider_models(self, name: str) -> tuple[str, ...]:
+        """``available_models`` tuple for the named provider."""
+        settings = self._global_settings_for_validation()
+        prov = (settings.providers or {}).get(name)
+        if prov is None:
+            return ()
+        if isinstance(prov, dict):
+            raw = prov.get("available_models") or ()
+            if isinstance(raw, (list, tuple)):
+                return tuple(
+                    dict.fromkeys(
+                        str(m).strip() for m in raw if str(m).strip()
+                    )
+                )
+            if isinstance(raw, str):
+                return tuple(
+                    dict.fromkeys(s.strip() for s in raw.split(",") if s.strip())
+                )
+            return ()
+        return tuple(getattr(prov, "available_models", ()) or ())
+
+    def _global_settings_for_validation(self):
+        """Return the current :class:`GlobalSettings`.
+
+        Resolution order:
+        1. ``self._global_settings_loader`` — installed by the
+           production main window (calls into the live
+           :class:`GlobalSettingsStore`).
+        2. ``self._global_settings_store`` — passed as a kwarg
+           to the dialog (test fixtures).
+        3. On-disk default at ``data_dir()/claude_global.json``.
+
+        Returns the dataclass value either way.
+        """
+        from src.profiles.global_settings import GlobalSettingsStore
+        from src.proxy.paths import data_dir
+
+        loader = getattr(self, "_global_settings_loader", None)
+        if loader is not None:
+            try:
+                settings = loader()
+                if settings is not None:
+                    return settings
+            except (OSError, ValueError):
+                pass
+        store = getattr(self, "_global_settings_store", None)
+        if store is not None:
+            try:
+                return store.load()
+            except (OSError, ValueError):
+                pass
+        return GlobalSettingsStore(data_dir() / "claude_global.json").load()
 
     # ---- Endpoints tab: row selection + form editor -----------------------
 
@@ -563,29 +668,27 @@ class EndpointsTabMixin:
             self.endpoint_url_hint.setText(url)
 
     def _populate_default_model_combo(self) -> None:
-        """Fill the General tab's ``default_model_combo`` dropdown.
+        """Fill the Model Configuration tab's ``default_model_combo``.
 
         Items, in display order:
           1. ``(no default)`` — sentinel; ``userData`` is ``None``.
-             Picked when ``profile.default_model`` is unset.
+             Picked when no default model is configured.
           2. Every deduped alias across all endpoint rows, in
              sorted order. ``userData`` is the alias string.
              These are the *preferred* choices — what Claude Code
              surfaces in ``/model``.
           3. ``(real model: X)`` fallback — when the profile has a
-             ``default_model`` value that's a real upstream ID
-             (e.g. a legacy profile from before this redesign),
-             surface it as a labeled entry so the user's existing
-             choice still round-trips through save verbatim. The
-             dropdown's ``currentData()`` reads back the real name;
-             the proxy still accepts a real model name on the
-             wire (it skips the alias-rewrite layer for known
-             names).
+             ``model`` value that's a real upstream ID (legacy),
+             surface it as a labeled entry so the existing choice
+             still round-trips through save verbatim.
 
-        Pre-selection: the current ``profile.default_model`` if
+        Pre-selection: the current ``claude_settings["model"]`` if
         present in the list, otherwise index 0 (``(no default)``).
+
+        Default model moved from a first-class dataclass field to
+        ``claude_settings["model"]`` (the key Claude Code reads in
+        ``settings.json``).
         """
-        # Sorted + deduped alias catalog across every endpoint.
         all_aliases: list[str] = []
         for endpoint in self._profile.model_endpoints.values():
             if endpoint is None:
@@ -596,10 +699,10 @@ class EndpointsTabMixin:
         self.default_model_combo.addItem("(no default)", None)
         for alias in sorted(dict.fromkeys(all_aliases)):
             self.default_model_combo.addItem(alias, alias)
-        # Legacy fallback: ``default_model`` set to a real name
-        # but no matching alias. Render it as a labeled last-resort
-        # entry so save doesn't silently drop the user's choice.
-        legacy_real = self._profile.default_model
+        settings = getattr(self._profile, "claude_settings", {}) or {}
+        legacy_real = (
+            settings.get("model") if isinstance(settings, dict) else None
+        )
         if (
             legacy_real
             and not any(
@@ -610,7 +713,6 @@ class EndpointsTabMixin:
             self.default_model_combo.addItem(
                 f"(real model: {legacy_real})", legacy_real
             )
-        # Pre-select the matching entry.
         target_idx = 0
         if legacy_real:
             for i in range(self.default_model_combo.count()):

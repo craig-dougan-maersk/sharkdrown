@@ -63,6 +63,69 @@ def _tmp_dir() -> Path:
     return Path(tempfile.mkdtemp())
 
 
+def _seed_global_default_provider(
+    base: Path, *, models: tuple[str, ...] = ("claude-opus-4-8",)
+) -> "GlobalSettingsStore":
+    """Seed a global settings store at ``base`` with a ``default``
+    provider pointing at ``https://api.anthropic.com`` and the
+    given model catalog.
+
+    Tests that exercise ``ProfileEditorDialog._on_accept`` need
+    this — the post-restructure validator reads providers from the
+    global store, not the profile. Centralising the seed here
+    keeps each test fixture terse.
+    """
+    from src.profiles.global_settings import GlobalSettings, GlobalSettingsStore
+
+    gs_store = GlobalSettingsStore(base / "claude_global.json")
+    gs_store.save(
+        GlobalSettings(
+            providers={
+                "default": {
+                    "url": "https://api.anthropic.com",
+                    "available_models": list(models),
+                },
+            },
+        )
+    )
+    return gs_store
+
+
+def _seed_global_providers_from_profile(
+    base: Path, profile: object
+) -> "GlobalSettingsStore":
+    """Mirror a profile's per-test ``providers`` dict into the global
+    settings store.
+
+    Several pre-restructure tests seeded ``default.providers`` on
+    the profile directly. After the menu restructure, the profile
+    editor's ``_on_accept`` reads from the global settings store
+    instead — so the test's seed data has to live there. The
+    profile's dict mixes dataclass ``Provider`` instances and
+    plain dicts across the test corpus; serialise both into the
+    dict shape the store expects.
+    """
+    from src.profiles.global_settings import GlobalSettings, GlobalSettingsStore
+
+    gs_store = GlobalSettingsStore(base / "claude_global.json")
+    raw = getattr(profile, "providers", None) or {}
+    out: dict[str, dict] = {}
+    for name, prov in raw.items():
+        if isinstance(prov, dict):
+            out[name] = prov
+            continue
+        entry: dict = {"url": getattr(prov, "url", "") or ""}
+        key_ref = getattr(prov, "key_ref", None)
+        if key_ref:
+            entry["key_ref"] = key_ref
+        available_models = getattr(prov, "available_models", None)
+        if available_models:
+            entry["available_models"] = list(available_models)
+        out[name] = entry
+    gs_store.save(GlobalSettings(providers=out))
+    return gs_store
+
+
 # ---- ClaudeProfile model --------------------------------------------------
 
 
@@ -524,47 +587,6 @@ def test_new_profile_seeded_from_default_inherits_endpoints() -> None:
 # ---- ProfileEditorDialog --------------------------------------------------
 
 
-def test_profile_editor_has_bind_port_config_dir_widgets() -> None:
-    """The dialog exposes a ``bind_edit``, ``port_edit``, and
-    ``config_dir_edit`` widget and the values round-trip."""
-    from src.profiles import ClaudeProfile, ProfileStore
-    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
-
-    _qapp()
-    base = _tmp_dir()
-    store = ProfileStore(path=base / "profiles.json")
-    default = store.ensure_default()
-    # Seed a default credential so the API Keys tab validation in
-    # ``_on_accept`` doesn't pop a modal QMessageBox in offscreen mode.
-    store.credential_store.set("default", "test-key")
-    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
-    try:
-        assert hasattr(dlg, "bind_edit")
-        assert hasattr(dlg, "port_edit")
-        assert hasattr(dlg, "config_dir_edit")
-        # Edit a value and verify it survives _on_accept.
-        dlg.bind_edit.setText("0.0.0.0")
-        dlg.port_edit.setValue(9001)
-        dlg.config_dir_edit.setText("/tmp/proxy-config")
-        # The dialog has to "accept" with valid name + endpoints. The
-        # Default we created has no endpoints, so add one.
-        from src.profiles.models import slugify
-        dlg.name_edit.setText(default.name)
-        # ``_populate`` already pre-adds an empty endpoint row so the
-        # user has somewhere to type. Fill it in.
-        dlg.endpoints_table.item(0, 0).setText("")  # Aliases col
-        # Provider col already pre-populated as "default"
-        dlg.endpoints_table.item(0, 2).setText("claude-opus-4-8")  # Model col
-        dlg._on_accept()
-        edited = dlg.to_profile()
-        assert edited.bind_address == "0.0.0.0"
-        assert edited.port == 9001
-        assert edited.config_dir == "/tmp/proxy-config"
-    finally:
-        dlg.deleteLater()
-    print("✓ ProfileEditorDialog has bind/port/config_dir round-tripping")
-
-
 def test_model_endpoints_table_is_in_a_scroll_area() -> None:
     """The Model Endpoints ``QTableWidget`` lives inside a
     ``QScrollArea`` so more than 2 rows are reachable via scroll."""
@@ -766,24 +788,61 @@ def test_profile_submenu_has_manage_profiles_entry() -> None:
 def test_active_profile_drives_proxy_start() -> None:
     """Reading from the active profile instead of legacy
     ``ProxyConfig`` — the host/port/config_dir/model_endpoints on
-    the profile are what the proxy thread is constructed with."""
+    the profile are what the proxy thread is constructed with.
+
+    Post-restructure: bind address + port + config_dir live in
+    the global settings store, not on the profile. This test
+    seeds both — the global store holds the host/port the
+    proxy thread binds, and the profile carries the model
+    endpoints / aliases that the proxy's router table is built
+    from.
+    """
+    import os
     from src.profiles import ClaudeProfile, ModelEndpoint, ProfileStore, Provider
+    from src.profiles.global_settings import GlobalSettings, GlobalSettingsStore
+    from src.proxy.paths import data_dir
     from src.ui.main_window import MainWindow
 
     _qapp()
     base = _tmp_dir()
+    # The MainWindow's ``_global_settings_store`` resolves to
+    # ``data_dir() / "claude_global.json"``. Force ``data_dir`` to
+    # the test's tmp dir so the seeded global settings are picked
+    # up by the lazy initialisation.
+    os.environ["XDG_DATA_HOME"] = str(base)
+    from src.proxy import paths as _paths
+    _paths._DATA_DIR_OVERRIDE = base
+
     store = ProfileStore(path=base / "profiles.json")
-    # Customise the active profile with distinctive values.
+    # Bind / port / providers live in the global store now.
+    gs_store = GlobalSettingsStore(base / "claude_global.json")
+    gs_store.save(
+        GlobalSettings(
+            bind_address="0.0.0.0",
+            port=8765,
+            providers={
+                "default": {"url": "https://example.org"},
+            },
+        )
+    )
+    # The profile still carries the model_endpoints (per-profile
+    # routing) — the active profile's endpoints are the routers.
     active = store.get_active() or store.ensure_default()
-    active.bind_address = "0.0.0.0"
-    active.port = 8765
-    active.providers = {
-        "default": Provider(name="default", url="https://example.org"),
-    }
     active.model_endpoints = {
         "claude-opus-4-8": ModelEndpoint(provider_name="default"),
     }
     store.upsert(active)
+    # Pre-populate the cached global settings store on the class
+    # so the lazy init inside ``_start_server`` reuses the seeded
+    # ``gs_store`` instead of constructing a fresh one against
+    # ``data_dir()``.
+    def _patched_global_settings_store(self):  # noqa: ANN001
+        if getattr(self, "_global_settings_store_ref", None) is None:
+            self._global_settings_store_ref = gs_store
+        return self._global_settings_store_ref
+
+    from src.ui.main_window import _profile_management as _pm
+    _pm.ProfileManagementMixin._global_settings_store = _patched_global_settings_store
 
     w = MainWindow()
     try:
@@ -1524,59 +1583,6 @@ def test_default_row_cannot_be_removed() -> None:
     print("✓ Default key row is non-removable")
 
 
-def test_api_key_value_persists_to_credential_store_on_save() -> None:
-    """Editing a key's value via the form + clicking Apply persists
-    the value to the global CredentialStore on the next OK."""
-    from src.profiles import ProfileStore
-    from src.profiles.models import Provider
-    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
-
-    _qapp()
-    base = _tmp_dir()
-    store = ProfileStore(path=base / "profiles.json")
-    store.credential_store.set("default", "old-default-value")
-    default = store.ensure_default()
-    # Seed the default provider with a model catalog so the
-    # endpoint Model combo has something to select (post-refactor
-    # the dropdown is constrained to provider.available_models).
-    default.providers = {
-        "default": Provider(
-            name="default", url="https://example.com",
-            available_models=("claude-opus-4-8",),
-        ),
-    }
-    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
-    try:
-        # The default row is auto-selected on open.
-        assert dlg.keys_table.selectedItems()
-        # Edit the value field + click Apply (the new flow — Apply
-        # replaces the in-row text and stores the pending value so
-        # that ``_on_accept`` writes the credential on OK).
-        dlg.key_value_edit.setText("brand-new-default-value")
-        assert dlg.key_apply_btn.isEnabled(), (
-            "Apply should enable once the value diverges from the row's stored value"
-        )
-        dlg.key_apply_btn.click()
-        # After Apply, the button is disabled again.
-        assert not dlg.key_apply_btn.isEnabled()
-        # Set up an endpoint row so _on_accept doesn't bail. The dialog
-        # auto-seeds a ``default`` provider (and the auto-populated
-        # row points at it), so we just type the model name and
-        # click Apply.
-        dlg.endpoint_model_combo.setCurrentText("claude-opus-4-8")
-        dlg.endpoint_apply_btn.click()
-        assert not dlg.endpoint_apply_btn.isEnabled()
-        dlg._on_accept()
-        # The CredentialStore should now have the new value.
-        assert store.credential_store.get("default") == "brand-new-default-value", (
-            f"expected updated default key, got "
-            f"{store.credential_store.get('default')!r}"
-        )
-    finally:
-        dlg.deleteLater()
-    print("✓ API key value persists to CredentialStore on save")
-
-
 # ---- Model Endpoints tab: select + edit + apply -----------------------
 
 
@@ -1688,7 +1694,10 @@ def test_endpoints_row_apply_persists_provider_name_on_save() -> None:
     store.credential_store.set("default", "x")
     default = store.ensure_default()
     # Two providers with non-overlapping model catalogs so the
-    # model combo actually rebuilds.
+    # model combo actually rebuilds. Providers live in the global
+    # settings store now; mirror the profile's seed dict so the
+    # endpoint validator has both ``default`` and ``work`` to look
+    # up.
     default.providers = {
         "default": Provider(
             name="default", url="https://example.com",
@@ -1699,7 +1708,12 @@ def test_endpoints_row_apply_persists_provider_name_on_save() -> None:
             available_models=("claude-opus-4-8", "claude-sonnet-4-6"),
         ),
     }
-    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    gs_store = _seed_global_providers_from_profile(base, default)
+    dlg = ProfileEditorDialog(
+        default,
+        credential_store=store.credential_store,
+        global_settings_loader=gs_store.load,
+    )
     try:
         # The form mirrors the empty pre-populated row.
         assert dlg._selected_endpoint_row == 0
@@ -1842,69 +1856,6 @@ def test_api_keys_form_apply_disabled_until_divergence() -> None:
     print("✓ API Keys form Apply enables on divergence")
 
 
-def test_api_keys_form_supports_rename_on_default() -> None:
-    """The user said they want to edit the Default row too. The
-    *name* on Default is structurally fixed (``\"default\"``), but
-    the value is editable. Typing a new value + Apply + OK
-    persists it to the global CredentialStore."""
-    from src.profiles import ProfileStore
-    from src.profiles.models import Provider
-    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
-    from PySide6.QtWidgets import QMessageBox
-
-    _qapp()
-    base = _tmp_dir()
-    store = ProfileStore(path=base / "profiles.json")
-    store.credential_store.set("default", "old-value")
-    default = store.ensure_default()
-    # Seed the default provider with a model catalog so the
-    # endpoint Model combo has something to pick (dropdown is
-    # constrained post-refactor).
-    default.providers = {
-        "default": Provider(
-            name="default", url="https://example.com",
-            available_models=("claude-opus-4-8",),
-        ),
-    }
-    # ``_on_accept`` raises ``QMessageBox.warning`` for any
-    # validation failure. The offscreen Qt platform happily
-    # *blocks* on those modals waiting for a click that never
-    # comes — replace with a silent logger so the test isn't a
-    # 60-second hang on the first failure.
-    orig_warning = QMessageBox.warning
-
-    def _silent_warning(*_a, **_kw):
-        return QMessageBox.StandardButton.Yes
-
-    QMessageBox.warning = staticmethod(_silent_warning)
-    try:
-        dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
-        try:
-            assert dlg._selected_key_row == 0
-            # The default row's value column shows 'old-value' as a
-            # masked dot string. Edit the form's value + Apply.
-            dlg.key_value_edit.setText("new-value")
-            assert dlg.key_apply_btn.isEnabled()
-            dlg.key_apply_btn.click()
-            # After Apply, the form is reset (Apply disabled).
-            assert not dlg.key_apply_btn.isEnabled()
-            # Also need an endpoint row to satisfy _on_accept. Pick
-            # the only model in the catalog.
-            dlg.endpoint_model_combo.setCurrentText("claude-opus-4-8")
-            dlg.endpoint_apply_btn.click()
-            assert not dlg.endpoint_apply_btn.isEnabled()
-            dlg._on_accept()
-            assert store.credential_store.get("default") == "new-value", (
-                f"expected new default value, got "
-                f"{store.credential_store.get('default')!r}"
-            )
-        finally:
-            dlg.deleteLater()
-    finally:
-        QMessageBox.warning = orig_warning
-    print("✓ API Keys form supports editing Default row's value")
-
-
 def test_resolve_api_key_walks_provider_chain() -> None:
     """``resolve_api_key`` walks default_model → endpoint →
     provider → key_ref → CredentialStore (post-refactor)."""
@@ -2000,14 +1951,21 @@ def test_env_vars_form_apply_persists_value() -> None:
     store.credential_store.set("default", "x")
     default = store.ensure_default()
     # Need a Provider with a catalog containing claude-opus-4-8 so
-    # the constrained Model combo has a selectable entry.
+    # the constrained Model combo has a selectable entry. The
+    # provider now lives in the global settings store; mirror the
+    # profile's seed dict so ``_on_accept`` finds ``default``.
     default.providers = {
         "default": Provider(
             name="default", url="https://example.com",
             available_models=("claude-opus-4-8",),
         ),
     }
-    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    gs_store = _seed_global_providers_from_profile(base, default)
+    dlg = ProfileEditorDialog(
+        default,
+        credential_store=store.credential_store,
+        global_settings_loader=gs_store.load,
+    )
     try:
         # Need an env row + an endpoint row first.
         from PySide6.QtWidgets import QTableWidgetItem
@@ -2195,55 +2153,6 @@ def test_default_provider_row_cannot_be_removed() -> None:
     finally:
         dlg.deleteLater()
     print("✓ Default provider row is non-removable")
-
-
-def test_providers_form_apply_persists_url_on_save() -> None:
-    """Editing a provider's URL via the form + clicking Apply
-    commits the URL to the table; ``_on_accept`` writes it to the
-    profile."""
-    from src.profiles import ProfileStore
-    from src.profiles.models import Provider
-    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
-
-    _qapp()
-    base = _tmp_dir()
-    store = ProfileStore(path=base / "profiles.json")
-    store.credential_store.set("default", "x")
-    default = store.ensure_default()
-    # Seed the default provider with a model catalog so the
-    # endpoint Model combo has something selectable (post-refactor
-    # the dropdown is constrained to provider.available_models).
-    default.providers = {
-        "default": Provider(
-            name="default", url="https://api.example.com",
-            available_models=("claude-opus-4-8",),
-        ),
-    }
-    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
-    try:
-        # Row 0 (default) is auto-selected. Form is populated.
-        assert dlg._selected_provider_row == 0
-        assert dlg.provider_name_edit.text() == "default"
-        # Edit the URL via the form + Apply.
-        dlg.provider_url_edit.setText("https://example.com/v2")
-        assert dlg.provider_apply_btn.isEnabled()
-        dlg.provider_apply_btn.click()
-        assert not dlg.provider_apply_btn.isEnabled()
-        # Add an endpoint row that references the default provider
-        # so _on_accept has something to commit.
-        dlg.endpoint_model_combo.setCurrentText("claude-opus-4-8")
-        dlg.endpoint_apply_btn.click()
-        dlg._on_accept()
-        edited = dlg.to_profile()
-        assert "default" in edited.providers
-        assert edited.providers["default"].url == "https://example.com/v2", (
-            f"expected updated default URL, got "
-            f"{edited.providers['default'].url!r}"
-        )
-        assert edited.model_endpoints["claude-opus-4-8"].provider_name == "default"
-    finally:
-        dlg.deleteLater()
-    print("✓ Provider form Apply persists URL on save")
 
 
 def test_providers_form_apply_disabled_until_divergence() -> None:
@@ -2488,8 +2397,16 @@ def test_endpoint_aliases_form_apply_persists_aliases_on_save() -> None:
             available_models=("claude-opus-4-8",),
         ),
     }
+    # Providers live in the global settings store now — mirror the
+    # profile's seed so the ``_on_accept`` validator finds
+    # ``default``.
+    gs_store = _seed_global_providers_from_profile(base, default)
     store.upsert(default)
-    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    dlg = ProfileEditorDialog(
+        default,
+        credential_store=store.credential_store,
+        global_settings_loader=gs_store.load,
+    )
     try:
         # Row 0 is the auto-populated empty row.
         assert dlg._selected_endpoint_row == 0
@@ -2586,7 +2503,7 @@ def test_endpoint_snap_apply_on_accept_commits_typed_aliases() -> None:
     dropped. Verify ``_on_accept`` commits any divergent form
     state just-in-time."""
     from src.profiles import ProfileStore
-    from src.profiles.models import Provider
+    from src.profiles.global_settings import GlobalSettings, GlobalSettingsStore
     from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
 
     _qapp()
@@ -2594,13 +2511,23 @@ def test_endpoint_snap_apply_on_accept_commits_typed_aliases() -> None:
     store = ProfileStore(path=base / "profiles.json")
     store.credential_store.set("default", "x")
     default = store.ensure_default()
-    default.providers = {
-        "default": Provider(
-            name="default", url="https://api.anthropic.com",
-            available_models=("claude-opus-4-8",),
-        ),
-    }
-    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    # Providers live in the global settings store now.
+    gs_store = GlobalSettingsStore(base / "claude_global.json")
+    gs_store.save(
+        GlobalSettings(
+            providers={
+                "default": {
+                    "url": "https://api.anthropic.com",
+                    "available_models": ["claude-opus-4-8"],
+                },
+            },
+        )
+    )
+    dlg = ProfileEditorDialog(
+        default,
+        credential_store=store.credential_store,
+        global_settings_loader=gs_store.load,
+    )
     try:
         # Type a model name + aliases in the form but DO NOT click
         # Apply. The intent: clicking OK should still commit.
@@ -2731,9 +2658,12 @@ def test_default_model_combo_lists_aliases_with_legacy_fallback() -> None:
 
 def test_default_model_combo_persists_alias_choice() -> None:
     """Picking an alias from the Default model dropdown + clicking OK
-    saves the alias verbatim as ``profile.default_model``. The proxy
-    rewrites it to the real model name at request time."""
-    from src.profiles import ProfileStore, Provider, ModelEndpoint
+    writes the alias into ``claude_settings["model"]`` (the same
+    key Claude Code reads in its settings.json). Previously this
+    lived on a now-removed ``default_model`` field."""
+    from src.profiles import ProfileStore
+    from src.profiles.global_settings import GlobalSettings, GlobalSettingsStore
+    from src.profiles.models import ModelEndpoint
     from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
 
     _qapp()
@@ -2741,19 +2671,31 @@ def test_default_model_combo_persists_alias_choice() -> None:
     store = ProfileStore(path=base / "profiles.json")
     store.credential_store.set("default", "x")
     default = store.ensure_default()
-    default.providers = {
-        "default": Provider(
-            name="default", url="https://api.anthropic.com",
-            available_models=("claude-opus-4-8",),
-        ),
-    }
+    # Providers live in the global settings store now — seed it
+    # so ``_on_accept`` finds the ``default`` provider the
+    # endpoint references.
+    gs_store = GlobalSettingsStore(base / "claude_global.json")
+    gs_store.save(
+        GlobalSettings(
+            providers={
+                "default": {
+                    "url": "https://api.anthropic.com",
+                    "available_models": ["claude-opus-4-8"],
+                },
+            },
+        )
+    )
     default.model_endpoints = {
         "claude-opus-4-8": ModelEndpoint(
             provider_name="default",
             aliases=("opus", "team-pro"),
         ),
     }
-    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    dlg = ProfileEditorDialog(
+        default,
+        credential_store=store.credential_store,
+        global_settings_loader=gs_store.load,
+    )
     try:
         # Pick the "opus" alias.
         for i in range(dlg.default_model_combo.count()):
@@ -2763,9 +2705,12 @@ def test_default_model_combo_persists_alias_choice() -> None:
         dlg._on_accept()
         edited = dlg.to_profile()
         # Real model name *not* stored — exactly the alias the
-        # user picked in the dropdown.
-        assert edited.default_model == "opus", (
-            f"expected default_model='opus', got {edited.default_model!r}"
+        # user picked in the dropdown. Post-restructure this
+        # lives under ``claude_settings["model"]`` rather than a
+        # top-level ``default_model`` field.
+        assert edited.claude_settings.get("model") == "opus", (
+            f"expected claude_settings['model']='opus', got "
+            f"{edited.claude_settings.get('model')!r}"
         )
     finally:
         dlg.deleteLater()
@@ -2845,7 +2790,8 @@ def test_endpoint_aliases_unique_across_profile_on_save() -> None:
     ``_on_accept`` (the editor surfaces a warning instead of
     silently shadowing)."""
     from src.profiles import ProfileStore
-    from src.profiles.models import ModelEndpoint, Provider
+    from src.profiles.global_settings import GlobalSettings, GlobalSettingsStore
+    from src.profiles.models import ModelEndpoint
     from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
     from PySide6.QtWidgets import QMessageBox
 
@@ -2856,15 +2802,28 @@ def test_endpoint_aliases_unique_across_profile_on_save() -> None:
     default = store.ensure_default()
     # Available Models needs to contain both claude-opus-4-8 and
     # claude-haiku-4-5 so the dialog's constrained dropdown has
-    # something to select for each row.
-    default.providers = {
-        "default": Provider(
-            name="default", url="https://api.anthropic.com",
-            available_models=("claude-opus-4-8", "claude-haiku-4-5"),
-        ),
-    }
+    # something to select for each row. Providers live in the
+    # global settings store now.
+    gs_store = GlobalSettingsStore(base / "claude_global.json")
+    gs_store.save(
+        GlobalSettings(
+            providers={
+                "default": {
+                    "url": "https://api.anthropic.com",
+                    "available_models": [
+                        "claude-opus-4-8",
+                        "claude-haiku-4-5",
+                    ],
+                },
+            },
+        )
+    )
     store.upsert(default)
-    dlg = ProfileEditorDialog(default, credential_store=store.credential_store)
+    dlg = ProfileEditorDialog(
+        default,
+        credential_store=store.credential_store,
+        global_settings_loader=gs_store.load,
+    )
     try:
         # Build two rows both claiming alias "opus".
         dlg.endpoint_model_combo.setCurrentText("claude-opus-4-8")

@@ -177,6 +177,13 @@ class MainWindow(
             get_proxy_base_url=self._proxy_base_url,
             request_proxy_start=self._request_proxy_start,
         )
+        # Default session CWD moved to the global settings store
+        # (``Claude > Settings > General``). Wire a loader so
+        # ``_launch_session`` can read it without holding its own
+        # reference to the global settings file.
+        self.claude_container.set_global_settings_loader(
+            lambda: self._global_settings_store().load()
+        )
         self.claude_container.proxy_requested.connect(self._on_claude_proxy_requested)
         self.view_tabs.addTab(self.claude_container, "Claude")
 
