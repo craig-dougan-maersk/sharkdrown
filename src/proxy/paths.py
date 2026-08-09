@@ -16,10 +16,10 @@ from PySide6.QtCore import QStandardPaths
 def data_dir() -> Path:
     """Return (and create) the per-user app-data directory.
 
-    Resolves to:
-      - Linux:  ~/.local/share/Sharkdrown/PandasMarkdownEditor
-      - macOS:  ~/Library/Application Support/Sharkdrown/PandasMarkdownEditor
-      - Windows: %APPDATA%/Sharkdrown/PandasMarkdownEditor
+    Resolves to (based on ``APP_ORG`` / ``APP_NAME`` from ``src.config``):
+      - Linux:   ~/.local/share/dougan.io/SharkDrown
+      - macOS:   ~/Library/Application Support/dougan.io/SharkDrown
+      - Windows: %APPDATA%/dougan.io/SharkDrown
     """
     base = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
     base.mkdir(parents=True, exist_ok=True)
@@ -29,6 +29,20 @@ def data_dir() -> Path:
 def default_db_path() -> Path:
     """Path to the SQLite capture database used by the proxy."""
     return data_dir() / "ccproxy-requests.db"
+
+
+def defaults_env_path() -> Path:
+    """Path to the user-editable global Claude env file.
+
+    The file is deployed (copied from the packaged ``defaults.env``
+    template) by :func:`src.profiles.global_env.ensure_global_env_file`
+    on first launch and remains editable via
+    ``Claude > Settings > Env Vars``. The env builder loads it
+    through :func:`src.profiles.global_env.load_global_env` and
+    layers it into the Claude Code session env above per-session
+    overrides but below the infra-var safety-net.
+    """
+    return data_dir() / "defaults.env"
 
 
 def default_config_path() -> Path:

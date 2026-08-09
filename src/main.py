@@ -30,9 +30,9 @@ def main() -> None:
     # Organization + application name MUST be set before constructing
     # MainWindow so that QStandardPaths.writableLocation(AppDataLocation)
     # and QSettings() resolve to per-app, platform-appropriate paths:
-    #   Linux:   ~/.local/share/Sharkdrown/PandasMarkdownEditor/
-    #   macOS:   ~/Library/Application Support/Sharkdrown/PandasMarkdownEditor/
-    #   Windows: %APPDATA%/Sharkdrown/PandasMarkdownEditor/
+    #   Linux:   ~/.local/share/dougan.io/SharkDrown/
+    #   macOS:   ~/Library/Application Support/dougan.io/SharkDrown/
+    #   Windows: %APPDATA%/dougan.io/SharkDrown/
     app.setOrganizationName(APP_ORG)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_TITLE)
@@ -76,6 +76,17 @@ def main() -> None:
         or font.pointSize() != app.font().pointSize()
     ):
         app.setFont(font)
+
+    # Deploy the packaged global Claude env file (``defaults.env``)
+    # to the app data directory on first launch. Idempotent: leaves
+    # any user-edited file alone. Called BEFORE constructing
+    # MainWindow so the file exists by the time the user opens
+    # ``Claude > Settings > Env Vars`` and the env-builder layer
+    # can load it on the first session launch.
+    from src.profiles.global_env import ensure_global_env_file
+    from src.proxy.paths import data_dir
+
+    ensure_global_env_file(data_dir())
 
     # Create and show the main window
     window = MainWindow()

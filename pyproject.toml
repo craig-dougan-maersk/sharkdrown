@@ -64,6 +64,17 @@ build-backend = "setuptools.build_meta"
 where = ["."]
 include = ["src*"]
 
+[tool.setuptools.package-data]
+# ``defaults.env`` is the shipped global Claude env template —
+# ``src.profiles.global_env.ensure_global_env_file`` reads it via
+# ``importlib.resources`` and deploys it to ``<data_dir>/defaults.env``
+# on first launch.
+"src.profiles.resources" = ["*.env", "*.txt", "*.md"]
+# ``Dockerfile.claude-code`` is bundled as a packaged resource so
+# the in-app docker image builder can read it via ``importlib.resources``
+# without depending on the cwd layout.
+"src.ui.claude.resources" = ["Dockerfile.claude-code", "*.txt", "*.md"]
+
 [tool.black]
 line-length = 88
 target-version = ["py312"]

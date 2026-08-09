@@ -13,6 +13,12 @@ installation (no longer per-profile):
   per-profile dialog so the user sees it as a single global list.)
 - **CLAUDE.md** — editor for ``~/.claude/CLAUDE.md``, the global rules
   document prepended into every profile's scoped ``CLAUDE.md``.
+- **Env Vars** — editor for ``<data_dir>/defaults.env``, the
+  user-editable global Claude Code session env file. Shipped with
+  ``CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`` and
+  ``CLAUDE_CODE_NO_FLICKER=1``; the user can add / override / remove
+  vars and the env-builder layers them into every session above
+  per-session overrides but below the infra-var safety-net.
 
 Construction pattern mirrors :class:`ProfileEditorDialog`: per-tab
 builders live in ``_*.py`` mixins composed onto the dialog. The dialog
@@ -34,6 +40,7 @@ from src.profiles.global_settings import GlobalSettings, GlobalSettingsStore
 
 from src.ui.claude.global_settings._claude_md_tab import ClaudeMdTabMixin
 from src.ui.claude.global_settings._api_keys_tab import ApiKeysTabMixin
+from src.ui.claude.global_settings._env_vars_tab import EnvVarsTabMixin
 from src.ui.claude.global_settings._general_tab import GeneralTabMixin
 from src.ui.claude.global_settings._providers_tab import ProvidersTabMixin
 
@@ -43,6 +50,7 @@ class GlobalSettingsDialog(
     ProvidersTabMixin,
     ApiKeysTabMixin,
     ClaudeMdTabMixin,
+    EnvVarsTabMixin,
     QDialog,
 ):
     """Edit the user's global Claude Code settings.
@@ -88,6 +96,7 @@ class GlobalSettingsDialog(
         self._build_providers_tab()
         self._build_api_key_tab()
         self._build_claude_md_tab()
+        self._build_env_vars_tab()
 
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -102,12 +111,14 @@ class GlobalSettingsDialog(
         self._populate_providers_tab()
         self._populate_keys_table()
         self._populate_claude_md_tab()
+        self._populate_env_vars_tab()
 
     def _on_accept(self) -> None:
         """Persist the edited settings to the backing store."""
         self._collect_general_tab()
         self._collect_providers_tab()
         self._collect_claude_md_tab()
+        self._collect_env_vars_tab()
         self._store.save(self._settings)
         self.accept()
 

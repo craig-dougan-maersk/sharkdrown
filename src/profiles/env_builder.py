@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import os
 import warnings
+from pathlib import Path
 from typing import Mapping
 
+from src.profiles import global_env
 from src.profiles.credential_store import CredentialStore
 from src.profiles.models import ClaudeProfile
 from src.profiles.store import SENTINEL_API_KEY
@@ -62,6 +64,14 @@ def resolve_api_key(
     *provider's* ``key_ref`` to a plaintext value via
     :class:`CredentialStore`.
 
+    ``claude_settings["model"]`` may hold either the canonical
+    upstream name (``"MiniMax-M3"``) **or** a user-friendly alias
+    (``"minimax"``). The profile editor saves whichever the user
+    typed in the Default Model combo; both should resolve to the
+    same credential. We try the canonical lookup first, then walk
+    the endpoints' ``aliases`` for a match — the same pattern the
+    proxy uses to rewrite inbound model names.
+
     Authentication is now a property of the provider rather than
     the endpoint (post-refactor) — so two models on the same
     provider share the same key, and the resolver traverses the
@@ -90,6 +100,21 @@ def resolve_api_key(
     if not default_model:
         return None
     endpoint = profile.model_endpoints.get(default_model)
+    # Fallback: ``claude_settings["model"]`` may be an alias
+    # (``"minimax"``) rather than the canonical upstream name
+    # (``"MiniMax-M3"``). Walk the endpoints' aliases for a match.
+    # The proxy's ``_apply_alias_rewrite`` does the same thing on
+    # inbound requests; we mirror it here so the credential
+    # resolver and the request handler agree on which provider an
+    # alias refers to.
+    if endpoint is None:
+        for model_name, ep in profile.model_endpoints.items():
+            if ep is None or isinstance(ep, str):
+                continue
+            aliases = getattr(ep, "aliases", ()) or ()
+            if default_model in aliases:
+                endpoint = ep
+                break
     if endpoint is None:
         return None
     provider = profile.providers.get(endpoint.provider_name)
@@ -106,6 +131,7 @@ def build_claude_session_env(
     api_key: str | None,
     session_env: Mapping[str, str] | None = None,
     container_aware: bool = False,
+    data_dir: Path | None = None,
 ) -> dict[str, str]:
     """Return a fresh dict containing every env var the child needs.
 
@@ -135,43 +161,59 @@ def build_claude_session_env(
         ``host.docker.internal`` (the Docker-for-Mac/Win hostname
         that resolves to the host machine), and rewrites
         ``CLAUDE_CONFIG_DIR`` to the in-container bind-mount
-        target (``/home/claude/.claude``). When ``False``, the
-        host values pass through unchanged.
+        target (``/home/claude/.claude``). The bind-mount
+        sources the whole profile dir so ``<host>/<slug>/.claude/``
+        appears at ``/home/claude/.claude/`` inside the
+        container — where Claude Code reads its config. When
+        ``False``, the host values pass through unchanged.
+    data_dir
+        Optional path to the app data directory (``<data_dir>`` from
+        ``proxy.paths.data_dir()``). When provided, the global env
+        file (``<data_dir>/defaults.env``) is loaded and layered
+        above ``session_env`` but below the safety-net re-apply of
+        integration-owned infra vars. When ``None`` (the default for
+        legacy callers that don't pass it), the global layer is
+        skipped — existing tests and call sites that don't yet
+        thread ``data_dir`` are unaffected. New callers (the
+        desktop app) should always pass ``data_dir`` so the
+        shipped defaults (``CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY``
+        and ``CLAUDE_CODE_NO_FLICKER``) reach the session.
     """
     # ---- Docker rewrites -------------------------------------------------
     if container_aware:
         # Late import — ``docker_session`` transitively pulls in
         # PySide6, and env_builder is imported by modules that
         # need to work without a QApplication (e.g. the proxy).
-        from src.ui.claude.docker_session import _IN_CONTAINER_CLAUDE_HOME
+        from src.ui.claude.docker_session import (
+            _IN_CONTAINER_CLAUDE_CONFIG_DIR,
+        )
 
         proxy_base_url = _rewrite_proxy_for_container(proxy_base_url)
-        config_dir = _IN_CONTAINER_CLAUDE_HOME
+        config_dir = _IN_CONTAINER_CLAUDE_CONFIG_DIR
 
     env: dict[str, str] = os.environ.copy()
-    """Return a fresh dict containing every env var the child needs.
 
-    Parameters
-    ----------
-    profile
-        The profile the session is locked to. Drives ``ANTHROPIC_MODEL``
-        (from ``default_model``) and the per-profile ``env_vars``.
-    proxy_base_url
-        Where Claude Code should point — typically
-        ``http://127.0.0.1:<port>``. The caller resolves this; the
-        env builder doesn't talk to the proxy directly.
-    config_dir
-        Absolute path to the per-profile ``CLAUDE_CONFIG_DIR``
-        (the return value of ``write_profile_config``).
-    api_key
-        Resolved API key for the profile (``CredentialStore.get(ref)``).
-        ``None`` → uses the labeled sentinel ``sk-proxy-injected`` so
-        Claude Code doesn't refuse to start; the proxy will reject
-        requests until a real key is configured.
-    session_env
-        Optional per-session overrides layered above ``profile.env_vars``.
-    """
-    env: dict[str, str] = os.environ.copy()
+    # ---- strip inherited infra vars --------------------------------------
+    # The GUI process starts from ``os.environ`` (PATH, HOME, LANG,
+    # etc.) but for *infrastructure* vars (those the proxy / Claude
+    # integration owns) the integration's own write below is the
+    # only source of truth. Without this strip, a value the user's
+    # interactive shell happens to have — e.g.
+    # ``ANTHROPIC_MODEL=MiniMax-M3`` set by ``direnv`` or a
+    # previous shell experiment — silently leaks into every
+    # Claude Code session. Setting "Default model: none" in the
+    # profile editor wouldn't matter: the inherited value still
+    # arrives in the child, indistinguishable from one the
+    # profile explicitly chose. Strip the entire ``INFRA_ENV_VARS``
+    # set here; the safety-net re-apply below then writes the
+    # integration's values (or omits ``ANTHROPIC_MODEL`` when the
+    # profile has no default model).
+    #
+    # We don't touch non-infra vars (``PATH`` etc.) — those come
+    # from the GUI process by design and the shell's value is
+    # what the user wants.
+    for k in INFRA_ENV_VARS:
+        env.pop(k, None)
 
     # ---- infra vars -------------------------------------------------------
     env["TERM"] = "xterm-256color"
@@ -201,6 +243,41 @@ def build_claude_session_env(
         env[str(k)] = str(v)
     if session_env:
         for k, v in session_env.items():
+            if k in INFRA_ENV_VARS and env.get(k) != v:
+                if k not in clobbers:
+                    clobbers.append(k)
+            env[str(k)] = str(v)
+
+    # ---- global env: load ``<data_dir>/defaults.env`` ----------------------
+    # The shipped global env (e.g. ``CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY``
+    # and ``CLAUDE_CODE_NO_FLICKER``) sits above ``session_env`` so a
+    # user-edited ``defaults.env`` wins over per-session overrides, but
+    # BELOW the safety-net so an ``defaults.env`` that tries to
+    # redirect ``ANTHROPIC_BASE_URL`` (or any other infra var) is a
+    # no-op — the safety-net re-apply below restores the
+    # integration's value.
+    #
+    # ``data_dir`` is optional so legacy callers (and the existing
+    # test suite that doesn't thread a data dir) keep working
+    # unchanged; the desktop app always passes it. We swallow any
+    # I/O error here so a corrupt or missing ``defaults.env`` cannot
+    # prevent Claude Code from launching — better to ship without
+    # the two new vars than to fail the whole session.
+    if data_dir is not None:
+        try:
+            global_defaults = global_env.load_global_env(Path(data_dir))
+        except OSError as exc:
+            warnings.warn(
+                f"Could not load global env from {data_dir}: {exc}; "
+                "skipping the global env layer.",
+                UserWarning,
+                stacklevel=2,
+            )
+            global_defaults = {}
+        for k, v in global_defaults.items():
+            # Track (but don't act on) clobbers here — the
+            # safety-net below fixes them if the global env tried
+            # to override an infra var.
             if k in INFRA_ENV_VARS and env.get(k) != v:
                 if k not in clobbers:
                     clobbers.append(k)
