@@ -27,7 +27,6 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QComboBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -44,6 +43,7 @@ from PySide6.QtWidgets import (
 
 from src.profiles.credential_store import CredentialStore
 from src.profiles.models import Provider
+from src.ui.widgets.closing_combo_box import ClosingComboBox
 
 
 class ProvidersTabMixin:
@@ -134,7 +134,7 @@ class ProvidersTabMixin:
         self.provider_url_edit.setPlaceholderText("https://api.example.com")
         editor_layout.addRow("Endpoint URL:", self.provider_url_edit)
 
-        self.provider_key_combo = QComboBox()
+        self.provider_key_combo = ClosingComboBox()
         self.provider_key_combo.addItem("(no key)", None)
         editor_layout.addRow("API Key:", self.provider_key_combo)
 
@@ -146,8 +146,14 @@ class ProvidersTabMixin:
 
         self.provider_name_edit.textChanged.connect(self._on_provider_form_changed)
         self.provider_url_edit.textChanged.connect(self._on_provider_form_changed)
-        self.provider_key_combo.currentIndexChanged.connect(
-            self._on_provider_form_changed
+        # ``activated`` so the popup closes cleanly when the user
+        # picks a credential; ``_on_provider_form_changed`` rebuilds
+        # the providers table which is the heavy-work pattern that
+        # left the popup stuck open before. Programmatic refresh
+        # paths (see ``_refresh_provider_key_combo``) bypass
+        # ``activated`` entirely.
+        self.provider_key_combo.activated.connect(
+            lambda _i: self._on_provider_form_changed()
         )
         self.provider_models_edit.textChanged.connect(self._on_provider_form_changed)
 

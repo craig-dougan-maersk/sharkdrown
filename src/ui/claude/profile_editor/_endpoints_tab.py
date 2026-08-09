@@ -3,7 +3,6 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QComboBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -20,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.profiles.models import ModelEndpoint
+from src.ui.widgets.closing_combo_box import ClosingComboBox
 
 
 class EndpointsTabMixin:
@@ -71,7 +71,7 @@ class EndpointsTabMixin:
         default_box = QWidget()
         default_layout = QFormLayout(default_box)
         default_layout.setContentsMargins(0, 0, 0, 0)
-        self.default_model_combo = QComboBox()
+        self.default_model_combo = ClosingComboBox()
         self.default_model_combo.setEditable(False)
         default_layout.addRow("Default model:", self.default_model_combo)
         tab_layout.addWidget(default_box)
@@ -185,7 +185,7 @@ class EndpointsTabMixin:
         # ``_refresh_endpoint_model_combo``. ``userData`` carries
         # the model name (same as the display text — kept for
         # symmetry with the other combos).
-        self.endpoint_model_combo = QComboBox()
+        self.endpoint_model_combo = ClosingComboBox()
         editor_layout.addRow("Model:", self.endpoint_model_combo)
 
         # The endpoint's URL is no longer free-text — it's a
@@ -193,7 +193,7 @@ class EndpointsTabMixin:
         # display label is the provider's *name*; the ``userData``
         # carries the URL (resolved at combo-rebuild time) so the
         # URL hint label below can show the resolved URL.
-        self.endpoint_provider_combo = QComboBox()
+        self.endpoint_provider_combo = ClosingComboBox()
         # ``(no provider)`` is the empty / pre-addition state.
         self.endpoint_provider_combo.addItem("(no provider)", "")
         editor_layout.addRow("Provider:", self.endpoint_provider_combo)
@@ -217,20 +217,32 @@ class EndpointsTabMixin:
         editor_layout.addRow("Aliases:", self.endpoint_aliases_edit)
 
         # ``editingFinished`` fires on F2/Enter/blur; ``textChanged``
-        # / ``currentIndexChanged`` fire continuously — the latter
-        # drive the Apply enable logic in real time.
-        self.endpoint_model_combo.currentIndexChanged.connect(
-            self._on_endpoint_form_changed
+        # fires continuously — the latter drives the Apply enable
+        # logic in real time.
+        #
+        # ``activated`` (NOT ``currentIndexChanged``) so the popup
+        # closes cleanly. The provider combo in particular had THREE
+        # ``currentIndexChanged`` slots — one of which rebuilt
+        # another combo (``_refresh_endpoint_model_combo``) — and
+        # that synchronous widget rebuild was the heaviest
+        # popup-stays-open trigger we found.
+        # ``_refresh_endpoint_provider_combo`` and
+        # ``_refresh_endpoint_model_combo`` populate the combos via
+        # ``blockSignals(True) + setCurrentIndex + blockSignals(False)``
+        # which bypasses ``activated`` so the populate path doesn't
+        # re-enter.
+        self.endpoint_model_combo.activated.connect(
+            lambda _i: self._on_endpoint_form_changed()
         )
-        self.endpoint_provider_combo.currentIndexChanged.connect(
-            self._on_endpoint_form_changed
+        self.endpoint_provider_combo.activated.connect(
+            lambda _i: self._on_endpoint_form_changed()
         )
         # Update the URL hint + repopulate the model combo on
         # every provider selection change.
-        self.endpoint_provider_combo.currentIndexChanged.connect(
+        self.endpoint_provider_combo.activated.connect(
             lambda _i: self._refresh_endpoint_url_hint()
         )
-        self.endpoint_provider_combo.currentIndexChanged.connect(
+        self.endpoint_provider_combo.activated.connect(
             lambda _i: self._refresh_endpoint_model_combo()
         )
         self.endpoint_aliases_edit.textChanged.connect(

@@ -34,6 +34,7 @@ from src.profiles.env_var_catalog import (
     standard_env_vars as _standard_env_vars,
 )
 from src.profiles.models import MarketplaceSource, Subagent
+from src.ui.widgets.closing_combo_box import ClosingComboBox
 
 
 # ---- env vars picker -------------------------------------------------------
@@ -195,9 +196,7 @@ class _SubagentEditorDialog(QDialog):
         # :class:`Subagent`. Aliases are deduplicated + sorted, then
         # any ``(real model: X)`` legacy value is appended last so the
         # user's existing choice round-trips through save.
-        from PySide6.QtWidgets import QComboBox
-
-        self.model_combo = QComboBox()
+        self.model_combo = ClosingComboBox()
         self.model_combo.setEditable(False)
         self.model_combo.addItem("(inherit session default)", "")
         for alias in sorted(dict.fromkeys(model_aliases)):
@@ -284,7 +283,7 @@ class _MarketplaceEditorDialog(QDialog):
         self.name_edit.setPlaceholderText("e.g. claude-plugins-official")
         layout.addRow("Marketplace name:", self.name_edit)
 
-        self.source_kind_combo = QComboBox()
+        self.source_kind_combo = ClosingComboBox()
         for kind in ("github", "git", "url", "git-subdir"):
             self.source_kind_combo.addItem(kind)
         # Default new entries to github — it's the most common kind
@@ -293,8 +292,15 @@ class _MarketplaceEditorDialog(QDialog):
         self.source_kind_combo.setCurrentText(
             source.source if source else "github"
         )
-        self.source_kind_combo.currentTextChanged.connect(
-            self._on_kind_changed
+        # ``activated`` instead of ``currentTextChanged`` so the
+        # popup closes cleanly. ``_on_kind_changed`` hides/shows
+        # several fields based on the picked kind — that's the
+        # heavy synchronous form-layout work that previously left
+        # the popup stuck open. Programmatic ``setCurrentText`` above
+        # bypasses ``activated`` so the initial population doesn't
+        # trigger a redundant rebuild.
+        self.source_kind_combo.activated.connect(
+            lambda _i: self._on_kind_changed(self.source_kind_combo.currentText())
         )
         layout.addRow("Source kind:", self.source_kind_combo)
 

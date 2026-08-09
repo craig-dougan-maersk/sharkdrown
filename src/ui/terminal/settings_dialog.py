@@ -9,7 +9,6 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -22,6 +21,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from src.ui.widgets.closing_combo_box import ClosingComboBox
 
 # ---- Built-in terminal colour themes ----------------------------------------
 
@@ -212,17 +213,25 @@ class TerminalSettingsDialog(QDialog):
         form = QFormLayout(page)
 
         # Theme selector
-        self._theme_combo = QComboBox()
+        self._theme_combo = ClosingComboBox()
         self._theme_combo.addItems(list(THEMES.keys()))
         current_theme = self._current["theme"]
         idx = self._theme_combo.findText(current_theme)
         if idx >= 0:
             self._theme_combo.setCurrentIndex(idx)
-        self._theme_combo.currentTextChanged.connect(self._update_preview)
+        # ``activated`` instead of ``currentTextChanged`` so the popup
+        # closes cleanly. ``_update_preview`` does heavy work
+        # (stylesheet rebuild + preview re-render) that previously
+        # left the popup stuck open. Programmatic ``setCurrentIndex``
+        # above bypasses ``activated`` so the initial population
+        # doesn't trigger a spurious preview update.
+        self._theme_combo.activated.connect(
+            lambda _i: self._update_preview(self._theme_combo.currentText())
+        )
         form.addRow("Color theme:", self._theme_combo)
 
         # Font family
-        self._font_combo = QComboBox()
+        self._font_combo = ClosingComboBox()
         self._font_combo.setEditable(True)
         mono_families = QFontDatabase.families(QFontDatabase.Latin)
         fixed_families = [

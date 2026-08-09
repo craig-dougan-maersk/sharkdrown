@@ -20,7 +20,7 @@ import copy
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QComboBox,
+    QComboBox,  # kept for ``QComboBox.InsertPolicy.NoInsert``; combos migrated below
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -42,6 +42,7 @@ from src.ui.clocks.models import (
     next_clock_id,
     save_clocks,
 )
+from src.ui.widgets.closing_combo_box import ClosingComboBox
 
 
 class ClockEditorDialog(QDialog):
@@ -75,7 +76,7 @@ class ClockEditorDialog(QDialog):
         layout = QFormLayout(self)
 
         # ---- Timezone --------------------------------------------------
-        self.timezone_combo = QComboBox()
+        self.timezone_combo = ClosingComboBox()
         self.timezone_combo.setEditable(True)
         # ``InsertPolicy.NoInsert`` so the typed-in text isn't
         # auto-added to the dropdown on OK — we only accept what's
@@ -106,7 +107,7 @@ class ClockEditorDialog(QDialog):
         layout.addRow("Timezone:", self.timezone_combo)
 
         # ---- Format ----------------------------------------------------
-        self.format_combo = QComboBox()
+        self.format_combo = ClosingComboBox()
         self.format_combo.addItems(["12-hour (AM/PM)", "24-hour"])
         self.format_combo.setCurrentIndex(0 if (clock is None or not clock.use_24h) else 1)
         layout.addRow("Format:", self.format_combo)

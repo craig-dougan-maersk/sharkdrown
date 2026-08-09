@@ -6,7 +6,6 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QColorDialog,
-    QComboBox,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -17,6 +16,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from src.ui.widgets.closing_combo_box import ClosingComboBox
 
 from ..model.connector_model import ConnectorModel
 from ..model.connector_types import EndingType, LineStyle
@@ -79,10 +79,16 @@ class ConnectorStyleDrawer(QWidget):
         form.setSpacing(4)
 
         # Line style
-        self._line_style_combo = QComboBox()
+        self._line_style_combo = ClosingComboBox()
         for style, label in _LINE_STYLE_LABELS:
             self._line_style_combo.addItem(label, style.value)
-        self._line_style_combo.currentIndexChanged.connect(
+        # ``activated`` is user-only (popup click / keyboard pick); the
+        # subclass calls ``hidePopup()`` first so the popup closes
+        # cleanly even though the downstream slot synchronously emits
+        # a model-rebuild signal. Programmatic ``setCurrentIndex`` in
+        # ``populate`` does NOT fire ``activated`` so model rebuilds
+        # don't re-enter.
+        self._line_style_combo.activated.connect(
             lambda _i: self.line_style_changed.emit(
                 self._line_style_combo.currentData()
             )
@@ -106,22 +112,24 @@ class ConnectorStyleDrawer(QWidget):
         form.addRow("Colour", self._color_btn)
 
         # Endings
-        self._start_ending_combo = QComboBox()
+        self._start_ending_combo = ClosingComboBox()
         for ending, label in _ENDING_LABELS:
             self._start_ending_combo.addItem(label, ending.value)
-        self._start_ending_combo.currentIndexChanged.connect(
+        # ``activated`` so the popup closes cleanly (see line-style
+        # comment above).
+        self._start_ending_combo.activated.connect(
             lambda _i: self.start_ending_changed.emit(
                 self._start_ending_combo.currentData()
             )
         )
         form.addRow("Start", self._start_ending_combo)
 
-        self._end_ending_combo = QComboBox()
+        self._end_ending_combo = ClosingComboBox()
         for ending, label in _ENDING_LABELS:
             self._end_ending_combo.addItem(label, ending.value)
         # Default to Arrow for the end.
         self._end_ending_combo.setCurrentIndex(1)
-        self._end_ending_combo.currentIndexChanged.connect(
+        self._end_ending_combo.activated.connect(
             lambda _i: self.end_ending_changed.emit(
                 self._end_ending_combo.currentData()
             )

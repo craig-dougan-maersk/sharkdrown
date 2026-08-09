@@ -18,7 +18,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QComboBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -35,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.profiles.models import McpServer
+from src.ui.widgets.closing_combo_box import ClosingComboBox
 
 
 # Allowed transport values; ordered to match the Claude Code docs
@@ -137,11 +137,20 @@ class McpServersTabMixin:
         self.mcp_name_edit.setPlaceholderText("e.g. filesystem")
         editor_layout.addRow("Name:", self.mcp_name_edit)
 
-        self.mcp_transport_combo = QComboBox()
+        self.mcp_transport_combo = ClosingComboBox()
         for t in _TRANSPORTS:
             self.mcp_transport_combo.addItem(t)
-        self.mcp_transport_combo.currentTextChanged.connect(
-            self._on_mcp_transport_changed
+        # ``activated`` so the popup closes cleanly. The slot
+        # toggles several form fields' visibility based on the
+        # picked transport (stdio vs http vs sse) — that's the
+        # form-layout heavy work that previously left the popup
+        # stuck open. Programmatic ``setCurrentText`` calls in
+        # ``_populate_mcp_form`` are guarded by ``blockSignals`` so
+        # they bypass ``activated`` and don't re-enter.
+        self.mcp_transport_combo.activated.connect(
+            lambda _i: self._on_mcp_transport_changed(
+                self.mcp_transport_combo.currentText()
+            )
         )
         editor_layout.addRow("Transport:", self.mcp_transport_combo)
 

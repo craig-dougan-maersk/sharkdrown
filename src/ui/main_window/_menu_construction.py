@@ -6,13 +6,14 @@ from __future__ import annotations
 from PySide6.QtGui import QAction, QActionGroup, QClipboard, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QLabel,
     QMenu,
     QMessageBox,
     QSlider,
 )
 from PySide6.QtCore import Qt
+
+from src.ui.widgets.closing_combo_box import ClosingComboBox
 
 from src.proxy.activity_tile import ActivityTile
 
@@ -290,7 +291,7 @@ class MenuConstructionMixin:
         self.font_size_value_label.setFixedWidth(32)
         self.status.addPermanentWidget(self.font_size_value_label)
 
-        self.format_combo = QComboBox()
+        self.format_combo = ClosingComboBox()
         self.format_combo.addItems(["markdown", "json", "yaml", "text", "html"])
         self.format_combo.setToolTip(
             "Format for the current document.\n"
