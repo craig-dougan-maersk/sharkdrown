@@ -74,12 +74,18 @@ def test_terminal_default_falls_back_to_14_when_settings_missing(
     assert resolved == 14
 
 
-def test_main_migrates_persisted_base_size_below_14_to_14(tmp_path) -> None:
-    """Existing users with a persisted base size < 14 are migrated to 14.
+def test_main_migrates_persisted_base_size_below_12_to_12(tmp_path) -> None:
+    """Existing users with a persisted base size < 12 are migrated to 12.
 
-    The user explicitly chose "force-override everyone to 14pt" — this
-    test asserts that the migration condition ``saved_base < 14`` writes
-    14 into QSettings, not just the ``None`` (first-launch) case.
+    The user explicitly distinguished UI chrome (menus, dialogs,
+    status bar) from CONTENT (editor + terminal — those stay at 14).
+    UI chrome default is 12pt; force-override behaviour is preserved
+    so first-launch AND upgrade users land at 12.
+
+    The migration condition is ``saved_base < 12``: persisted values
+    of 10-11 (the previous system-derived default on most Linux
+    desktops) get bumped to 12, and the brief PR2 default of 14 also
+    gets migrated down to 12.
     """
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
@@ -94,23 +100,26 @@ def test_main_migrates_persisted_base_size_below_14_to_14(tmp_path) -> None:
     )
     QSettings().clear()
 
-    # Seed an existing-user scenario: app_font_base_size = 12 (the old
-    # default seeded from the system font, which is typically 10-12pt).
+    # Seed an existing-user scenario: app_font_base_size = 11 (the
+    # previous system-derived default on most Linux desktops). The
+    # brief PR2 bump to 14 is also covered by this test — anything
+    # < 12 migrates to 12.
     settings = QSettings("SharkDrown", "App")
-    settings.setValue("app_font_base_size", 12)
+    settings.setValue("app_font_base_size", 11)
 
-    # Run the same migration logic main() does. We import the constants
-    # rather than re-running main() so the test stays focused.
-    DEFAULT_BASE_FONT_SIZE = 14
+    # Run the same migration logic main() does. We inline the
+    # constants rather than re-running main() so the test stays
+    # focused.
+    DEFAULT_BASE_FONT_SIZE = 12
     saved_base = settings.value("app_font_base_size", None, type=int)
     if saved_base is None or saved_base < DEFAULT_BASE_FONT_SIZE:
         settings.setValue("app_font_base_size", DEFAULT_BASE_FONT_SIZE)
 
-    assert settings.value("app_font_base_size", type=int) == 14
+    assert settings.value("app_font_base_size", type=int) == 12
 
 
-def test_main_leaves_existing_user_at_or_above_14_alone(tmp_path) -> None:
-    """Users who already set a base size ≥ 14 are not downgraded."""
+def test_main_leaves_existing_user_at_or_above_12_alone(tmp_path) -> None:
+    """Users who already set a base size ≥ 12 are not downgraded."""
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
 
@@ -126,11 +135,11 @@ def test_main_leaves_existing_user_at_or_above_14_alone(tmp_path) -> None:
     settings = QSettings("SharkDrown", "App")
     settings.setValue("app_font_base_size", 18)  # user explicitly chose 18
 
-    DEFAULT_BASE_FONT_SIZE = 14
+    DEFAULT_BASE_FONT_SIZE = 12
     saved_base = settings.value("app_font_base_size", None, type=int)
     if saved_base is None or saved_base < DEFAULT_BASE_FONT_SIZE:
         settings.setValue("app_font_base_size", DEFAULT_BASE_FONT_SIZE)
 
     assert settings.value("app_font_base_size", type=int) == 18, (
-        "Migration must not touch users who have already set a size ≥ 14."
+        "Migration must not touch users who have already set a size ≥ 12."
     )

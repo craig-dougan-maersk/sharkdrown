@@ -1700,6 +1700,19 @@ class TerminalSessionView(QWidget):
         rows = self._measure_rendered_rows(h)
         if rows < 1:
             rows = max(1, h // ch)
+        # PR5 (issue #3 + user-reported "TUI lost on font change" fix):
+        # the ``_measure_rendered_rows`` probe uses a temporary
+        # QTextDocument that doesn't always agree byte-for-byte with
+        # the actual rendered terminal — at large font sizes (22pt+
+        # at 800×600) it can over-report by a few rows, producing a
+        # cell grid where ``rows * ch`` exceeds the viewport. The
+        # shell still gets TIOCSWINSZ with the oversized grid and
+        # the visible terminal is clipped vertically. Trim rows until
+        # the grid actually fits. We use ``ch`` (fontMetrics) as the
+        # per-row estimate — slight over-estimate is fine; under-
+        # estimating would clip.
+        while rows > 1 and rows * ch > h:
+            rows -= 1
         # Reject implausibly small sizes — we'd rather keep a known-good
         # 24×80 (or whatever the last good size was) than resize the shell
         # to 1×12 for one frame.
@@ -1723,9 +1736,23 @@ class TerminalSessionView(QWidget):
             # Both axes too small — likely a transient layout state.
             # Keep the previous good size.
             return
-        if cols < self.MIN_COLS:
+        # PR5 (issue #3 fix): previously the unconditional
+        # ``return`` FROZE the cell grid at whatever values it last
+        # held, so when the user bumped the font size 5× via Ctrl+=
+        # the grid stayed at 80×24 while the rendered document grew
+        # much wider — columns clipped off the right and rows
+        # below the bottom were lost. We now allow the grid to
+        # shrink to whatever fits the viewport, but only when the
+        # MIN_COLS / MIN_ROWS floors would actually fit at the
+        # current font size — otherwise forcing them produces a
+        # grid that's larger than the viewport (e.g. at 28pt on a
+        # 800×600 window: cw ≈ 22px, so MIN_COLS=40 needs 880px of
+        # width; forcing cols=40 produces horizontal overflow
+        # beyond what the viewport can show — the "half-displayed
+        # TUI" symptom the user reported).
+        if cols < self.MIN_COLS and cols * cw <= w:
             cols = self.MIN_COLS
-        if rows < self.MIN_ROWS:
+        if rows < self.MIN_ROWS and rows * ch <= h:
             rows = self.MIN_ROWS
         if rows == self._rows and cols == self._cols:
             return

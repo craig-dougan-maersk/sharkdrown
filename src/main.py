@@ -47,13 +47,19 @@ def main() -> None:
     # Restore persisted UI font preferences.
     from PySide6.QtCore import QSettings
     settings = QSettings("SharkDrown", "App")
-    # Default font size bumped from system-derived (typically 10-12pt) to
-    # 14 in the multi-bug-fix milestone (issue #2). The user explicitly
-    # chose to force-override existing users too — any persisted base
-    # size < 14 is rewritten to 14 so first-launch AND upgrade users
-    # land at the new default. Users who have explicitly set a size ≥ 14
-    # are left alone; the migration only catches the previous default.
-    DEFAULT_BASE_FONT_SIZE = 14
+    # UI chrome (menus, dialogs, status bar) default font size = 12.
+    # The user explicitly distinguished this from CONTENT font size
+    # (editor + terminal stay at 14pt — see EditorWidget.DEFAULT_FONT_POINT_SIZE
+    # and TerminalSessionView.DEFAULT_FONT_POINT_SIZE). 14pt UI chrome
+    # was visually too heavy in dialog buttons and status bar labels.
+    #
+    # Force-override behaviour: any persisted base size < 12 is
+    # rewritten to 12 so first-launch AND upgrade users land at the
+    # new default. Users who have explicitly set a size ≥ 12 are
+    # left alone; the migration only catches the previous default
+    # (which was system-derived, typically 10-11pt) and the brief
+    # PR2 bump to 14.
+    DEFAULT_BASE_FONT_SIZE = 12
     saved_base = settings.value("app_font_base_size", None, type=int)
     if saved_base is None or saved_base < DEFAULT_BASE_FONT_SIZE:
         settings.setValue("app_font_base_size", DEFAULT_BASE_FONT_SIZE)
