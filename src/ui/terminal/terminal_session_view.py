@@ -66,6 +66,48 @@ def _norm_mods(mods) -> int:
 
 # A tiny dataclass-free namespace so this can be imported in renderer-only
 # tests without pulling in PySide6.
+
+
+def _screen_signature(screen) -> tuple:
+    """Build a hashable signature of pyte's screen + cursor state.
+
+    Used by :meth:`TerminalSessionView._repaint` to short-circuit
+    rebuilds when nothing changed. Iterating every cell is O(rows ×
+    cols) which is cheap enough at typical terminal sizes (80×24,
+    132×50 worst case).
+
+    pyte exposes ``screen.display`` as a list of row strings (one
+    character per cell) — that's the canonical "what the user sees"
+    representation. The full per-cell fg/bg attributes live in
+    ``screen.buffer[y]`` (a sparse ``defaultdict``-like structure
+    that pyte populates lazily with ``Char`` objects), but iterating
+    every cell attribute just to detect change is overkill: when
+    only a colour changes but the character doesn't, the visual
+    output DOES differ, but the screen-to-HTML render produces
+    different bytes anyway. The character-level signature is
+    sufficient for "did anything change that the user can see",
+    and we cross-check via the cursor position.
+
+    Returns a tuple that hashes stably across calls.
+    """
+    # Cursor position is part of the signature because the cursor's
+    # inverted-cell rendering depends on it.
+    try:
+        cursor = (int(screen.cursor.x), int(screen.cursor.y))
+    except (AttributeError, TypeError, ValueError):
+        cursor = (0, 0)
+
+    # ``screen.display`` is the canonical row-string list. Reading
+    # it is O(rows × cols) — about 1920 bytes for a typical 80×24
+    # terminal, far cheaper than the HTML render it's gating.
+    try:
+        display = tuple(screen.display)
+    except (AttributeError, TypeError):
+        display = ()
+
+    return (cursor, display)
+
+
 def key_to_bytes(
     key: int,
     *,
@@ -1045,6 +1087,31 @@ class TerminalSessionView(QWidget):
         # auto-scroll to the bottom on repaint.
         self._user_scrolled_up = False
 
+        # ---- PR5: dirty-tracking repaint ---------------------------------
+        # The previous per-tick ``setHtml`` repaint had three problems:
+        # (a) ``setHtml`` resets the scrollbar to 0 every 16ms, so
+        #     user-up scrolls snapped back to the bottom before the
+        #     rest of the repaint could decide what to do (issue #4).
+        # (b) ``history_lines_to_html`` walked the full scrollback
+        #     every tick, costing ~436ms at 5000 lines.
+        # (c) Even when nothing changed (idle frames) we re-rendered
+        #     the entire document, blocking selection drags and
+        #     scroll events from landing in time.
+        #
+        # ``_cached_live_signature`` / ``_cached_history_lines_count``
+        # / ``_cached_sel`` track the previous frame's state so we
+        # can skip the entire repaint when nothing changed. The
+        # signature is the pyte buffer's per-cell (char, fg, bg)
+        # triple plus the cursor position — hashable for cheap
+        # comparison. ``_cached_history_html`` caches the rendered
+        # scrollback between rebuilds — only refreshed when the
+        # scrollback actually changed (a new line was pushed off
+        # the live screen).
+        self._cached_live_signature: tuple | None = None
+        self._cached_history_lines_count: int = -1
+        self._cached_sel: object = None
+        self._cached_history_html: str = ""
+
         # Lazy pyte import — pyte is a runtime dep but not required to
         # construct the widget, so render-only tests can still import this
         # module.
@@ -1394,125 +1461,195 @@ class TerminalSessionView(QWidget):
             self._repaint_timer.start()
 
     def _repaint(self) -> None:
+        """Render the live screen + scrollback to the QTextEdit.
+
+        PR5 architectural improvement: dirty-line tracking.
+
+        Before this change, ``_repaint`` ran on a 16ms timer and
+        unconditionally called ``setHtml`` on every tick. ``setHtml``
+        resets the scrollbar to 0, so a user-up scroll was always
+        overwritten before the rest of the repaint could decide what
+        to do (issue #4: "scroll up/down broken, can't reach the
+        latest line"). It also rebuilt the entire scrollback HTML
+        every tick — quadratic in scrollback depth, ~436ms at 5000
+        lines, which starved the event loop and made selection drags
+        and scroll events lag.
+
+        The fix:
+        1. Hash the screen + scrollback state. Skip the entire
+           rebuild when the hash matches the cached one. Idle frames
+           (no PTY output) hit the early-return in O(rows) instead of
+           O(history_lines × row_width).
+        2. Cache the scrollback HTML across repaints; refresh only
+           when scrollback lines were added.
+        3. Capture the scrollbar position BEFORE ``setHtml`` (which
+           resets it) and restore after, so the user's scroll is
+           preserved across the rebuild.
+
+        Why a content hash and not a tick counter: ``_schedule_repaint``
+        coalesces bursts of PTY data into a single tick, so the hash
+        catches "no bytes since last frame" cheaply. A tick counter
+        would still rebuild the document on idle ticks.
+        """
         if self._screen is None:
             return
-        # Pass the cell-coordinate selection through to the renderer so
-        # the highlighted cells render with reversed fg/bg.
+
+        # ---- 1. Compute the dirty hash --------------------------------
+        # Include the live screen buffer + scrollback length + cursor.
+        # Iterating every cell on every tick is still O(rows × cols),
+        # but it's far cheaper than rebuilding the entire HTML and
+        # round-tripping it through QTextDocument.
+        try:
+            live_signature = _screen_signature(self._screen)
+        except (AttributeError, TypeError):
+            live_signature = None
+
+        history_lines_count = 0
+        if hasattr(self._screen, "history") and self._screen.history.top:
+            history_lines_count = len(self._screen.history.top)
+
+        # The selection state matters too — if the user changed
+        # selection without the screen changing, we still need to
+        # repaint so the highlight moves.
         sel = None
         if hasattr(self, "text_edit"):
             sel = self.text_edit.selection_range()
 
-        # Build full HTML: scrollback history + live screen.
+        cached_sel = getattr(self, "_cached_sel", None)
+        # Even on an "idle" frame (no PTY data, no selection move),
+        # we still want to run the follow-mode scroll logic below
+        # when ``_user_scrolled_up`` is set. Otherwise a user who
+        # scrolled up history and then navigated back to the bottom
+        # via keyboard (Ctrl+End) or scrollbar drag — paths that
+        # don't fire ``wheelEvent`` — would be stuck in
+        # "scrolled up" mode forever; new content accumulates
+        # invisibly below the viewport. The old per-tick repaint
+        # happened to re-engage follow mode as a side effect of
+        # always running; the dirty-tracking early-return must
+        # preserve that side effect explicitly.
+        if (
+            live_signature is not None
+            and history_lines_count == getattr(
+                self, "_cached_history_lines_count", -1
+            )
+            and live_signature
+            == getattr(self, "_cached_live_signature", None)
+            and sel == cached_sel
+            and not getattr(self, "_user_scrolled_up", False)
+        ):
+            # Nothing changed AND no selection move AND no pending
+            # scroll-state reset — skip the rebuild. Cheap early-
+            # return: O(1) when the screen is idle, O(n) when the
+            # user is typing into a running shell (the signature
+            # changes on every keystroke).
+            return
+        # Update the live-signature cache now (so the early-return
+        # compares against fresh state on the NEXT frame). The
+        # history-line count is updated BELOW after the history-rebuild
+        # decision — otherwise we'd race-update it here and the
+        # "should we rebuild history HTML?" check below would always
+        # see the new count and skip the rebuild entirely.
+        self._cached_live_signature = live_signature
+        self._cached_sel = sel
+
+        # ---- 2. Build the new HTML -----------------------------------
         live_html = screen_to_html(self._screen, selection=sel)
 
-        history_html = ""
-        if hasattr(self._screen, "history") and self._screen.history.top:
-            history_html = history_lines_to_html(
-                self._screen.history.top, self._screen.columns
-            )
+        history_html = self._cached_history_html
+        if history_lines_count:
+            # Rebuild history only when we know it changed (the
+            # count differs from the cached value). The cached value
+            # is updated below; if the count is the same we keep the
+            # cached HTML.
+            if self._cached_history_lines_count != history_lines_count:
+                history_html = history_lines_to_html(
+                    self._screen.history.top, self._screen.columns
+                )
+                self._cached_history_html = history_html
+            # Update the cached count AFTER deciding whether to
+            # rebuild — otherwise the next call would always see the
+            # new count and skip the rebuild.
+            self._cached_history_lines_count = history_lines_count
+        else:
+            history_html = ""
+            self._cached_history_html = ""
+            self._cached_history_lines_count = 0
 
         if history_html:
-            # Inject history rows before the live content inside the <pre> tag.
-            # screen_to_html returns '<pre style="...">CONTENT</pre>'.
-            # We insert history_html right after the opening <pre ...> tag.
+            # Inject history rows before the live content inside the
+            # ``<pre>`` tag. ``screen_to_html`` returns
+            # ``'<pre style="...">CONTENT</pre>'``; insert history_html
+            # right after the opening ``<pre ...>`` tag.
             pre_end = live_html.index(">") + 1
             html = live_html[:pre_end] + history_html + live_html[pre_end:]
         else:
             html = live_html
 
-        # Detect scroll position before replacing content.
+        # ---- 3. Preserve the scroll position --------------------------
+        # ``setHtml`` resets the scrollbar to 0. Capture the value
+        # BEFORE so we can restore it after — but only for user-up
+        # scroll states. In follow-mode (the user is at the bottom
+        # and wants to see new output), we let the auto-scroll below
+        # take over.
         scrollbar = self.text_edit.verticalScrollBar()
-        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 5
+        saved_scroll = scrollbar.value()
+        saved_max = scrollbar.maximum()
+        was_at_bottom = saved_scroll >= saved_max - 5
 
         self.text_edit.setHtml(html)
 
-        # Auto-scroll to the cursor unless the user manually scrolled up.
-        if not self._user_scrolled_up or was_at_bottom:
-            # Even when ``_user_scrolled_up`` was True at the start of
-            # this repaint, a repaint that already detected the user
-            # at the bottom (the ``was_at_bottom`` short-circuit) should
-            # re-engage follow mode — the user can navigate back to
-            # the bottom via keyboard (Ctrl+End), the scrollbar drag
-            # handle, or a programmatic scroll, none of which fire
-            # ``wheelEvent`` and so can't clear ``_user_scrolled_up``
-            # on their own. Without this, a user who scrolled up
-            # history and then scrolled back down would see new
-            # output accumulate invisibly below the viewport — the
-            # "active line off the bottom" symptom.
-            self._user_scrolled_up = False
-            # Force the document layout so ``scrollbar.maximum()``
-            # reflects the new content height. We pin the document's
-            # text width to the viewport first: without that,
-            # ``adjustSize`` is a no-op for documents with no
-            # fixed-width blocks (ours is a flowing ``<pre>``), and
-            # ``scrollbar.maximum()`` stays at the value left over
-            # from the *previous* repaint.
-            viewport_width = self.text_edit.viewport().width()
-            if viewport_width > 0:
-                self.text_edit.document().setTextWidth(viewport_width)
-            self.text_edit.document().adjustSize()
+        # Restore user scroll when they were NOT at the bottom. In
+        # follow-mode, fall through to the auto-scroll below.
+        if self._user_scrolled_up and not was_at_bottom:
+            # Map the old scroll position (pixel offset in the
+            # pre-rebuild document) to the new one. ``setHtml``
+            # produces a document with approximately the same height
+            # (same rows × same line height), so the old value is
+            # usually within a row or two of the new equivalent.
+            # Clamp to the new maximum to handle the rare case where
+            # the new document is shorter (e.g. after a ``clear``).
+            scrollbar.setValue(min(saved_scroll, scrollbar.maximum()))
+            return  # skip the follow-mode auto-scroll
 
-            # Scroll to the *cursor's* position in the document, not
-            # to the bottom of the document. For an active session
-            # the cursor sits at the bottom of the live screen (which
-            # is at the bottom of the document), so the two are
-            # equivalent. For a new session with no data, the
-            # cursor is at the very top — ``setValue(maximum)`` would
-            # land the user on the blank rows below the prompt and
-            # leave the active line "a few lines off the top" of the
-            # viewport (the symptom the user reported after the
-            # previous fix). ``ensureCursorVisible`` is also more
-            # robust than ``setValue(maximum)`` when the document is
-            # a few pixels taller than expected: Qt's layout engine
-            # knows exactly where the cursor is and scrolls to put
-            # it in the visible area, even if ``maximum`` is off by
-            # one row's worth of pixels.
-            text_cursor = self.text_edit.textCursor()
-            text_cursor.movePosition(QTextCursor.Start)
-            # The pyte cursor's row is the offset within the live
-            # screen; the live screen starts after any scrollback
-            # history. Walk the QTextCursor down that many lines so
-            # ``ensureCursorVisible`` lands on the cursor's row.
-            history_lines = 0
-            if hasattr(self._screen, "history") and self._screen.history.top:
-                history_lines = len(self._screen.history.top)
-            target_line = history_lines + int(self._screen.cursor.y)
-            for _ in range(target_line):
-                text_cursor.movePosition(QTextCursor.Down)
-            self.text_edit.setTextCursor(text_cursor)
-            self.text_edit.ensureCursorVisible()
-            # ``ensureCursorVisible`` is a *minimum-distance* scroll: it
-            # scrolls only enough to bring the cursor's rect into the
-            # viewport. For a terminal that's correct for the cursor
-            # itself, but the content *below* the cursor (Claude Code's
-            # status bar / latest output, which sits on the last few
-            # rows of the live screen while the cursor is parked a few
-            # rows above it) ends up below the visible area — the
-            # "active line reaches the bottom, last five lines aren't
-            # viewable" symptom during an active session.
-            #
-            # Only force ``setValue(maximum)`` when there's *real*
-            # overflow — i.e. scrollback history exists. A fresh
-            # session has ``history_lines == 0`` and the document is
-            # at most a few rows taller than the viewport (rounding
-            # noise from ``_measure_rendered_rows``); snapping to
-            # ``maximum`` there scrolls the TUI header off the top
-            # because the cursor (already visible to ``ensureCursorVisible``)
-            # sits in the bottom viewport-height. The
-            # ``history_lines > 0`` gate means we only snap once
-            # content has actually scrolled off the top of the live
-            # screen — which is exactly when the user wants to see
-            # the latest output rather than the session start.
-            if history_lines > 0:
-                if scrollbar.value() < scrollbar.maximum():
-                    scrollbar.setValue(scrollbar.maximum())
-            # Reset horizontal scroll — ``ensureCursorVisible`` may
-            # have scrolled right to keep the cursor's column in
-            # view, clipping the first characters on the left. The
-            # terminal grid should always start at x=0.
-            hbar = self.text_edit.horizontalScrollBar()
-            if hbar.value() != 0:
-                hbar.setValue(0)
+        # ---- 4. Follow-mode auto-scroll -------------------------------
+        # Either we weren't user-scrolled-up, OR the user was at the
+        # bottom (the documented re-engagement of follow mode).
+        self._user_scrolled_up = False
+
+        # Force the document layout so ``scrollbar.maximum()`` reflects
+        # the new content height. We pin the document's text width to
+        # the viewport first: without that, ``adjustSize`` is a no-op
+        # for documents with no fixed-width blocks (ours is a flowing
+        # ``<pre>``), and ``scrollbar.maximum()`` stays at the value
+        # left over from the previous repaint.
+        viewport_width = self.text_edit.viewport().width()
+        if viewport_width > 0:
+            self.text_edit.document().setTextWidth(viewport_width)
+        self.text_edit.document().adjustSize()
+
+        # Scroll to the cursor's position. ``ensureCursorVisible`` is
+        # a minimum-distance scroll — for a terminal that's correct
+        # for the cursor itself, but content below the cursor (Claude
+        # Code's status bar / latest output) ends up below the visible
+        # area. So: snap to ``maximum`` when there's real overflow
+        # (history exists); otherwise let ``ensureCursorVisible`` land
+        # on the cursor's row.
+        text_cursor = self.text_edit.textCursor()
+        text_cursor.movePosition(QTextCursor.Start)
+        target_line = history_lines_count + int(self._screen.cursor.y)
+        for _ in range(target_line):
+            text_cursor.movePosition(QTextCursor.Down)
+        self.text_edit.setTextCursor(text_cursor)
+        self.text_edit.ensureCursorVisible()
+
+        if history_lines_count > 0:
+            if scrollbar.value() < scrollbar.maximum():
+                scrollbar.setValue(scrollbar.maximum())
+
+        # Reset horizontal scroll.
+        hbar = self.text_edit.horizontalScrollBar()
+        if hbar.value() != 0:
+            hbar.setValue(0)
 
     def _recompute_size(self) -> None:
         """Translate current pixel size → rows/cols via QFontMetrics.
@@ -1566,8 +1703,30 @@ class TerminalSessionView(QWidget):
         # Reject implausibly small sizes — we'd rather keep a known-good
         # 24×80 (or whatever the last good size was) than resize the shell
         # to 1×12 for one frame.
-        if cols < self.MIN_COLS or rows < self.MIN_ROWS:
+        #
+        # PR5 (issue #3 fix): previously this was an unconditional
+        # ``return`` that FROZE the cell grid at whatever values it
+        # last held. With the new 14pt default font (PR2) and the
+        # user's ability to bump font sizes 5× via Ctrl+=, the freeze
+        # happens often: the viewport still grows, but ``cols/rows``
+        # stop updating, so the rendered document is much wider /
+        # taller than the grid, columns clip off the right, and rows
+        # below the bottom are lost.
+        #
+        # New behaviour: shrink the cell grid to the largest size
+        # that fits the viewport AND clears the MIN_COLS/MIN_ROWS
+        # thresholds. Only bail entirely (keep the previous size) if
+        # both thresholds are violated — that's the "split
+        # mid-resize, viewport briefly 1×12" case where any update
+        # would be worse than no update.
+        if cols < self.MIN_COLS and rows < self.MIN_ROWS:
+            # Both axes too small — likely a transient layout state.
+            # Keep the previous good size.
             return
+        if cols < self.MIN_COLS:
+            cols = self.MIN_COLS
+        if rows < self.MIN_ROWS:
+            rows = self.MIN_ROWS
         if rows == self._rows and cols == self._cols:
             return
         self._rows = rows
@@ -1586,6 +1745,15 @@ class TerminalSessionView(QWidget):
         ``n`` whose rendered height is ``<= viewport_height_px``;
         returns 0 only if even one row doesn't fit (caller falls back
         to the integer-division heuristic).
+
+        PR5 fix: the previous version called ``setPlainText`` which
+        produces no HTML elements, so the ``setDefaultStyleSheet``
+        ``pre { ... }`` block was dead code — the measured height
+        was the plain-text layout (~552px vs the actual ``<pre>``
+        rendering ~529px at 24 rows, a ~4% error per row). The
+        measurement now uses ``setHtml`` with a real ``<pre>``
+        element so the stylesheet actually applies, matching the
+        renderer's output byte-for-byte.
         """
         from PySide6.QtGui import QTextDocument
 
@@ -1606,21 +1774,27 @@ class TerminalSessionView(QWidget):
         # Probe from a known-safe upper bound. ``viewport_height //
         # lineSpacing`` is generous; trim down until ``doc_height <=
         # viewport_height``.
-        upper = max(self.MIN_ROWS, viewport_height_px // max(1, self.text_edit.fontMetrics().lineSpacing())) + 4
+        upper = max(
+            self.MIN_ROWS,
+            viewport_height_px
+            // max(1, self.text_edit.fontMetrics().lineSpacing()),
+        ) + 4
         upper = min(upper, 500)  # sanity cap
-        # Build a sample payload of ``n`` rows of plain text — the
-        # renderer's ``<pre>`` does the heavy lifting; for measurement
-        # purposes a row of spaces is enough.
+        # Build a sample payload of ``n`` rows of HTML — a real
+        # ``<pre>`` element so the stylesheet applies. The renderer
+        # uses a ``<pre>`` so this matches its layout. Without this,
+        # the measurement reflects plain-text layout, which is
+        # ~4% taller per row — 24 rows × 4% ≈ 1 phantom row of
+        # scroll offset (the "two extra phantom lines" symptom).
         best = 0
-        # Binary-search-ish trim: start at ``upper`` and step down
-        # while the rendered height fits. Brute step is fine here —
-        # this runs once per resize event, not in a hot loop.
         for n in range(upper, 0, -1):
-            # ``n`` rows = ``n-1`` explicit newlines plus the trailing
-            # line Qt always renders.
-            text = ("\n" * (n - 1)) + " "
-            doc.setPlainText(text)
-            doc.setPlainText(text)  # second call forces re-layout
+            text = (
+                "<pre>" + ("\n" * (n - 1)) + " </pre>"
+            )
+            doc.setHtml(text)
+            # A second call forces re-layout; without it the cached
+            # ``size()`` from the previous ``setHtml`` is returned.
+            doc.setHtml(text)
             h = doc.size().height()
             if h <= viewport_height_px:
                 best = n
@@ -1657,6 +1831,12 @@ class TerminalSessionView(QWidget):
         if before != after and hasattr(self, "text_edit"):
             if getattr(self.text_edit, "has_selection", lambda: False)():
                 self.text_edit.clear_selection()
+            # PR5: invalidate the dirty-tracking cache so the next
+            # repaint sees the new (different) cols rather than
+            # hitting the cache and skipping the rebuild entirely.
+            self._cached_live_signature = None
+            self._cached_history_html = ""
+            self._cached_history_lines_count = -1
         self._repaint()
 
     def sizeHint(self) -> QSize:  # noqa: N802

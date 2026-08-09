@@ -884,7 +884,11 @@ def test_measure_rendered_rows_matches_actual_layout() -> None:
         n = view._measure_rendered_rows(vp_h)
         assert n >= 1, f"no rows at all fit in {vp_h} px"
         # Render ``n`` rows in a fresh document and confirm the
-        # rendered height fits in the viewport.
+        # rendered height fits in the viewport. Use ``setHtml`` with
+        # a real ``<pre>`` element so the stylesheet applies — the
+        # same fix as PR5 (PR5 fix in ``_measure_rendered_rows``
+        # switched from ``setPlainText`` to ``setHtml(<pre>...)`` so
+        # the measurement matches the renderer's actual layout).
         doc = QTextDocument()
         doc.setDocumentMargin(0)
         doc.setDefaultStyleSheet(
@@ -892,8 +896,9 @@ def test_measure_rendered_rows_matches_actual_layout() -> None:
             "font-family:Menlo,Consolas,monospace}"
         )
         doc.setDefaultFont(edit.font())
-        text = "\n" * (n - 1) + " "
-        doc.setPlainText(text)
+        text = "<pre>" + "\n" * (n - 1) + " </pre>"
+        doc.setHtml(text)
+        doc.setHtml(text)  # force re-layout
         rendered_h = doc.size().height()
         assert rendered_h <= vp_h, (
             f"_measure_rendered_rows({vp_h}) returned {n}, "
@@ -902,8 +907,9 @@ def test_measure_rendered_rows_matches_actual_layout() -> None:
         )
         # And ``n+1`` rows must NOT fit, otherwise we're
         # under-reporting.
-        text_extra = "\n" * n + " "
-        doc.setPlainText(text_extra)
+        text_extra = "<pre>" + "\n" * n + " </pre>"
+        doc.setHtml(text_extra)
+        doc.setHtml(text_extra)  # force re-layout
         if doc.size().height() <= vp_h:
             # Edge case: at very small viewport sizes the "+1" row
             # may still fit if rounding cooperates. Acceptable —
@@ -950,7 +956,14 @@ def test_recompute_size_does_not_overflow_viewport() -> None:
         "font-family:Menlo,Consolas,monospace}"
     )
     doc.setDefaultFont(view.text_edit.font())
-    doc.setPlainText("\n" * (rows - 1) + " ")
+    # Same fix as ``test_measure_rendered_rows_matches_actual_layout``:
+    # ``setHtml(<pre>...)`` so the stylesheet actually applies —
+    # ``setPlainText`` produces no HTML elements so the
+    # ``pre{margin:0;...}`` rule was dead code, making the measurement
+    # ~4% taller per row than the actual ``<pre>`` render.
+    text = "<pre>" + "\n" * (rows - 1) + " </pre>"
+    doc.setHtml(text)
+    doc.setHtml(text)  # force re-layout
     rendered_h = doc.size().height()
     assert rendered_h <= vp_h + 1, (
         f"view._rows={rows} but rendering that many rows takes "
