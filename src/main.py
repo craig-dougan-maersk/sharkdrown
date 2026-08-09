@@ -47,19 +47,34 @@ def main() -> None:
     # Restore persisted UI font preferences.
     from PySide6.QtCore import QSettings
     settings = QSettings("SharkDrown", "App")
-    if not settings.contains("app_font_base_size"):
-        settings.setValue("app_font_base_size", app.font().pointSize())
+    # Default font size bumped from system-derived (typically 10-12pt) to
+    # 14 in the multi-bug-fix milestone (issue #2). The user explicitly
+    # chose to force-override existing users too — any persisted base
+    # size < 14 is rewritten to 14 so first-launch AND upgrade users
+    # land at the new default. Users who have explicitly set a size ≥ 14
+    # are left alone; the migration only catches the previous default.
+    DEFAULT_BASE_FONT_SIZE = 14
+    saved_base = settings.value("app_font_base_size", None, type=int)
+    if saved_base is None or saved_base < DEFAULT_BASE_FONT_SIZE:
+        settings.setValue("app_font_base_size", DEFAULT_BASE_FONT_SIZE)
     font = app.font()
     # Restore font family
     saved_family = settings.value("ui_font_family", "System Default")
     if saved_family != "System Default":
         font.setFamily(saved_family)
-    # Restore font size delta
+    # Resolve the effective point size: persisted base + user delta,
+    # clamped to the same [8, 32] range the rest of the UI uses. Done
+    # unconditionally so users with no family change AND no delta still
+    # land at the new default base size when their persisted value was
+    # bumped above.
     font_delta = settings.value("app_font_delta", 0, type=int)
-    if font_delta:
-        base = settings.value("app_font_base_size", font.pointSize(), type=int)
-        font.setPointSize(max(8, min(24, base + font_delta)))
-    if saved_family != "System Default" or font_delta:
+    base = settings.value("app_font_base_size", font.pointSize(), type=int)
+    font.setPointSize(max(8, min(32, base + font_delta)))
+    if (
+        saved_family != "System Default"
+        or font_delta
+        or font.pointSize() != app.font().pointSize()
+    ):
         app.setFont(font)
 
     # Create and show the main window

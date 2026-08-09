@@ -965,6 +965,13 @@ class TerminalSessionView(QWidget):
     # which is usually 10-13pt — comfortably inside the clamp.
     MIN_FONT_POINT_SIZE = 8
     MAX_FONT_POINT_SIZE = 32
+    # Default bumped from 10 → 14 in the multi-bug-fix milestone (issue
+    # #2). Used by both the missing-settings fallback in ``_build_ui``
+    # (when ``terminal/font_size`` is absent from QSettings) and by
+    # ``apply_font_settings`` (when the user picks "use default"). The
+    # 14pt value matches the editor default and the user's requested
+    # "Default font size for UI and for content should be 14".
+    DEFAULT_FONT_POINT_SIZE = 14
 
     def __init__(
         self,
@@ -1278,7 +1285,7 @@ class TerminalSessionView(QWidget):
             new_font = QFont(font_family)
         else:
             new_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
-        size = font_size if font_size > 0 else max(self._base_font.pointSize(), 10)
+        size = font_size if font_size > 0 else self.DEFAULT_FONT_POINT_SIZE
         size = max(self.MIN_FONT_POINT_SIZE, min(self.MAX_FONT_POINT_SIZE, size))
         new_font.setPointSize(size)
         self._base_font = new_font
@@ -1317,7 +1324,7 @@ class TerminalSessionView(QWidget):
             self._base_font = QFont(ts["font_family"])
         else:
             self._base_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
-        size = ts["font_size"] if ts["font_size"] > 0 else max(self._base_font.pointSize(), 10)
+        size = ts["font_size"] if ts["font_size"] > 0 else self.DEFAULT_FONT_POINT_SIZE
         self._base_font.setPointSize(size)
         self.text_edit.setFont(self._base_font)
         # Disable the horizontal scrollbar — the screen is fixed-width

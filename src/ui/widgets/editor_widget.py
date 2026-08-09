@@ -572,7 +572,13 @@ class EditorWidget(QWidget):
 
     MIN_FONT_POINT_SIZE = 8
     MAX_FONT_POINT_SIZE = 32
-    DEFAULT_FONT_POINT_SIZE = 12
+    # Default bumped from 12 → 14 in the multi-bug-fix milestone (issue
+    # #2). The user's original complaint: "Default font size for UI and
+    # for content should be 14". ``reset_font_size`` uses this constant
+    # for Ctrl+0, so first-time users who never adjust their font end
+    # up at 14pt after a reset; existing users who deliberately picked
+    # a different size are unaffected until they hit Ctrl+0.
+    DEFAULT_FONT_POINT_SIZE = 14
 
     def adjust_font_size(self, delta: int) -> None:
         """Increase or decrease the editor font size by delta points."""
