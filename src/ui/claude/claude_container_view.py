@@ -557,6 +557,15 @@ class ClaudeContainerView(QWidget):
             proxy_base_url=self._get_proxy_base_url(),
             config_dir=str(config_dir_path),
             api_key=api_key,
+            # ``data_dir`` threads the deployed ``defaults.env`` file
+            # through the env-builder's global-env layer (PR4). Without
+            # this, ``CLAUDE_CODE_NO_FLICKER`` and
+            # ``CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`` (and any
+            # other vars the user adds via ``Claude > Settings > Env
+            # Vars``) silently fail to reach the container — the
+            # ``build_claude_session_env(..., data_dir=None)`` legacy
+            # behaviour skips the global layer entirely.
+            data_dir=data_dir(),
             # ``container_aware`` follows the *user's preference* —
             # the URL/CLAUDE_CONFIG_DIR rewrites happen even when
             # Docker turns out to be unavailable at runtime (the
