@@ -87,12 +87,18 @@ def key_to_bytes(
     ctrl_held = bool(mod_mask & int(Qt.ControlModifier.value))
     alt_held = bool(mod_mask & int(Qt.AltModifier.value))
     meta_held = bool(mod_mask & int(Qt.MetaModifier.value))
+    shift_held = bool(mod_mask & int(Qt.ShiftModifier.value))
 
     # Plain printable text always wins for unmodified key presses (lets
     # `text` (which honours keyboard layout) drive the output rather than
     # ``key`` (which doesn't know about layout-specific characters)).
     if text and not (ctrl_held or alt_held or meta_held):
         if key in (Qt.Key_Tab, Qt.Key_Backtab):
+            # Shift+Tab (whether reported as ``Key_Tab`` or
+            # ``Key_Backtab``) is xterm's CSI Z — the Claude Code TUI
+            # uses it to cycle permission modes. Plain Tab → TAB.
+            if shift_held:
+                return b"\x1b[Z"
             return b"\t"
         return text.encode("utf-8")
 
@@ -101,7 +107,18 @@ def key_to_bytes(
         return b"\r"
     if key == Qt.Key_Backspace:
         return b"\x7f"
+    if key == Qt.Key_Backtab:
+        # Shift+Backtab (no printable text) — same as Shift+Tab above.
+        if shift_held:
+            return b"\x1b[Z"
+        return b"\t"
     if key == Qt.Key_Tab:
+        # Shift+Tab reported as ``Key_Tab`` (some keyboard layouts /
+        # event sources don't differentiate). Honor the modifier so
+        # the test suite's ``Key_Tab + ShiftModifier + text="\t"``
+        # case produces CSI Z, not a plain TAB.
+        if shift_held:
+            return b"\x1b[Z"
         return b"\t"
     if key == Qt.Key_Escape:
         return b"\x1b"
@@ -212,6 +229,21 @@ class TerminalTextEdit(QTextEdit):
         # intercepts BEFORE Qt's default handling so this doesn't block
         # the keys we care about.
         self.setReadOnly(True)
+        # ``setTabChangesFocus(True)`` (the default) is the root cause of
+        # "tab completion does nothing in claude-code sessions". Qt's
+        # ``QWidget::event()`` route for ``QEvent::KeyPress`` checks
+        # ``(isReadOnly() && tabChangesFocus())`` and short-circuits
+        # Tab/Backtab to ``focusNextPrevChild()`` BEFORE
+        # ``keyPressEvent`` ever runs — so our ``Qt.Key_Tab`` branch in
+        # ``key_to_bytes`` never sees the key. ``tabChangesFocus=False``
+        # disables that short-circuit; the key then reaches our
+        # ``keyPressEvent`` override and is forwarded to the PTY as
+        # ``b"\t"``, which the shell sees as a request for completion.
+        # Without this, Claude Code's completion suggestions appear
+        # (the shell still sends them when it receives a Tab-equivalent
+        # via some other path) but pressing Tab in the input line does
+        # nothing.
+        self.setTabChangesFocus(False)
         # Allow the widget to receive keyboard focus and to take part in
         # tab focus chains. We previously set ``Qt.NoTextInteraction``
         # here, but that flag also makes QTextEdit refuse focus on click,
@@ -716,13 +748,26 @@ class TerminalTextEdit(QTextEdit):
         # widget size here would under-estimate the number of cells
         # that fit and make clicks land a few rows higher than they
         # should. The viewport size matches exactly what's visible.
+        #
+        # Scrollbar offset: ``pos.y()`` is in viewport-local pixels,
+        # which is a *window into the document*, not the document
+        # itself. When the user scrolls up into scrollback the
+        # viewport is showing rows ``[scroll_value/ch, scroll_value/ch +
+        # h)``; without adding the scrollbar value the click always
+        # resolves to the bottom ``h`` rows (the live screen), and
+        # the selection's "start of selection" is anchored to the
+        # latest line regardless of where the user actually clicked.
+        # We add the scrollbar value before dividing so a click at
+        # viewport-top with the scrollbar at value ``V`` maps to row
+        # ``V / ch`` instead of row 0.
         vp = self.viewport()
         vp_w = max(1, vp.width())
         vp_h = max(1, vp.height())
         cw = vp_w / w
         ch = vp_h / h
+        scroll_y = self.verticalScrollBar().value()
         x = int(pos.x() // cw)
-        y = int(pos.y() // ch)
+        y = int((pos.y() + scroll_y) // ch)
         x = max(0, min(w - 1, x))
         y = max(0, min(h - 1, y))
         return (x, y)
