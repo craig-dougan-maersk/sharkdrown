@@ -177,30 +177,50 @@ async def list_models(
     """Return the proxy's view of its routing config as a model catalog.
 
     Claude Code's ``/model`` picker reads this endpoint and shows each
-    ``id`` as a selectable entry; the picker ALSO surfaces a
-    ``description`` (when present) in the menu row so the user can
-    see what they're actually picking. The picker ignores everything
-    else (Anthropic-shaped envelope is the convention but the picker
-    reads selectively).
+    ``id`` as a selectable entry. Per the official Gateway protocol
+    reference (https://code.claude.com/docs/en/llm-gateway-protocol),
+    the picker reads exactly two fields:
 
-    The response shape follows that convention:
+    - ``id`` (required) — the value Claude Code will pass as
+      ``model=...`` on subsequent ``/v1/messages`` calls.
+    - ``display_name`` (optional) — the menu-row label.
 
-    - ``id`` is the **alias** the user types in — e.g. ``"minimax"``.
-      This is what Claude Code passes as ``model=...`` in subsequent
-      ``/v1/messages`` calls; the proxy's alias-rewrite layer then
-      maps it to the canonical real name (``MiniMax-M3``) before
-      forwarding. Putting the alias in ``id`` is what makes the
-      picker menu match the user's ``/model minimax`` workflow.
-    - ``description`` is ``"<real-model> - <endpoint-url>"`` so the
-      picker shows both the canonical model name and the URL the
-      request will land at when this alias is picked. Without this
-      the picker would only show ``minimax`` and the user wouldn't
-      know which upstream that hits.
+    It also applies a strict filter: an entry is kept only when its
+    ``id`` contains ``claude`` or ``anthropic`` (case-insensitive).
+    Entries that fail the filter are silently dropped from the
+    picker, which is why aliases like ``minimax`` never appeared in
+    earlier versions — none of those strings contain the required
+    substring.
+
+    To make those aliases discoverable, ``_proxy_lifecycle.py``
+    augments the alias map at startup: every non-claude / non-anthropic
+    alias gets a synthetic companion entry
+    ``<alias>-non-anthropic -> <real-model>`` (the synthetic id
+    passes the picker filter). The augmentation runs BEFORE this
+    handler is invoked, so the ``alias_map`` we read here already
+    contains both the original alias and its synthetic sibling.
+
+    We therefore walk the map grouped by ``real`` model name and
+    emit one picker entry per (alias, real) pair, distinguishing
+    three cases:
+
+    1. **Claude / anthropic alias** (``"claude" in alias.lower()``
+       or ``"anthropic" in alias.lower()``): emit
+       ``{"id": alias}`` — no display_name. The id is already a
+       user-readable label and passes the filter on its own.
+    2. **Non-claude alias** whose name DOES NOT end with the
+       synthetic ``-non-anthropic`` suffix: skip. The augmentation
+       produced a companion entry that we'll emit in case 3; we
+       never double-list by emitting the bare form too.
+    3. **Synthetic ``<alias>-non-anthropic`` entry**: emit
+       ``{"id": synthetic, "display_name": <alias>}`` so the
+       picker shows the user's typed-in label while routing uses
+       the synthetic id.
 
     Endpoints with **no alias** are emitted with the real model name
     as ``id`` (the user can still pick them by typing the real name)
-    but with no ``description`` enrichment — the alias map is
-    authoritative for the user-facing labels.
+    but with no ``display_name`` — the alias map is authoritative
+    for the user-facing labels and an un-aliased endpoint has none.
 
     Query flags:
       ``?debug=1&token=<debug_token>`` → include the ``__proxy__``
@@ -210,53 +230,83 @@ async def list_models(
     endpoints_cfg = settings.model_endpoints
     alias_map = endpoints_cfg.model_aliases or {}
     endpoints_map = endpoints_cfg.endpoints or {}
-    providers_map = endpoints_cfg.providers or {}
 
-    def _endpoint_url(real_name: str) -> str:
-        """Resolve the upstream URL for a real model name.
+    _SYNTHETIC_SUFFIX = "-non-anthropic"
 
-        Walks ``endpoints[real_name] → providers[provider_name].url``.
-        Falls back to an empty string when the provider isn't in the
-        registry — the same silent-drop policy as
-        ``_proxy_lifecycle.py:116-119``. The description will just
-        lack the URL portion in that case; the picker still works.
-        """
-        provider_name = endpoints_map.get(real_name, "")
-        if not provider_name:
-            return ""
-        provider = providers_map.get(provider_name)
-        if provider is None:
-            return ""
-        return str(provider.url or "")
+    def _is_synthetic(alias: str) -> bool:
+        """True when ``alias`` ends with the synthetic-id suffix AND
+        the bare name (without suffix) is also present in the alias
+        map. Without the bare name present, ``foo-non-anthropic``
+        is just a user-defined alias and should be treated as one
+        (no special handling)."""
+        if not alias.endswith(_SYNTHETIC_SUFFIX):
+            return False
+        bare = alias[: -len(_SYNTHETIC_SUFFIX)]
+        return bare in alias_map
 
-    models: list[dict] = []
-    # ``seen_real`` tracks which real model names already have an
-    # alias-driven entry; ``seen_ids`` tracks which ``id`` values
-    # have been emitted (aliases are unique by construction, but
-    # endpoint keys may collide with aliases for un-aliased
-    # endpoints — we prefer the alias view).
-    seen_real: set[str] = set()
-    seen_ids: set[str] = set()
-    for alias, real in sorted(alias_map.items()):
+    def _alias_is_claude_or_anthropic(alias: str) -> bool:
+        """Match Claude Code's own filter: case-insensitive substring
+        check for ``claude`` OR ``anthropic``."""
+        lowered = alias.lower()
+        return "claude" in lowered or "anthropic" in lowered
+
+    # Group aliases by ``real`` model name so we can decide whether
+    # the synthetic-id entry is the canonical emit for each
+    # non-claude alias. ``real -> list[alias]`` is the pivot.
+    aliases_by_real: dict[str, list[str]] = {}
+    for alias, real in alias_map.items():
         if not isinstance(alias, str) or not isinstance(real, str):
             continue
-        if alias in seen_ids:
-            # Duplicate alias — last-write-wins; skip to avoid
-            # double-listing in the picker.
-            continue
-        endpoint_url = _endpoint_url(real)
-        entry: dict = {"id": alias}
-        if endpoint_url:
-            entry["description"] = f"{real} - {endpoint_url}"
-        else:
-            # No URL available — still useful to surface the
-            # mapping; description without URL is just the real name.
-            entry["description"] = real
-        models.append(entry)
+        aliases_by_real.setdefault(real, []).append(alias)
+
+    models: list[dict] = []
+    seen_real: set[str] = set()
+    seen_ids: set[str] = set()
+
+    for real in sorted(aliases_by_real):
+        aliases = sorted(set(aliases_by_real[real]))
+        # Per-alias emission rules (in priority order):
+        for alias in aliases:
+            if _is_synthetic(alias):
+                # Synthetic ``<bare>-non-anthropic`` → emit with
+                # ``display_name = <bare>``. The bare alias itself
+                # is skipped via the loop's elif below so we never
+                # double-list.
+                bare = alias[: -len(_SYNTHETIC_SUFFIX)]
+                if bare in seen_ids:
+                    # Bare alias already emitted under a different
+                    # loop iteration order — keep the synthetic
+                    # entry and let the bare one be deduplicated.
+                    pass
+                models.append({"id": alias, "display_name": bare})
+                seen_ids.add(alias)
+                continue
+            if _alias_is_claude_or_anthropic(alias):
+                # Claude / anthropic alias — id alone is sufficient.
+                if alias not in seen_ids:
+                    models.append({"id": alias})
+                    seen_ids.add(alias)
+                continue
+            # Non-claude alias without the synthetic suffix — emit
+            # ONLY if no companion synthetic entry was produced by
+            # the augmentation. (When augmentation succeeded, the
+            # synthetic entry is in the map and will be emitted
+            # in the ``_is_synthetic`` branch above.)
+            synthetic_companion = f"{alias}{_SYNTHETIC_SUFFIX}"
+            if synthetic_companion not in alias_map and alias not in seen_ids:
+                # User defined a non-claude alias without an
+                # augmented companion (or augmentation was skipped
+                # because the companion already exists from a
+                # different alias). Emit the bare alias as ``id``
+                # so the picker at least sees it — Claude Code
+                # will still drop it (filter), but the diagnostic
+                # ``?debug=1`` block will show the mapping.
+                models.append({"id": alias})
+                seen_ids.add(alias)
         seen_real.add(real)
-        seen_ids.add(alias)
+
     # Emit un-aliased endpoints too — pickable by their real model
-    # name. They show up without a description so the picker doesn't
+    # name. They show up without a display_name so the picker doesn't
     # accidentally surface them as user-facing labels.
     for real in sorted(endpoints_map):
         if real in seen_real:

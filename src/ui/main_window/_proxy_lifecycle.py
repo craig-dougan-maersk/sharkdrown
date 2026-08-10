@@ -3,17 +3,81 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
+import yaml
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QMessageBox
 
 from src.proxy.event_bridge import EventBusBridge
-from src.proxy.paths import default_db_path
+from src.proxy.paths import data_dir, default_db_path
 from src.proxy.server_thread import ProxyServerThread
 
 logger = logging.getLogger(__name__)
+
+
+# Suffix appended to non-Claude aliases to give them an ``id`` that
+# passes Claude Code's ``/v1/models`` picker filter
+# (``id`` contains ``claude`` or ``anthropic``, case-insensitive).
+# Public so tests can assert against it without re-deriving the
+# constant from a magic string.
+SYNTHETIC_ALIAS_SUFFIX = "-non-anthropic"
+
+
+def _passes_claude_picker_filter(alias: str) -> bool:
+    """True when ``alias`` would survive Claude Code's picker filter.
+
+    Mirrors the filter documented at
+    https://code.claude.com/docs/en/llm-gateway-protocol:
+
+        Claude Code keeps an entry when its ``id`` contains
+        ``claude`` or ``anthropic`` anywhere in the string, matched
+        case-insensitively.
+
+    Anything that fails this filter is silently dropped from the
+    picker's auto-discovered list. We replicate the same case-fold
+    here so the augmentation only adds synthetic ids for the
+    aliases that actually need them.
+    """
+    lowered = alias.lower()
+    return "claude" in lowered or "anthropic" in lowered
+
+
+def augment_proxy_aliases_for_discovery(
+    proxy_aliases: dict[str, str],
+) -> None:
+    """Augment ``proxy_aliases`` in-place with synthetic ids.
+
+    For each (alias, real) where ``alias`` would FAIL Claude Code's
+    picker filter (no ``claude`` / ``anthropic`` substring), add a
+    companion entry ``<alias>-non-anthropic -> real``. The
+    companion id passes the picker filter; ``/v1/models`` emits it
+    with ``display_name = <alias>`` so the user sees their typed-in
+    label in the menu.
+
+    User-facing state (``profiles.json``, the profile editor UI) is
+    NOT modified — only the proxy's runtime view is widened. The
+    augmentation is purely additive: any user-defined key
+    (``minimax``, ``claude-alias``, ``minimax-non-anthropic`` from
+    a power user) is preserved verbatim.
+
+    Edge cases:
+    - claude / anthropic substring check is case-insensitive.
+    - If the user already defined ``<alias>-non-anthropic`` as a
+      real alias, the augmentation is skipped for that alias
+      (the user's explicit key wins).
+    - ``list(proxy_aliases.items())`` snapshots the dict so the
+      mid-loop mutation doesn't trip ``RuntimeError``.
+    """
+    for alias, real in list(proxy_aliases.items()):
+        if _passes_claude_picker_filter(alias):
+            continue
+        synthetic = f"{alias}{SYNTHETIC_ALIAS_SUFFIX}"
+        if synthetic not in proxy_aliases:
+            proxy_aliases[synthetic] = real
 
 
 class ProxyLifecycleMixin:
@@ -41,6 +105,27 @@ class ProxyLifecycleMixin:
         # defaults when the file is missing.
         global_settings = self._global_settings_store().load()
         host = global_settings.bind_address or "127.0.0.1"
+        # ---- Auto-rebind to 0.0.0.0 for container-mode sessions -------
+        # When the active profile runs Claude Code inside a container,
+        # the container reaches the host proxy via
+        # ``host.docker.internal`` (which resolves to the host's
+        # external interface on Linux, NOT loopback). The proxy must
+        # be listening on a non-loopback interface for that to work —
+        # otherwise the container connects to ``host.docker.internal``
+        # but the kernel rejects the SYN because nothing is bound to
+        # that IP locally, and Claude Code surfaces *"Invalid API
+        # key"* because no request ever reaches us.
+        #
+        # We honour an explicit ``bind_address`` set by the user, but
+        # fall back to ``0.0.0.0`` automatically when container mode
+        # is in use. ``run_in_container`` defaults to True on every
+        # profile (per the container-mode migration plan), so this
+        # rebind happens for most users by default.
+        if (
+            host in ("", "127.0.0.1", "localhost")
+            and getattr(active, "run_in_container", True)
+        ):
+            host = "0.0.0.0"
         port = int(global_settings.port or 3001)
         config_dir_path = (
             Path(global_settings.config_dir)
@@ -98,6 +183,12 @@ class ProxyLifecycleMixin:
                     if isinstance(alias, str) and alias.strip():
                         proxy_aliases[alias.strip()] = str(model)
 
+        # Augment the alias map with synthetic ids for non-Claude
+        # aliases so Claude Code's gateway auto-discovery can surface
+        # them. See ``augment_proxy_aliases_for_discovery`` for the
+        # full rationale and edge-case handling.
+        augment_proxy_aliases_for_discovery(proxy_aliases)
+
         self.proxy_host = host
         # Only commit the port when it's a known value. When port=0
         # (OS-assigned), proxy_port stays 0 until _on_proxy_started
@@ -132,7 +223,32 @@ class ProxyLifecycleMixin:
                 )
 
                 handle = start_proxy_container(
-                    global_settings, bind_port=port or 3001
+                    global_settings,
+                    bind_port=port or 3001,
+                    extra_env={
+                        # Point the container's uvicorn at the
+                        # config.yaml we just wrote — see
+                        # ``_write_proxy_config_yaml`` below. Without
+                        # this the container falls back to an empty
+                        # ``./config.yaml`` and routing resolves to
+                        # the hardcoded default ``anthropic`` provider
+                        # (api.anthropic.com) regardless of what the
+                        # active profile is configured for, which
+                        # silently breaks any non-Anthropic setup
+                        # (MiniMax, OpenRouter, …).
+                        "PROXY_CONFIG_YAML": "/etc/sharkdrown/config.yaml",
+                    },
+                )
+                # Persist the per-profile routing config the local
+                # thread would have passed via constructor kwargs.
+                # The container reads ``PROXY_CONFIG_YAML`` from
+                # env (see :class:`YamlSettingsSource`) and uses it
+                # instead of the CWD-relative default. The file
+                # lands at ``/etc/sharkdrown/config.yaml`` via
+                # the bind-mount that ``start_proxy_container``
+                # already wires.
+                self._write_proxy_config_yaml(
+                    proxy_endpoints, proxy_aliases, proxy_providers
                 )
                 self.proxy_status_label.setText(
                     f"Proxy: container {handle.container_name} starting…"
@@ -248,6 +364,20 @@ class ProxyLifecycleMixin:
             self.activity_tile.set_base_url(f"http://{self.proxy_host}:{port}")
         if self.claude_container is not None:
             self.claude_container.set_base_url(f"http://{self.proxy_host}:{port}")
+        # Auto-show the Dashboard on every successful proxy start.
+        # The dashboard is the most useful first view after the
+        # proxy comes up — it surfaces live request captures and
+        # provider health. The user can still toggle it off via
+        # ``Claude → Show Dashboard`` after that. Must come *after*
+        # ``set_base_url`` so the (lazy-built) ``DashboardView`` has
+        # a URL to point at before we focus its inner tab.
+        if not self.action_show_dashboard.isChecked():
+            self.action_show_dashboard.setChecked(True)
+            # ``setChecked`` only updates the action's internal
+            # state — the ``triggered`` signal doesn't fire on
+            # programmatic changes, so we invoke the slot directly
+            # to update the inner-tab visibility.
+            self._show_dashboard_panel(True)
         self.status.showMessage(
             f"Proxy ready — point Claude Code at http://{self.proxy_host}:{port}",
             5000,
@@ -332,10 +462,140 @@ class ProxyLifecycleMixin:
         QDesktopServices.openUrl(QUrl(url))
 
     def _is_proxy_running(self) -> bool:
-        return self.proxy_thread is not None and self.proxy_thread.isRunning()
+        """True iff the proxy is currently serving requests.
+
+        Two paths can run the proxy:
+
+        - **Local QThread** (``self.proxy_thread is not None and
+          self.proxy_thread.isRunning()``) — used when
+          ``run_proxy_in_container=False``.
+        - **Container** (``sharkdrown-proxy`` container is up) —
+          used when ``run_proxy_in_container=True``. In this
+          mode there's no ``proxy_thread``; the proxy lives in
+          its own podman container and the GUI talks to it via
+          the published port.
+
+        Without the container check, the proxy-gate in
+        ``ClaudeContainerView.new_session`` would *always* think
+        the proxy is down when ``run_proxy_in_container=True``,
+        which would (a) make ``_proxy_base_url()`` return ""
+        even when the proxy IS up, and (b) queue the launch and
+        ask the main window to start a proxy that's already
+        running. Result: ``ANTHROPIC_BASE_URL`` is empty in the
+        spawned Claude container, Claude Code can't reach the
+        proxy, surfaces *"Invalid API key"*.
+        """
+        if self.proxy_thread is not None and self.proxy_thread.isRunning():
+            return True
+        # Container-mode proxy: ask podman whether the named
+        # container is up. Cheaper than an HTTP probe; only
+        # consulted on the proxy-gate / URL-builder paths, not
+        # in tight loops.
+        try:
+            from src.ui.claude.docker_proxy import is_proxy_container_running
+            from src.profiles.global_settings import GlobalSettings
+
+            settings = GlobalSettings(
+                container_runtime=self._proxy_container_runtime()
+            )
+            return is_proxy_container_running(settings, "sharkdrown-proxy")
+        except (ImportError, FileNotFoundError, OSError):
+            return False
+
+    def _write_proxy_config_yaml(
+        self,
+        proxy_endpoints: dict[str, str],
+        proxy_aliases: dict[str, str],
+        proxy_providers: dict[str, dict],
+    ) -> None:
+        """Persist the per-profile proxy routing config to ``config.yaml``.
+
+        Called from the ``run_proxy_in_container`` branch of
+        :meth:`_start_server` before the container is spawned.
+        Without this, the container-mode proxy has no aliases,
+        endpoints, or providers — every request lands on the
+        hardcoded default ``anthropic`` provider (api.anthropic.com)
+        and Claude Code surfaces *"Invalid API key"* or
+        *"model not found"* for any non-Anthropic setup.
+
+        The local-thread path passes this data via the
+        ``ProxyServerThread`` constructor; the container path has
+        no such hook, so we materialise it to a YAML file the
+        container reads via the ``PROXY_CONFIG_YAML`` env var
+        (see :class:`YamlSettingsSource`).
+
+        Atomic-write semantics: write to a sibling temp file and
+        ``os.replace`` into place. ``chmod 600`` — the file
+        contains plaintext API keys resolved from
+        :class:`CredentialStore`, so it must not be world-readable.
+        """
+        config_payload = {
+            "model_endpoints": {
+                "endpoints": dict(proxy_endpoints),
+                "model_aliases": dict(proxy_aliases),
+                "providers": dict(proxy_providers),
+            }
+        }
+        yaml_bytes = yaml.safe_dump(
+            config_payload,
+            sort_keys=False,
+            default_flow_style=False,
+        ).encode("utf-8")
+        config_path = data_dir() / "config.yaml"
+
+        # Atomic-write: temp file in the same directory, chmod
+        # 600 *before* close (avoids the chmod-race window
+        # documented in ``ProfileStore``), then ``os.replace``
+        # so readers never see a half-written file.
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(config_path.parent),
+            prefix=".config.yaml.",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "wb", closefd=True) as fh:
+                fh.write(yaml_bytes)
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, config_path)
+        except OSError:
+            # Best-effort cleanup on failure — don't leave temp
+            # files lying around. The caller (a user-visible start
+            # operation) will surface the actual container-spawn
+            # failure with a clearer message.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def _proxy_container_runtime(self) -> str:
+        """Resolve ``container_runtime`` from global settings.
+
+        Falls back to ``"podman"`` (the default in
+        :class:`GlobalSettings`) when the settings store can't be
+        read. Kept separate from ``_is_proxy_running`` so the
+        runtime resolution is one-line-callable from elsewhere.
+        """
+        try:
+            return str(
+                self._global_settings_store().load().container_runtime or "podman"
+            )
+        except (OSError, ValueError):
+            return "podman"
 
     def _proxy_base_url(self) -> str:
-        """URL Claude Code sessions should use. Empty if proxy isn't up."""
+        """URL Claude Code sessions should use. Empty if proxy isn't up.
+
+        When ``run_proxy_in_container=True``, the proxy runs in
+        its own podman container and the URL is always
+        ``http://127.0.0.1:<port>`` — the published port on the
+        host loopback, which is how Claude Code sessions (running
+        on the host or in their own containers) reach it.
+        ``host.docker.internal`` rewriting for in-container
+        Claude sessions happens later in
+        :func:`env_builder.build_claude_session_env` when
+        ``container_aware=True``.
+        """
         if not self._is_proxy_running() or self.proxy_port == 0:
             return ""
         return f"http://{self.proxy_host}:{self.proxy_port}"

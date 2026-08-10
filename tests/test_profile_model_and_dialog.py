@@ -3516,20 +3516,26 @@ def test_router_consults_model_endpoints_map() -> None:
 
 
 def test_proxy_models_endpoint_surfaces_alias_map() -> None:
-    """``GET /v1/models`` lists each alias as a selectable ``id`` with a
-    ``description`` of ``<real-model> - <endpoint-url>``, so Claude
-    Code's ``/model`` picker shows the user-facing label and the
-    canonical model + URL behind it. ``?debug=1`` adds a ``__proxy__``
-    block with the full routing config.
+    """``GET /v1/models`` emits entries that Claude Code's picker can
+    actually use. Contract per the official Gateway protocol ref
+    (https://code.claude.com/docs/en/llm-gateway-protocol):
 
-    Used to verify Claude Code is reaching the proxy (and to debug
-    why a request might bypass it).
+    - Claude aliases (``claude`` or ``anthropic`` substring in
+      ``id``) emit ``{"id": alias}`` — the picker filter passes
+      on the id alone; no ``display_name`` needed.
+    - Non-Claude aliases emit ``{"id": "<alias>-non-anthropic",
+      "display_name": "<alias>"}`` — the synthetic id passes the
+      picker filter; the display_name shows the user-facing label.
 
-    Contract change (post-multi-bug-fix-milestone): the response
-    shape was inverted from ``{id: real-name, aliases: [...]}`` to
-    ``{id: alias, description: "<real> - <url>"}``. The picker UX
-    needs the alias (what the user types) in ``id`` and the
-    canonical name + URL in a human-readable ``description``.
+    The synthetic-id augmentation happens in ``_proxy_lifecycle.py``
+    at proxy startup. The map this test exercises simulates the
+    post-augmentation state — the bare alias AND its synthetic
+    sibling both point at the same real model. This is the
+    production data path.
+
+    ``?debug=1&token=<token>`` adds a ``__proxy__`` block with the
+    full routing config (useful for diagnosing misconfigured
+    sessions via curl).
     """
     from fastapi import Request
     from ccproxy.app.config import (
@@ -3550,9 +3556,15 @@ def test_proxy_models_endpoint_surfaces_alias_map() -> None:
                 ),
             },
             endpoints={"MiniMax-M3": "MiniMax"},
+            # Simulate the post-_proxy_lifecycle state: bare aliases
+            # AND their synthetic companions both present, plus a
+            # claude alias that doesn't need augmentation.
             model_aliases={
                 "freestuff": "MiniMax-M3",
+                "freestuff-non-anthropic": "MiniMax-M3",
                 "mm-m3": "MiniMax-M3",
+                "mm-m3-non-anthropic": "MiniMax-M3",
+                "claude-mm-m3": "MiniMax-M3",
             },
         ),
     )
@@ -3577,45 +3589,48 @@ def test_proxy_models_endpoint_surfaces_alias_map() -> None:
             self.app.state.debug_token = debug_token
 
     import asyncio
-    # Standard picker-friendly response: each alias is its own entry
-    # with a ``description`` showing the canonical model + URL.
-    body = asyncio.run(list_models(_FakeReq({}), settings=cfg)).body.decode()
     import json as _json
 
+    body = asyncio.run(list_models(_FakeReq({}), settings=cfg)).body.decode()
     parsed = _json.loads(body)
     assert parsed["object"] == "list"
     by_id = {m["id"]: m for m in parsed["data"]}
-    # Each alias is its own ``id`` (the picker selection target).
-    assert "freestuff" in by_id, by_id
-    assert "mm-m3" in by_id, by_id
-    # Each alias entry has a description of the form
-    # ``<real-model> - <endpoint-url>``.
-    for alias_id in ("freestuff", "mm-m3"):
-        desc = by_id[alias_id]["description"]
-        assert "MiniMax-M3" in desc, (
-            f"description for {alias_id!r} should mention the real "
-            f"model name, got {desc!r}"
-        )
-        # ``HttpUrl`` normalises the URL (lowercases the host, adds a
-        # trailing slash). The original ``https://api.MiniMax.io``
-        # input becomes ``https://api.minimax.io/`` after pydantic
-        # validation; assert against the normalised form.
-        assert "https://api.minimax.io" in desc, (
-            f"description for {alias_id!r} should mention the "
-            f"endpoint URL (normalised form), got {desc!r}"
-        )
-        assert " - " in desc, (
-            f"description should be '<real> - <url>', got {desc!r}"
-        )
-    # No legacy ``aliases`` key in the response — Claude Code's
-    # picker doesn't display arrays under each entry; the description
-    # field is what it surfaces.
+
+    # Non-claude aliases: synthetic id is the picker key, the bare
+    # alias is the display_name.
+    assert "freestuff-non-anthropic" in by_id, by_id
+    assert by_id["freestuff-non-anthropic"]["display_name"] == "freestuff"
+    assert "mm-m3-non-anthropic" in by_id, by_id
+    assert by_id["mm-m3-non-anthropic"]["display_name"] == "mm-m3"
+
+    # The BARE non-claude aliases are NOT emitted (their synthetic
+    # siblings are the canonical entries; double-listing would
+    # confuse the picker).
+    assert "freestuff" not in by_id, (
+        f"bare 'freestuff' should not appear — the synthetic "
+        f"freestuff-non-anthropic is the canonical entry, got {list(by_id.keys())!r}"
+    )
+    assert "mm-m3" not in by_id, (
+        f"bare 'mm-m3' should not appear — the synthetic mm-m3-non-anthropic "
+        f"is the canonical entry, got {list(by_id.keys())!r}"
+    )
+
+    # Claude aliases: id alone, no display_name.
+    assert "claude-mm-m3" in by_id, by_id
+    assert "display_name" not in by_id["claude-mm-m3"], (
+        f"claude aliases emit no display_name (id is already the "
+        f"human-readable label and passes the filter), got "
+        f"{by_id['claude-mm-m3']!r}"
+    )
+
+    # No legacy ``aliases`` array in any entry.
     for entry in parsed["data"]:
         assert "aliases" not in entry, (
             f"legacy 'aliases' field should not appear in /v1/models "
-            f"response (replaced by per-alias entries with descriptions); "
+            f"response (Claude Code reads only id + display_name), "
             f"got {entry!r}"
         )
+
     # Debug variant exposes the alias_map + endpoints explicitly so a
     # misconfigured session can be diagnosed by curl.
     debug_body = asyncio.run(
@@ -3625,10 +3640,7 @@ def test_proxy_models_endpoint_surfaces_alias_map() -> None:
         )
     ).body.decode()
     debug = _json.loads(debug_body)
-    assert debug["__proxy__"]["alias_map"] == {
-        "freestuff": "MiniMax-M3",
-        "mm-m3": "MiniMax-M3",
-    }
+    assert debug["__proxy__"]["alias_map"] == cfg.model_endpoints.model_aliases
     assert debug["__proxy__"]["endpoints_map"] == {"MiniMax-M3": "MiniMax"}
     assert debug["__proxy__"]["default_provider"] == "MiniMax"
     print("✓ /v1/models surfaces the alias map (with ?debug=1)")
@@ -3637,7 +3649,7 @@ def test_proxy_models_endpoint_surfaces_alias_map() -> None:
 def test_proxy_models_endpoint_unaliased_uses_real_name() -> None:
     """Endpoints with NO alias emit their real model name as ``id``
     (a fallback so un-aliased endpoints are still pickable) and no
-    ``description`` — the alias map is authoritative for
+    ``display_name`` — the alias map is authoritative for
     user-facing labels."""
     from ccproxy.app.config import (
         ModelEndpointsCfg,
@@ -3659,39 +3671,37 @@ def test_proxy_models_endpoint_unaliased_uses_real_name() -> None:
         ),
     )
 
+    class _State:
+        debug_token = None
+
+    class _App:
+        state = _State()
+
     class _FakeReq:
-        def __init__(self, qp):
-            self.query_params = qp
-
-            class _State:
-                debug_token = None
-
-            class _App:
-                state = _State()
-
-            self.app = _App()
+        query_params = {}
+        app = _App()
 
     import asyncio
     import json as _json
 
-    body = asyncio.run(list_models(_FakeReq({}), settings=cfg)).body.decode()
+    body = asyncio.run(list_models(_FakeReq(), settings=cfg)).body.decode()
     parsed = _json.loads(body)
     by_id = {m["id"]: m for m in parsed["data"]}
     assert "MiniMax-M3" in by_id
-    # Un-aliased endpoints get a bare entry — no description field
+    # Un-aliased endpoints get a bare entry — no display_name field
     # (the alias map has no entry to drive one).
-    assert "description" not in by_id["MiniMax-M3"], (
-        f"un-aliased endpoint should not have a description, "
+    assert "display_name" not in by_id["MiniMax-M3"], (
+        f"un-aliased endpoint should not have a display_name, "
         f"got {by_id['MiniMax-M3']!r}"
     )
-    print("✓ /v1/models un-aliased endpoints use real name without description")
+    print("✓ /v1/models un-aliased endpoints use real name without display_name")
 
 
 def test_proxy_models_endpoint_alias_collision_with_real_name() -> None:
     """An alias that happens to equal a real model name doesn't
-    double-list. We prefer the alias view (which carries the
-    description); the real-name fallback is skipped because the
-    alias already covered the entry."""
+    double-list. The handler prefers the synthetic-id entry for
+    non-claude aliases; for claude aliases (which match the picker
+    filter on the id alone) the bare alias is the canonical entry."""
     from ccproxy.app.config import (
         ModelEndpointsCfg,
         ProviderCfg,
@@ -3708,38 +3718,203 @@ def test_proxy_models_endpoint_alias_collision_with_real_name() -> None:
                 ),
             },
             endpoints={"MiniMax-M3": "p"},
+            # claude substring matches the picker filter — the
+            # augmentation does NOT add a synthetic companion.
             model_aliases={
-                # Alias is the same string as the real model name.
-                # The proxy rewrites are idempotent for this case
-                # (``"MiniMax-M3" → "MiniMax-M3"``); the picker should
-                # still see one entry, not two.
-                "MiniMax-M3": "MiniMax-M3",
+                "claude-MiniMax-M3": "MiniMax-M3",
             },
         ),
     )
 
+    class _State:
+        debug_token = None
+
+    class _App:
+        state = _State()
+
     class _FakeReq:
-        def __init__(self, qp):
-            self.query_params = qp
-
-            class _State:
-                debug_token = None
-
-            class _App:
-                state = _State()
-
-            self.app = _App()
+        query_params = {}
+        app = _App()
 
     import asyncio
     import json as _json
 
-    body = asyncio.run(list_models(_FakeReq({}), settings=cfg)).body.decode()
+    body = asyncio.run(list_models(_FakeReq(), settings=cfg)).body.decode()
     parsed = _json.loads(body)
     by_id = {m["id"]: m for m in parsed["data"]}
-    assert list(by_id.keys()) == ["MiniMax-M3"], (
-        f"alias == real_name should produce a single entry, got {list(by_id.keys())!r}"
+    assert list(by_id.keys()) == ["claude-MiniMax-M3"], (
+        f"claude alias matching the picker filter should emit one "
+        f"entry, got {list(by_id.keys())!r}"
     )
-    print("✓ /v1/models handles alias == real_name without double-listing")
+    print("✓ /v1/models handles claude alias without double-listing")
+
+
+def test_proxy_models_endpoint_non_claude_alias_without_augmentation() -> None:
+    """If the ``_proxy_lifecycle`` augmentation is somehow bypassed
+    (or the alias was added after proxy startup), the handler still
+    emits SOMETHING for non-claude aliases — a bare ``{"id":
+    alias}`` entry. Claude Code will drop it (filter), but the
+    diagnostic ``?debug=1`` block still surfaces the mapping so
+    the user can diagnose the missing augmentation.
+
+    This is the safety-net path; production should always have the
+    augmentation in place via ``_proxy_lifecycle.py``.
+    """
+    from ccproxy.app.config import (
+        ModelEndpointsCfg,
+        ProviderCfg,
+        Settings,
+    )
+    from ccproxy.app.api.proxy import list_models
+
+    cfg = Settings(
+        model_endpoints=ModelEndpointsCfg(
+            providers={
+                "p": ProviderCfg(
+                    url="https://api.example.com",
+                    available_models=["real-model"],
+                ),
+            },
+            endpoints={"real-model": "p"},
+            # Non-claude alias WITHOUT its synthetic companion —
+            # simulates a state where _proxy_lifecycle's augmentation
+            # hasn't run (e.g. test bypass, or legacy config).
+            model_aliases={
+                "freestuff": "real-model",
+            },
+        ),
+    )
+
+    class _State:
+        debug_token = None
+
+    class _App:
+        state = _State()
+
+    class _FakeReq:
+        query_params = {}
+        app = _App()
+
+    import asyncio
+    import json as _json
+
+    body = asyncio.run(list_models(_FakeReq(), settings=cfg)).body.decode()
+    parsed = _json.loads(body)
+    by_id = {m["id"]: m for m in parsed["data"]}
+    assert "freestuff" in by_id
+    # No display_name in the safety-net path either — only the
+    # augmentation produces that.
+    assert "display_name" not in by_id["freestuff"], (
+        f"safety-net path should not add display_name without "
+        f"augmentation, got {by_id['freestuff']!r}"
+    )
+    print("✓ /v1/models emits bare non-claude alias as safety-net when augmentation is absent")
+
+
+def test_augment_proxy_aliases_for_discovery_adds_synthetic_id() -> None:
+    """Non-claude aliases get a synthetic ``<alias>-non-anthropic``
+    companion so Claude Code's picker can surface them.
+
+    The augmentation is the proxy-side complement to the /v1/models
+    handler: the handler reads the augmented map and emits
+    ``{"id": synthetic, "display_name": <alias>}`` per non-claude
+    alias. Claude Code keeps entries whose ``id`` contains
+    ``claude`` or ``anthropic`` (case-insensitive); the synthetic
+    id satisfies that filter so the user's typed-in label appears
+    in the /model picker.
+    """
+    from src.ui.main_window._proxy_lifecycle import (
+        augment_proxy_aliases_for_discovery,
+    )
+
+    aliases = {
+        "minimax": "real-model",
+        "mm": "real-model",
+        "claude-mm": "claude-real",
+        "anthropic-mm": "claude-real",
+        "Claude-Large": "claude-real",  # case-insensitive — passes filter
+    }
+    snapshot_before = dict(aliases)
+    augment_proxy_aliases_for_discovery(aliases)
+
+    # Non-claude aliases got synthetic companions.
+    assert "minimax-non-anthropic" in aliases
+    assert aliases["minimax-non-anthropic"] == "real-model"
+    assert "mm-non-anthropic" in aliases
+    assert aliases["mm-non-anthropic"] == "real-model"
+
+    # Claude / anthropic aliases were NOT augmented — they already
+    # pass the picker filter on their own id.
+    assert "claude-mm-non-anthropic" not in aliases
+    assert "anthropic-mm-non-anthropic" not in aliases
+    assert "Claude-Large-non-anthropic" not in aliases
+
+    # Original aliases preserved verbatim.
+    for k, v in snapshot_before.items():
+        assert aliases[k] == v, (
+            f"original alias {k!r} should be preserved, "
+            f"got {aliases[k]!r}"
+        )
+
+    print("✓ augment_proxy_aliases_for_discovery adds synthetic id for non-claude aliases only")
+
+
+def test_augment_proxy_aliases_for_discovery_does_not_clobber_user_key() -> None:
+    """If the user already defined ``<alias>-non-anthropic`` as a
+    real alias pointing at a DIFFERENT model, the augmentation
+    skips that alias — the user's explicit key wins."""
+    from src.ui.main_window._proxy_lifecycle import (
+        augment_proxy_aliases_for_discovery,
+    )
+
+    aliases = {
+        "minimax": "real-model-a",
+        # User defined this synthetic-looking key by hand, pointing
+        # at a different real model. The augmentation must NOT
+        # overwrite it with ``real-model-a``.
+        "minimax-non-anthropic": "real-model-b",
+    }
+    augment_proxy_aliases_for_discovery(aliases)
+
+    # The user's key wins.
+    assert aliases["minimax-non-anthropic"] == "real-model-b"
+    # And the original alias is still there.
+    assert aliases["minimax"] == "real-model-a"
+    print("✓ augment_proxy_aliases_for_discovery does not clobber user-defined synthetic keys")
+
+
+def test_augment_proxy_aliases_for_discovery_alias_rewrite_transparent() -> None:
+    """Both ``minimax`` and ``minimax-non-anthropic`` (after
+    augmentation) rewrite to the same real model name. The
+    proxy's alias-rewrite layer is symmetric: a request with
+    ``model=minimax`` and a request with
+    ``model=minimax-non-anthropic`` both forward the same
+    upstream model name."""
+    from ccproxy.app.api.proxy import _apply_alias_rewrite
+    from ccproxy.app.models.anthropic import AnthropicRequest
+    from src.ui.main_window._proxy_lifecycle import (
+        augment_proxy_aliases_for_discovery,
+    )
+
+    aliases = {"minimax": "real-model"}
+    augment_proxy_aliases_for_discovery(aliases)
+    assert "minimax-non-anthropic" in aliases
+
+    req1 = AnthropicRequest.model_validate(
+        {"model": "minimax", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}
+    )
+    req2 = AnthropicRequest.model_validate(
+        {"model": "minimax-non-anthropic", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}
+    )
+
+    new1, alias1 = _apply_alias_rewrite(req1, aliases)
+    new2, alias2 = _apply_alias_rewrite(req2, aliases)
+
+    assert new1.model == "real-model"
+    assert new2.model == "real-model"
+    assert alias1 == "minimax"
+    assert alias2 == "minimax-non-anthropic"
+    print("✓ both alias and synthetic id rewrite to the same real model")
 
 
 def test_proxy_alias_preserves_alias_in_log_field() -> None:

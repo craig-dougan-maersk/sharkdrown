@@ -145,11 +145,13 @@ def main() -> None:
         assert body.get("status") == "healthy"
         print(f"✓ /health returned healthy: {body}")
 
-    # ---- Make a call against /v1/models (returns the proxy's view of
-    # its routing config: each real model with its aliases). The
-    # current smoke-test profile has a single real model with no
-    # aliases — that's still enough to verify the Anthropic-shaped
-    # envelope shape Claude Code expects.
+    # ---- Make a call against /v1/models (returns the proxy's view
+    # of its routing config). The current smoke-test profile has a
+    # single real model (``claude-opus-4-8``) with no aliases — the
+    # response should emit ``{"id": "claude-opus-4-8"}`` (no
+    # ``display_name`` because the id already passes Claude Code's
+    # picker filter, no ``aliases`` array because that field was
+    # removed in the multi-bug-fix milestone).
     with urllib.request.urlopen(f"{base}/v1/models", timeout=2) as resp:
         assert resp.status == 200
         body = json.loads(resp.read())
@@ -157,10 +159,25 @@ def main() -> None:
         assert isinstance(body.get("data"), list), (
             f"'data' should be a list, got {body!r}"
         )
-        # Every entry is ``{id, aliases}`` (Anthropic-shaped + alias
-        # array for diagnostics).
+        # Every entry has ``id`` (required by Claude Code's picker)
+        # and may have ``display_name`` (only when the alias is
+        # non-claude — the synthetic-id entry surfaces the
+        # human-readable label there). The legacy ``aliases`` array
+        # is gone.
         for entry in body["data"]:
-            assert "id" in entry and "aliases" in entry, entry
+            assert "id" in entry, (
+                f"every /v1/models entry must have 'id'; got {entry!r}"
+            )
+            assert "aliases" not in entry, (
+                f"legacy 'aliases' field must not appear in /v1/models "
+                f"response; got {entry!r}"
+            )
+        # The smoke profile's single real model should appear.
+        ids = [e["id"] for e in body["data"]]
+        assert "claude-opus-4-8" in ids, (
+            f"smoke profile's real model must appear in /v1/models; "
+            f"got ids={ids!r}"
+        )
         print(f"✓ /v1/models returned {len(body['data'])} model entries")
 
     # ---- Toggle the dashboard tab on -----------------------------------
