@@ -38,18 +38,95 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user so the host can bind-mount
-# ``/home/claude/.claude`` without the UID/GID mismatch that
-# would otherwise leave files owned by root on the host.
-RUN groupadd --gid 3000 claude \
-    && useradd  --uid 3000 --gid 3000 --shell /bin/bash \
-                --create-home --home-dir /home/claude claude
+# ``<profile>/`` to ``/home/claude`` without a UID/GID mismatch
+# that would otherwise leave files owned by root on the host
+# (Claude Code runs as this user; EACCES on ~/.claude means it
+# can't bootstrap its config dir and surfaces "Invalid API
+# key" because no auth-bearing request ever leaves the
+# container).
+#
+# The UID/GID must match the *host user* that owns the
+# bind-mounted profile directory — typically UID 1000 on a
+# single-user Linux box. Rootless podman without
+# ``--userns=keep-id`` does NOT remap host UIDs into the
+# container, so the in-container user needs to be the same
+# numeric UID as the host user for the bind-mount to be
+# writable.
+#
+# For users whose host UID isn't 1000: rebuild with
+# ``--build-arg CLAUDE_UID=$(id -u) --build-arg CLAUDE_GID=$(id -g)``
+# so the image's ``claude`` user matches their account.
+#
+# ``CLAUDE_UID=0`` (running the GUI as root) is forbidden:
+# ``USER claude`` would override the root user to UID 0, breaking
+# the security model and making Claude Code's writes to
+# ``~/.claude`` owned by root on the host. SharkDrown's
+# ``docker_image_builder`` substitutes a safe UID (1000) and
+# surfaces a status-bar warning when ``os.getuid() == 0``.
+ARG CLAUDE_UID=1000
+ARG CLAUDE_GID=1000
+# Build the ``claude`` group / user with the requested GID / UID.
+# Rootless podman host UIDs frequently collide with UIDs baked
+# into the base image (e.g. ``node:20-slim`` ships with a ``node``
+# group at GID 1000 and a ``node`` user at UID 1000), so we
+# handle the collision by renaming the existing entries in
+# place. This keeps ``/etc/passwd`` and ``/etc/group`` consistent
+# (the alternative — silently ignoring the conflict — would
+# leave a leftover ``node`` user at UID 1000 with our build-arg
+# label claiming a different UID, which would surface as a
+# confusing permission error at container start).
+#
+# ``CLAUDE_UID=0`` is forbidden because the image bakes ``USER
+# claude``, which overrides UID 0 and breaks the security model.
+# SharkDrown's ``docker_image_builder`` substitutes a safe UID
+# (1000) and surfaces a status-bar warning when ``os.getuid() ==
+# 0``.
+RUN if [ "${CLAUDE_UID}" = "0" ]; then \
+      echo "ERROR: CLAUDE_UID=0 is forbidden; pick a non-root UID" && exit 1; \
+    fi \
+    # ---- Group ----
+    # If a group already exists at ${CLAUDE_GID}, rename it to
+    # ``claude``; otherwise create ``claude`` at that GID.
+    && if getent group ${CLAUDE_GID} > /dev/null; then \
+         EXISTING_GNAME=$(getent group ${CLAUDE_GID} | cut -d: -f1); \
+         if [ "$EXISTING_GNAME" != "claude" ]; then \
+           groupmod -n claude "$EXISTING_GNAME"; \
+         fi; \
+       else \
+         groupadd --gid ${CLAUDE_GID} claude; \
+       fi \
+    # ---- User ----
+    # Same collision-handling for the user entry. The home dir
+    # is chowned below so the freshly-named user owns the
+    # workspace Claude Code will write to.
+    && if getent passwd ${CLAUDE_UID} > /dev/null; then \
+         EXISTING_UNAME=$(getent passwd ${CLAUDE_UID} | cut -d: -f1); \
+         if [ "$EXISTING_UNAME" != "claude" ]; then \
+           usermod -l claude -d /home/claude -s /bin/bash "$EXISTING_UNAME"; \
+         fi; \
+       else \
+         useradd --uid ${CLAUDE_UID} --gid ${CLAUDE_GID} --shell /bin/bash \
+                 --create-home --home-dir /home/claude claude; \
+       fi \
+    && mkdir -p /home/claude \
+    && chown -R ${CLAUDE_UID}:${CLAUDE_GID} /home/claude
 
 # Install the Claude Code CLI globally. The Anthropic installer
 # typically pulls a pinned npm tarball, so this step is
 # reproducible once the upstream URL is stable. The build-arg
-# ``CLAUDE_CODE_VERSION`` lets CI pin a specific release; the
-# default ``latest`` tag is what most users want.
-ARG CLAUDE_CODE_VERSION=latest
+# ``CLAUDE_CODE_VERSION`` lets CI pin a specific release.
+#
+# Default version note: Claude Code 2.1.223+ relaxed the
+# ``/v1/models`` discovery filter from "id begins with claude or
+# anthropic" to "id contains claude or anthropic" — see
+# https://code.claude.com/docs/en/llm-gateway-protocol. Our
+# synthetic-id scheme (``<alias>-non-anthropic``) relies on the
+# relaxed filter. Pinning the default below 2.1.223 leaves the
+# picker empty for non-claude aliases even though everything else
+# works; pinning ``latest`` would also work, but pinning an
+# explicit known-good version gives CI a stable target without
+# surprises from a sudden upstream version bump.
+ARG CLAUDE_CODE_VERSION=2.1.223
 
 # If you have a private mirror of the Claude Code npm tarball,
 # point ``CLAUDE_CODE_TARBALL`` at it; otherwise the upstream
@@ -61,14 +138,25 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
 USER claude
 WORKDIR /home/claude
 
+# Stamp the baked-in UID onto the image so the runtime rebuild
+# check (see ``src/ui/claude/docker_image_builder.py``) can detect
+# when a host UID no longer matches the existing image and trigger
+# a rebuild with the right ``--build-arg``. The label is read via
+# ``podman inspect --format '{{ index .Config.Labels "io.sharkdrown.claude-uid" }}'``.
+LABEL io.sharkdrown.claude-uid="${CLAUDE_UID}"
+LABEL io.sharkdrown.claude-gid="${CLAUDE_GID}"
+
 # Make the bind-mount target explicit in the image so an
 # out-of-the-box ``docker run`` mounts the right path even
-# without SharkDrown's bind-mount flag.
-RUN mkdir -p /home/claude/.claude
+# without SharkDrown's bind-mount flag. The bind-mount source
+# is the *profile dir* (parent of ``.claude/``) so Claude's
+# config lands at ``/home/claude/.claude`` automatically —
+# matching Claude Code's expected ``<HOME>/.claude`` layout.
+RUN mkdir -p /home/claude
 
 # Hint to the spawned Claude Code CLI that the bind mount lives
 # at this path; harmless if the host uses a different layout.
-ENV CLAUDE_CONFIG_DIR=/home/claude/.claude
+ENV CLAUDE_CONFIG_DIR=/home/claude
 ENV TERM=xterm-256color
 ENV COLORTERM=truecolor
 
