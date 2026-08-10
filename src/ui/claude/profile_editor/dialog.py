@@ -514,19 +514,6 @@ class ProfileEditorDialog(
                 return
         self._profile.model_endpoints = endpoints
 
-        # Default model — stored under ``claude_settings["model"]`` so
-        # the per-profile ``settings.json`` writes the same key Claude
-        # Code reads. Previously a first-class dataclass field.
-        default_model: str | None = self.default_model_combo.currentData()
-        if default_model is not None:
-            default_model = str(default_model).strip() or None
-        if not isinstance(self._profile.claude_settings, dict):
-            self._profile.claude_settings = {}
-        if default_model:
-            self._profile.claude_settings["model"] = default_model
-        else:
-            self._profile.claude_settings.pop("model", None)
-
         # Bind / port / config_dir / session CWD are global now —
         # no per-profile copies. The General tab moved to
         # ``Claude > Settings``.
@@ -548,14 +535,21 @@ class ProfileEditorDialog(
         self._collect_container_tab()
 
         # Claude settings (raw JSON) — merge the parsed JSON on top
-        # of the dict we've accumulated so far (the Default model
-        # combo writes ``model`` *before* this block runs; the
-        # Plugins / MCP / Subagents tab handlers mutate specific
-        # keys the same way). Replacing the dict wholesale would
-        # silently drop those writes, so the JSON editor's
-        # contents is treated as *additive* — the form is the
-        # source of truth for the structured keys, and the JSON
-        # is the escape hatch for everything else.
+        # of the dict we've accumulated so far. Replacing the dict
+        # wholesale would silently drop writes from the Plugins /
+        # MCP / Subagents tab handlers, so the JSON editor's
+        # contents is treated as *additive*.
+        #
+        # **Order matters**: the Default-model combo (next block)
+        # runs *after* this merge so it can override a stale
+        # ``"model"`` entry the JSON text picked up at populate
+        # time. Without that, picking ``(no default)`` would still
+        # leave ``claude_settings["model"] = "<previous model>"``
+        # because the JSON editor's text was snapshotted from
+        # ``self._profile.claude_settings`` *before* the user
+        # touched the combo. Form is the source of truth for
+        # structured keys, JSON is the escape hatch for everything
+        # else.
         raw = self.settings_edit.toPlainText().strip()
         if raw:
             try:
@@ -582,6 +576,24 @@ class ProfileEditorDialog(
             # an empty dict rather than wiping whatever the form
             # handlers may have written.
             self._profile.claude_settings = {}
+
+        # Default model — stored under ``claude_settings["model"]`` so
+        # the per-profile ``settings.json`` writes the same key
+        # Claude Code reads. Runs *after* the JSON-merge block above
+        # so the combo's choice overrides any stale ``"model"`` key
+        # the JSON text carried in from populate time. Picking
+        # ``(no default)`` (userData ``None``) therefore reliably
+        # clears the key and keeps ``ANTHROPIC_MODEL`` unset on
+        # session launch.
+        default_model: str | None = self.default_model_combo.currentData()
+        if default_model is not None:
+            default_model = str(default_model).strip() or None
+        if not isinstance(self._profile.claude_settings, dict):
+            self._profile.claude_settings = {}
+        if default_model:
+            self._profile.claude_settings["model"] = default_model
+        else:
+            self._profile.claude_settings.pop("model", None)
 
         self.accept()
 

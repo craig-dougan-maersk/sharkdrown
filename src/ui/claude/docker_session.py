@@ -56,12 +56,21 @@ from src.profiles.paths_helpers import profile_config_base_dir
 from src.ui.claude.docker_claude_md import sync_profile_claude_md
 
 
-# Default in-container home for the claude user. The bind mount
-# targets this path so the container sees the profile's scoped
-# ``~/.claude``. ``HOME`` may differ on unusual images; we set
-# ``CLAUDE_CONFIG_DIR=/home/claude/.claude`` explicitly so the
-# path is independent of whatever HOME resolves to inside.
-_IN_CONTAINER_CLAUDE_HOME = "/home/claude/.claude"
+# Bind-mount target inside the container. The host's
+# ``<profile>/`` dir is mounted at this path, so the in-container
+# ``.claude`` subdir lands at ``/home/claude/.claude/``. Used as
+# the ``target=`` argument to ``<runtime> create --mount``.
+_IN_CONTAINER_CLAUDE_HOME = "/home/claude"
+
+
+# Where Claude Code reads its config inside the container. With
+# the bind-mount source being the entire ``<profile>/`` dir, the
+# config files live at ``/home/claude/.claude/`` (relative to
+# the in-container HOME). Claude Code's own convention is to
+# default to ``<HOME>/.claude`` but we set the env var explicitly
+# so the path is independent of whatever HOME resolves to inside
+# (some images set ``HOME=/`` for the root user, etc.).
+_IN_CONTAINER_CLAUDE_CONFIG_DIR = "/home/claude/.claude"
 
 
 # Default pty size used when the host side has no preference. The
@@ -113,6 +122,60 @@ def set_runtime_binary(name: str) -> None:
     globals()["_RUNTIME_BINARY_OVERRIDE"] = name or "docker"
 
 
+def ensure_image_for_current_uid(*, runtime: str | None = None) -> str:
+    """Resolve — and rebuild if needed — the Claude Code image for the host UID.
+
+    Thin wrapper around :func:`src.ui.claude.docker_image_builder.ensure_image_for_current_uid`
+    that honours the runtime override (``podman`` / ``docker``)
+    set by :func:`set_runtime_binary`. Returns the image tag
+    (e.g. ``"claude-code:uid-1000"``) for the caller to pass to
+    ``podman create``.
+
+    Idempotent — a no-op when the right image is already cached,
+    a one-time rebuild otherwise. See
+    :mod:`src.ui.claude.docker_image_builder` for the full
+    UID-matching rationale and tag scheme.
+    """
+    from src.ui.claude import docker_image_builder
+
+    rt = runtime or globals().get("_RUNTIME_BINARY_OVERRIDE") or "podman"
+    return docker_image_builder.ensure_image_for_current_uid(runtime=rt)
+
+
+#: Image-tag values that mean "auto-resolve to the per-host-UID
+#: tag" rather than "use this exact image". The legacy placeholder
+#: ``"claude-code:latest"`` is included so profiles saved before
+#: the per-UID scheme was introduced still trigger the rebuild on
+#: their next launch. An empty string is also a sentinel (the new
+#: dataclass default).
+_AUTO_RESOLVE_IMAGE_SENTINELS: frozenset[str] = frozenset(
+    {"", "claude-code:latest"}
+)
+
+
+def _resolve_image_for_launch(
+    profile_container_image: str, *, runtime: str
+) -> str:
+    """Pick the image tag for a container launch.
+
+    Returns the user's explicit ``profile_container_image`` when
+    it's a real tag (anything outside the auto-resolve sentinel
+    set). Returns the per-host-UID tag from
+    :func:`ensure_image_for_current_uid` otherwise — which
+    rebuilds the image if the cached version's baked-in UID
+    doesn't match the host user.
+
+    The "auto-resolve" set is intentionally narrow: just the
+    empty string and the legacy ``claude-code:latest`` placeholder.
+    Test fixtures use ``"alpine:latest"`` (a real image); users
+    with custom builds use whatever tag they pushed. Neither
+    should be silently rewritten.
+    """
+    if profile_container_image in _AUTO_RESOLVE_IMAGE_SENTINELS:
+        return ensure_image_for_current_uid(runtime=runtime)
+    return profile_container_image
+
+
 def ensure_container(profile: ClaudeProfile) -> str:
     """Create the per-profile container if it doesn't exist.
 
@@ -135,8 +198,15 @@ def ensure_container(profile: ClaudeProfile) -> str:
     - **Running** — returns the name as-is.
 
     The bind mount sources the profile's scoped
-    ``<data_dir>/profiles/<slug>/.claude`` to
-    ``/home/claude/.claude`` inside the container.
+    ``<data_dir>/claude_profiles/<slug>/`` to
+    ``/home/claude`` inside the container. SharkDrown writes
+    ``settings.json``, ``agents/``, ``plugins/``, and
+    ``.mcp.json`` under ``<slug>/.claude/`` (so the bind-mount
+    exposes them at ``/home/claude/.claude/``); Claude Code's own
+    runtime state (``history.jsonl``, ``projects/``, ``daemon/``,
+    ``jobs/``, ``.claude.json``, etc.) also lives under
+    ``<slug>/.claude/`` because Claude treats ``/home/claude`` as
+    its home directory.
 
     The image tag is read from
     ``profile.container_image``; empty value falls back to
@@ -189,13 +259,31 @@ def ensure_container(profile: ClaudeProfile) -> str:
             )
         return name
     # Make sure the scoped CLAUDE.md is on disk so the container
-    # sees it on first launch.
+    # sees it on first launch. ``write_profile_config`` would also
+    # create ``<slug>/.claude`` (which contains ``settings.json``,
+    # ``agents/``, etc.), but ``ensure_container`` is sometimes
+    # called without a write — and a missing ``<slug>/.claude/``
+    # would leave Claude Code with no settings inside the
+    # container.
     sync_profile_claude_md(profile)
-    host_config_dir = (
-        profile_config_base_dir() / profile.slug / ".claude"
+    host_profile_dir = profile_config_base_dir() / profile.slug
+    host_profile_dir.mkdir(parents=True, exist_ok=True)
+    # Resolve the per-host-UID image tag (or honour the user's
+    # explicit ``container_image`` override). Each host UID gets
+    # its own tag (``claude-code:uid-<n>``) so the in-container
+    # ``claude`` user can write to the bind-mounted profile dir
+    # without a UID-mismatch EACCES — see
+    # :mod:`src.ui.claude.docker_image_builder`.
+    #
+    # ``_resolve_image_for_launch`` treats the legacy placeholder
+    # ``"claude-code:latest"`` (and the empty string) as "auto
+    # resolve" so profiles saved before the per-UID scheme was
+    # introduced still trigger the rebuild on their next launch.
+    # Anything else — e.g. ``"alpine:latest"`` in tests, or a
+    # user's custom image — is honoured verbatim.
+    image = _resolve_image_for_launch(
+        profile.container_image, runtime=runtime or "podman"
     )
-    host_config_dir.mkdir(parents=True, exist_ok=True)
-    image = profile.container_image or "claude-code:latest"
     # Override the entrypoint to ``sleep infinity``. The image's
     # default ``CMD ["claude"]`` would otherwise run Claude as
     # PID 1 the moment the container starts — but at that point
@@ -214,13 +302,32 @@ def ensure_container(profile: ClaudeProfile) -> str:
     # the host-side pty bridge (Bug 4 fix) makes ``isatty(0)``
     # true inside the container so Claude stays in interactive
     # mode and the prompt loop never times out.
+    #
+    # ``--userns=keep-id`` is the critical fix for the
+    # bind-mount-permission bug. Without it, rootless podman
+    # shifts the host's UID 1000 (``craig``) into the container's
+    # UID 0 (``root``) for the bind-mount source — so the
+    # in-container ``claude`` user (UID 1000, baked into the
+    # image) sees the host files as owned by *root* and can't
+    # write to ``~/.claude``. ``--userns=keep-id`` maps the host
+    # UID 1:1 into the container, so the bind-mount source's
+    # owner (``craig``, UID 1000) appears in the container as
+    # UID 1000, matching the baked-in ``claude`` user.
+    #
+    # We deliberately don't pass ``--user`` — the image's
+    # ``USER claude`` directive already sets the entrypoint
+    # user, and our per-host-UID image build means that user is
+    # always UID 1000 / GID 1000 / etc. as appropriate. Hardcoding
+    # ``--user 1000:1000`` here would break for any host user
+    # with a different UID.
     subprocess.run(
         [
             runtime, "create",
             "-i",
             "--name", name,
+            "--userns=keep-id",
             "--mount",
-            f"type=bind,source={host_config_dir},target={_IN_CONTAINER_CLAUDE_HOME}",
+            f"type=bind,source={host_profile_dir},target={_IN_CONTAINER_CLAUDE_HOME}",
             "--network", "bridge",
             "--hostname", f"claude-{profile.slug}",
             # Make ``host.docker.internal`` resolve to the host's

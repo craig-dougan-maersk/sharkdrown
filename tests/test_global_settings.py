@@ -927,6 +927,164 @@ def test_ensure_container_create_overrides_entrypoint(monkeypatch, tmp_path) -> 
     print("✓ ensure_container overrides entrypoint to keep container alive")
 
 
+def test_ensure_container_binds_profile_dir_to_home(monkeypatch, tmp_path) -> None:
+    """``ensure_container`` mounts ``<profile>/`` (not ``<profile>/.claude/``)
+    onto ``/home/claude`` so SharkDrown's ``settings.json`` / ``agents/`` /
+    ``plugins/`` (under ``<profile>/.claude/``) appear at
+    ``/home/claude/.claude/`` inside the container — where Claude Code
+    reads them.
+
+    Regression guard: the previous layout mounted
+    ``<profile>/.claude → /home/claude/.claude``, leaving SharkDrown's
+    ``settings.json`` outside the bind-mount. Claude Code inside the
+    container saw an empty ``~/.claude/``, tried to mkdir its own
+    config dirs, and failed with EACCES because the bind-mount target
+    wasn't a writable parent. With the new layout the entire
+    ``<profile>/`` is writable from the container's perspective, so
+    Claude can create ``~/.claude/`` (== ``<profile>/.claude/`` on the
+    host) on demand.
+    """
+    from src.profiles import ClaudeProfile
+    from src.ui.claude import docker_session
+
+    profile = ClaudeProfile(
+        name="Mount",
+        slug="mount-profile",
+        container_image="alpine:latest",
+    )
+
+    calls: list[list[str]] = []
+
+    class _FakeResult:
+        def __init__(self, returncode: int = 0, stdout: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:2] == ["docker", "inspect"]:
+            return _FakeResult(returncode=1)
+        return _FakeResult(returncode=0)
+
+    monkeypatch.setattr(docker_session.subprocess, "run", _fake_run)
+    monkeypatch.setattr(docker_session, "_resolve_docker_binary", lambda: "docker")
+    monkeypatch.setattr(
+        docker_session, "sync_profile_claude_md", lambda profile: None
+    )
+    # ``profile_config_base_dir`` is bound at import time in
+    # ``docker_session`` (via ``from … import …``) so we have to
+    # patch the *bound* name on ``docker_session`` itself, not on
+    # the source module.
+    monkeypatch.setattr(
+        docker_session, "profile_config_base_dir", lambda: tmp_path
+    )
+
+    name = docker_session.ensure_container(profile)
+    assert name == "mount-profile"
+
+    create_calls = [c for c in calls if c[:2] == ["docker", "create"]]
+    assert len(create_calls) == 1
+    create_cmd = create_calls[0]
+    # The bind-mount entry must point at ``<profile>/`` (the parent
+    # directory) and at ``/home/claude`` (not ``/home/claude/.claude``).
+    mounts = [
+        arg for arg in create_cmd
+        if isinstance(arg, str) and arg.startswith("type=bind")
+    ]
+    assert len(mounts) == 1, (
+        f"expected exactly one bind-mount in create cmd, got: {mounts!r}"
+    )
+    mount = mounts[0]
+    # The source is ``<tmp_path>/<slug>`` — the *parent* of ``.claude``.
+    expected_source = str(tmp_path / "mount-profile")
+    assert f"source={expected_source}" in mount, (
+        f"bind-mount source must be the profile dir, not .claude; "
+        f"got {mount!r}"
+    )
+    assert "target=/home/claude" in mount, (
+        f"bind-mount target must be /home/claude (Claude's HOME), "
+        f"got {mount!r}"
+    )
+    # Sanity: the source must NOT include ``.claude`` — that would mean
+    # we regressed to the old layout where SharkDrown's settings.json
+    # sat outside the bind-mount.
+    assert ".claude" not in mount, (
+        f"bind-mount source must NOT include .claude; got {mount!r}"
+    )
+    print("✓ ensure_container binds <profile>/ to /home/claude")
+
+
+def test_ensure_container_uses_keep_id_userns(monkeypatch, tmp_path) -> None:
+    """``ensure_container`` passes ``--userns=keep-id`` so the host
+    UID is mapped 1:1 into the container's user namespace.
+
+    Without ``--userns=keep-id``, rootless podman shifts the host's
+    UID 1000 (``craig``) into the container's UID 0 (``root``) for
+    the bind-mount source. The in-container ``claude`` user (UID
+    1000, baked into the image) then sees the host files as owned
+    by *root* and can't write to ``~/.claude`` — Claude Code
+    surfaces ``EACCES: permission denied, mkdir '/home/claude/...'``
+    followed by *"Invalid API key"* (because it never reaches the
+    network layer).
+
+    ``--userns=keep-id`` keeps host UID 1000 mapped to container
+    UID 1000, so the bind-mount source owner (``craig``, UID 1000)
+    appears in the container as UID 1000 = ``claude`` user, making
+    the bind-mount writable.
+    """
+    from src.profiles import ClaudeProfile
+    from src.ui.claude import docker_session
+
+    profile = ClaudeProfile(
+        name="UIDMap",
+        slug="uid-map-profile",
+        container_image="alpine:latest",
+    )
+
+    calls: list[list[str]] = []
+
+    class _FakeResult:
+        def __init__(self, returncode: int = 0, stdout: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:2] == ["docker", "inspect"]:
+            return _FakeResult(returncode=1)
+        return _FakeResult(returncode=0)
+
+    monkeypatch.setattr(docker_session.subprocess, "run", _fake_run)
+    monkeypatch.setattr(docker_session, "_resolve_docker_binary", lambda: "docker")
+    monkeypatch.setattr(
+        docker_session, "sync_profile_claude_md", lambda profile: None
+    )
+    monkeypatch.setattr(
+        docker_session, "profile_config_base_dir", lambda: tmp_path
+    )
+
+    name = docker_session.ensure_container(profile)
+    assert name == "uid-map-profile"
+
+    create_calls = [c for c in calls if c[:2] == ["docker", "create"]]
+    assert len(create_calls) == 1
+    create_cmd = create_calls[0]
+    assert "--userns=keep-id" in create_cmd, (
+        f"create must include --userns=keep-id so host UIDs map "
+        f"1:1 into the container; got {create_cmd!r}"
+    )
+    # ``--user`` must NOT be hardcoded — the image's ``USER claude``
+    # already sets the entrypoint user, and the per-host-UID image
+    # build means that user matches the host UID automatically.
+    # Hardcoding ``--user 1000:1000`` here would break for any
+    # host user whose UID isn't 1000.
+    assert "--user" not in create_cmd, (
+        f"create must not hardcode --user; the image's USER "
+        f"directive already sets the entrypoint user. Got: {create_cmd!r}"
+    )
+    print("✓ ensure_container uses --userns=keep-id (no hardcoded --user)")
+
+
 def test_docker_session_uses_tty_for_exec(monkeypatch) -> None:
     """``DockerSession.run()`` spawns ``docker exec -i -t`` so the
     child sees a real TTY.

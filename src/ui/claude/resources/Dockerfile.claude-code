@@ -1,0 +1,158 @@
+# Dockerfile for Claude Code CLI sessions launched by SharkDrown.
+#
+# IMPORTANT: This file is bundled into the Python package via
+# ``importlib.resources.files("src.ui.claude.resources")`` so the
+# runtime image-rebuild flow works without a repo checkout (pip
+# install, AppImage, .deb). The canonical source lives at the
+# repo root (``Dockerfile.claude-code``); keep both in sync.
+#
+# Builds a container image with the Claude Code CLI installed and a
+# non-root ``claude`` user whose home is the bind-mount target for
+# the per-profile ``~/.claude`` directory.
+#
+# Usage from a fresh SharkDrown install:
+#
+#     docker build -f Dockerfile.claude-code -t claude-code:latest .
+#
+# Or override the tag via the ``IMAGE_TAG`` build-arg to bake a
+# specific Claude Code release into the image.
+#
+# Inside the container the Claude Code binary lives at
+# ``/usr/local/bin/claude`` (PATH is set via the profile's
+# ``.bashrc`` snippet below). SharkDrown spawns this binary via
+# ``docker exec -i <container> claude …`` — see
+# ``src/ui/claude/docker_session.py``.
+#
+# The bind-mount target is ``/home/claude/.claude``; the
+# ``sync_profile_claude_md`` helper prepends the global
+# ``~/.claude/CLAUDE.md`` content into that directory before
+# each container start.
+
+ARG NODE_VERSION=20-slim
+
+FROM node:${NODE_VERSION}
+
+# Install only the runtime deps the Claude Code CLI needs. Most
+# Claude Code installations need git for plugin management and
+# curl for plugin marketplace fetches; ``ca-certificates`` is
+# required for HTTPS to Anthropic's API.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user so the host can bind-mount
+# ``<profile>/`` to ``/home/claude`` without a UID/GID mismatch
+# that would otherwise leave files owned by root on the host
+# (Claude Code runs as this user; EACCES on ~/.claude means it
+# can't bootstrap its config dir and surfaces "Invalid API
+# key" because no auth-bearing request ever leaves the
+# container).
+#
+# The UID/GID must match the *host user* that owns the
+# bind-mounted profile directory — typically UID 1000 on a
+# single-user Linux box. Rootless podman without
+# ``--userns=keep-id`` does NOT remap host UIDs into the
+# container, so the in-container user needs to be the same
+# numeric UID as the host user for the bind-mount to be
+# writable.
+#
+# For users whose host UID isn't 1000: rebuild with
+# ``--build-arg CLAUDE_UID=$(id -u) --build-arg CLAUDE_GID=$(id -g)``
+# so the image's ``claude`` user matches their account.
+#
+# ``CLAUDE_UID=0`` (running the GUI as root) is forbidden:
+# ``USER claude`` would override the root user to UID 0, breaking
+# the security model and making Claude Code's writes to
+# ``~/.claude`` owned by root on the host. SharkDrown's
+# ``docker_image_builder`` substitutes a safe UID (1000) and
+# surfaces a status-bar warning when ``os.getuid() == 0``.
+ARG CLAUDE_UID=1000
+ARG CLAUDE_GID=1000
+# Build the ``claude`` group / user with the requested GID / UID.
+# Rootless podman host UIDs frequently collide with UIDs baked
+# into the base image (e.g. ``node:20-slim`` ships with a ``node``
+# group at GID 1000 and a ``node`` user at UID 1000), so we
+# handle the collision by renaming the existing entries in
+# place. This keeps ``/etc/passwd`` and ``/etc/group`` consistent
+# (the alternative — silently ignoring the conflict — would
+# leave a leftover ``node`` user at UID 1000 with our build-arg
+# label claiming a different UID, which would surface as a
+# confusing permission error at container start).
+#
+# ``CLAUDE_UID=0`` is forbidden because the image bakes ``USER
+# claude``, which overrides UID 0 and breaks the security model.
+# SharkDrown's ``docker_image_builder`` substitutes a safe UID
+# (1000) and surfaces a status-bar warning when ``os.getuid() ==
+# 0``.
+RUN if [ "${CLAUDE_UID}" = "0" ]; then \
+      echo "ERROR: CLAUDE_UID=0 is forbidden; pick a non-root UID" && exit 1; \
+    fi \
+    # ---- Group ----
+    # If a group already exists at ${CLAUDE_GID}, rename it to
+    # ``claude``; otherwise create ``claude`` at that GID. Always
+    # ``chown`` the home dir so any pre-existing files inherit the
+    # right ownership.
+    && if getent group ${CLAUDE_GID} > /dev/null; then \
+         EXISTING_GNAME=$(getent group ${CLAUDE_GID} | cut -d: -f1); \
+         if [ "$EXISTING_GNAME" != "claude" ]; then \
+           groupmod -n claude "$EXISTING_GNAME"; \
+         fi; \
+       else \
+         groupadd --gid ${CLAUDE_GID} claude; \
+       fi \
+    # ---- User ----
+    && if getent passwd ${CLAUDE_UID} > /dev/null; then \
+         EXISTING_UNAME=$(getent passwd ${CLAUDE_UID} | cut -d: -f1); \
+         if [ "$EXISTING_UNAME" != "claude" ]; then \
+           usermod -l claude -d /home/claude -s /bin/bash "$EXISTING_UNAME"; \
+         fi; \
+       else \
+         useradd --uid ${CLAUDE_UID} --gid ${CLAUDE_GID} --shell /bin/bash \
+                 --create-home --home-dir /home/claude claude; \
+       fi \
+    && mkdir -p /home/claude \
+    && chown -R ${CLAUDE_UID}:${CLAUDE_GID} /home/claude
+
+# Install the Claude Code CLI globally. The Anthropic installer
+# typically pulls a pinned npm tarball, so this step is
+# reproducible once the upstream URL is stable. The build-arg
+# ``CLAUDE_CODE_VERSION`` lets CI pin a specific release; the
+# default ``latest`` tag is what most users want.
+ARG CLAUDE_CODE_VERSION=latest
+
+# If you have a private mirror of the Claude Code npm tarball,
+# point ``CLAUDE_CODE_TARBALL`` at it; otherwise the upstream
+# registry is used. The official Anthropic npm package is
+# ``@anthropic-ai/claude-code``.
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
+    && claude --version
+
+USER claude
+WORKDIR /home/claude
+
+# Stamp the baked-in UID onto the image so the runtime rebuild
+# check (see ``src/ui/claude/docker_image_builder.py``) can detect
+# when a host UID no longer matches the existing image and trigger
+# a rebuild with the right ``--build-arg``. The label is read via
+# ``podman inspect --format '{{ index .Config.Labels "io.sharkdrown.claude-uid" }}'``.
+LABEL io.sharkdrown.claude-uid="${CLAUDE_UID}"
+LABEL io.sharkdrown.claude-gid="${CLAUDE_GID}"
+
+# Make the bind-mount target explicit in the image so an
+# out-of-the-box ``docker run`` mounts the right path even
+# without SharkDrown's bind-mount flag. The bind-mount source
+# is the *profile dir* (parent of ``.claude/``) so Claude's
+# config lands at ``/home/claude/.claude`` automatically —
+# matching Claude Code's expected ``<HOME>/.claude`` layout.
+RUN mkdir -p /home/claude
+
+# Hint to the spawned Claude Code CLI that the bind mount lives
+# at this path; harmless if the host uses a different layout.
+ENV CLAUDE_CONFIG_DIR=/home/claude
+ENV TERM=xterm-256color
+ENV COLORTERM=truecolor
+
+CMD ["claude"]

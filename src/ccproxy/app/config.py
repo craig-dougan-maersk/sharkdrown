@@ -104,6 +104,19 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
     ) -> None:
         super().__init__(settings_class)
         configured = (init_kwargs or {}).get("config_yaml_path")
+        # Fall back to ``PROXY_CONFIG_YAML`` env var when no
+        # ``config_yaml_path`` is passed in code. Used by the
+        # container-mode proxy spawn (which can't pass init args
+        # because the container process starts from a fixed
+        # uvicorn command line) — the desktop GUI writes the
+        # settings to ``/etc/sharkdrown/config.yaml`` and sets
+        # this env var so the proxy picks them up.
+        if not configured:
+            import os
+
+            env_path = os.environ.get("PROXY_CONFIG_YAML")
+            if env_path:
+                configured = env_path
         self.yaml_file = Path(configured) if configured else Path(default_yaml_path)
 
     def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
@@ -122,6 +135,24 @@ class YamlSettingsSource(PydanticBaseSettingsSource):
         try:
             with path.open(encoding="utf-8") as f:
                 data = yaml.safe_load(f)
+            # Log which file we loaded and what shape it has.
+            # ``model_endpoints`` is the only block the desktop
+            # populates dynamically; the others come from YAML
+            # or env. Logging the endpoint count is enough to
+            # confirm the per-profile routing config made it
+            # into the container (the most common cause of a
+            # silent routing-to-default-anthropic failure is a
+            # stale config.yaml or a missing volume mount).
+            model_endpoints = (
+                data.get("model_endpoints") if isinstance(data, dict) else None
+            ) or {}
+            logger.info(
+                "loaded proxy config from %s: %d endpoint(s), %d alias(es), %d provider(s)",
+                path,
+                len(model_endpoints.get("endpoints") or {}),
+                len(model_endpoints.get("model_aliases") or {}),
+                len(model_endpoints.get("providers") or {}),
+            )
         except yaml.YAMLError:
             logger.warning("config.yaml at %s is invalid; ignoring", path, exc_info=True)
             return {}

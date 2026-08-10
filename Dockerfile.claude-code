@@ -126,7 +126,7 @@ RUN if [ "${CLAUDE_UID}" = "0" ]; then \
 # works; pinning ``latest`` would also work, but pinning an
 # explicit known-good version gives CI a stable target without
 # surprises from a sudden upstream version bump.
-ARG CLAUDE_CODE_VERSION=2.1.223
+ARG CLAUDE_CODE_VERSION=2.1.226
 
 # If you have a private mirror of the Claude Code npm tarball,
 # point ``CLAUDE_CODE_TARBALL`` at it; otherwise the upstream

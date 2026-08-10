@@ -124,6 +124,7 @@ def start_proxy_container(
     *,
     bind_port: int,
     container_name: str = "sharkdrown-proxy",
+    extra_env: dict[str, str] | None = None,
 ) -> ProxyContainerHandle:
     """Spawn the proxy container if it's not already running.
 
@@ -139,6 +140,12 @@ def start_proxy_container(
       ``ProxyServerThread`` would read.
     - ``--restart unless-stopped`` so a transient host reboot
       doesn't lose the proxy.
+    - ``-e KEY=VALUE`` (one per entry in ``extra_env``) so the
+      caller can inject per-launch configuration that doesn't
+      belong on disk. The desktop GUI uses this to point the
+      container at a freshly-written ``config.yaml`` via the
+      ``PROXY_CONFIG_YAML`` env var; ``Settings`` reads that var
+      in :class:`YamlSettingsSource`.
 
     Returns ``(host_port, container_name)``. Raises
     :class:`FileNotFoundError` if the runtime binary is missing,
@@ -167,7 +174,7 @@ def start_proxy_container(
     host_data = data_dir()
     host_data.mkdir(parents=True, exist_ok=True)
     image = settings.proxy_image or "sharkdrown-proxy:latest"
-    cmd = [
+    cmd: list[str] = [
         runtime,
         "run",
         "-d",  # detached
@@ -176,8 +183,16 @@ def start_proxy_container(
         "--mount",
         f"type=bind,source={host_data},target={_PROXY_DATA_PATH}",
         "--restart", "unless-stopped",
-        image,
     ]
+    # Inject per-launch env vars. ``-e KEY=VALUE`` flags must
+    # come BEFORE the image name (podman / docker argv ordering);
+    # podman doesn't pass host env into containers by default
+    # (same root cause as the Claude-session bug fixed in
+    # ``docker_session.py``), so each var needs an explicit flag.
+    if extra_env:
+        for k, v in extra_env.items():
+            cmd.extend(["-e", f"{k}={v}"])
+    cmd.append(image)
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
     return ProxyContainerHandle(
         host_port=bind_port, container_name=container_name

@@ -85,6 +85,15 @@ class GlobalSettings:
     default_claude_image: str = "claude-code:latest"
     proxy_image: str = "sharkdrown-proxy:latest"
     run_proxy_in_container: bool = False
+    # When True (default), the launcher rebuilds the Claude Code
+    # image with ``--build-arg CLAUDE_UID=$(id -u)`` if the cached
+    # image's baked-in UID doesn't match the host user. Set to
+    # False on air-gapped hosts where ``npm install`` can't run at
+    # build time — the launcher then uses whatever tag
+    # ``default_claude_image`` resolves to without rebuilding.
+    # See ``src/ui/claude/docker_image_builder.py`` for the full
+    # rationale and tag scheme.
+    claude_image_auto_rebuild: bool = True
 
 
 GLOBAL_SETTINGS_FILENAME = "claude_global.json"
@@ -174,6 +183,7 @@ def _serialize(s: GlobalSettings) -> dict:
         "default_claude_image": s.default_claude_image,
         "proxy_image": s.proxy_image,
         "run_proxy_in_container": s.run_proxy_in_container,
+        "claude_image_auto_rebuild": s.claude_image_auto_rebuild,
     }
     # Drop empty optional fields to keep the file diff clean.
     if not s.session_cwd:
@@ -192,6 +202,9 @@ def _serialize(s: GlobalSettings) -> dict:
         out.pop("proxy_image", None)
     if not s.run_proxy_in_container:
         out.pop("run_proxy_in_container", None)
+    if s.claude_image_auto_rebuild:
+        # Default — drop to keep the file diff clean.
+        out.pop("claude_image_auto_rebuild", None)
     return out
 
 
@@ -237,6 +250,7 @@ def _deserialize(data: dict) -> GlobalSettings:
         or "sharkdrown-proxy:latest"
     )
     run_proxy_in_container = bool(data.get("run_proxy_in_container", False))
+    claude_image_auto_rebuild = bool(data.get("claude_image_auto_rebuild", True))
     return GlobalSettings(
         bind_address=bind,
         port=port,
@@ -247,4 +261,5 @@ def _deserialize(data: dict) -> GlobalSettings:
         default_claude_image=claude_img,
         proxy_image=proxy_img,
         run_proxy_in_container=run_proxy_in_container,
+        claude_image_auto_rebuild=claude_image_auto_rebuild,
     )

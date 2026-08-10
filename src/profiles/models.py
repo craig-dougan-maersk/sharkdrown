@@ -428,11 +428,13 @@ class ClaudeProfile:
     # time) whose ``~/.claude`` is a bind-mount of the profile's
     # scoped ``<data_dir>/profiles/<slug>/.claude`` directory.
     #
-    # ``container_image`` defaults to ``"claude-code:latest"`` — a
-    # placeholder the user replaces with whatever image they've
-    # published locally (``docker build -t claude-code:latest .`` in
-    # the Claude Code repo, typically). The container must have the
-    # ``claude`` CLI on its ``PATH``.
+    # ``container_image`` defaults to ``""`` — the launcher fills
+    # in the per-host-UID tag (``claude-code:uid-<n>``) via
+    # :func:`src.ui.claude.docker_image_builder.ensure_image_for_current_uid`,
+    # which also rebuilds the image when the baked-in UID doesn't
+    # match the host user. An explicit non-empty value (e.g.
+    # ``"alpine:latest"`` in tests, or a user's custom image in
+    # advanced setups) bypasses the auto-rebuild path.
     #
     # Note: the host's proxy must be reachable from inside the
     # container — the convention is to rebind the proxy to
@@ -440,7 +442,7 @@ class ClaudeProfile:
     # the in-container hostname. The launch path performs that
     # rewrite via ``env_builder.build_claude_session_env``.
     run_in_container: bool = True
-    container_image: str = "claude-code:latest"
+    container_image: str = ""
     container_name: str = ""
     # ---- Deprecated per-profile proxy / session fields ---------------
     #
