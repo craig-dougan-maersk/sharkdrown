@@ -19,33 +19,6 @@ from src.proxy.server_thread import ProxyServerThread
 logger = logging.getLogger(__name__)
 
 
-# Suffix appended to non-Claude aliases to give them an ``id`` that
-# passes Claude Code's ``/v1/models`` picker filter
-# (``id`` contains ``claude`` or ``anthropic``, case-insensitive).
-# Public so tests can assert against it without re-deriving the
-# constant from a magic string.
-SYNTHETIC_ALIAS_SUFFIX = "-non-anthropic"
-
-
-def _passes_claude_picker_filter(alias: str) -> bool:
-    """True when ``alias`` would survive Claude Code's picker filter.
-
-    Mirrors the filter documented at
-    https://code.claude.com/docs/en/llm-gateway-protocol:
-
-        Claude Code keeps an entry when its ``id`` contains
-        ``claude`` or ``anthropic`` anywhere in the string, matched
-        case-insensitively.
-
-    Anything that fails this filter is silently dropped from the
-    picker's auto-discovered list. We replicate the same case-fold
-    here so the augmentation only adds synthetic ids for the
-    aliases that actually need them.
-    """
-    lowered = alias.lower()
-    return "claude" in lowered or "anthropic" in lowered
-
-
 def augment_proxy_aliases_for_discovery(
     proxy_aliases: dict[str, str],
 ) -> None:
@@ -64,6 +37,13 @@ def augment_proxy_aliases_for_discovery(
     (``minimax``, ``claude-alias``, ``minimax-non-anthropic`` from
     a power user) is preserved verbatim.
 
+    The synthetic-id rule lives in
+    ``src/profiles/discovery_id.picker_id_for_alias`` so the
+    ``settings.json.availableModels`` writer
+    (``src/profiles/config_dir.py``) can apply the SAME format on
+    disk. Without that shared helper the two surfaces would drift
+    and Claude Code's picker filter would apply inconsistently.
+
     Edge cases:
     - claude / anthropic substring check is case-insensitive.
     - If the user already defined ``<alias>-non-anthropic`` as a
@@ -72,10 +52,12 @@ def augment_proxy_aliases_for_discovery(
     - ``list(proxy_aliases.items())`` snapshots the dict so the
       mid-loop mutation doesn't trip ``RuntimeError``.
     """
+    from src.profiles.discovery_id import picker_id_for_alias
+
     for alias, real in list(proxy_aliases.items()):
-        if _passes_claude_picker_filter(alias):
-            continue
-        synthetic = f"{alias}{SYNTHETIC_ALIAS_SUFFIX}"
+        synthetic = picker_id_for_alias(alias)
+        if synthetic == alias:
+            continue  # Already passes the filter; no augmentation needed.
         if synthetic not in proxy_aliases:
             proxy_aliases[synthetic] = real
 

@@ -310,6 +310,13 @@ def test_write_profile_config_writes_settings_json():
         claude_settings={"permissions": {"allow": ["Edit"]}},
     )
     config_dir = write_profile_config(p, base_dir=base)
+    # The config dir is rooted at ``<slug>/.claude/`` so the bind-mount
+    # source ``<slug>/`` lands it at ``/home/claude/.claude/`` inside
+    # the container. See ``test_ensure_container_binds_profile_dir_to_home``.
+    assert config_dir == base / "demo" / ".claude", (
+        f"write_profile_config must return <slug>/.claude for "
+        f"container bind-mount; got {config_dir!r}"
+    )
     settings_path = config_dir / "settings.json"
     assert settings_path.is_file()
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -327,7 +334,22 @@ def test_write_profile_config_exposes_aliases_in_available_models():
     Claude Code's ``/model`` picker offers them. Real upstream IDs
     (``claude-opus-4-8``) stay hidden — only human-friendly aliases
     are surfaced. The proxy's alias-rewrite layer handles substitution
-    on the wire."""
+    on the wire.
+
+    Multi-bug-fix-milestone contract: the id format MUST match
+    what the proxy advertises in ``/v1/models``. Claude Code's
+    picker applies the same ``id contains "claude" or "anthropic"``
+    substring filter to both surfaces, so the format has to be
+    identical or the picker shows inconsistent entries. The
+    transformation lives in
+    ``src/profiles/discovery_id.picker_id_for_alias`` and is
+    applied uniformly to every alias before it's written.
+
+    For aliases that already pass the filter (``claude-*`` or
+    ``anthropic-*``) the bare name is written verbatim. For aliases
+    that don't, a synthetic ``<alias>-non-anthropic`` suffix is
+    appended so the picker keeps them.
+    """
     from src.profiles import ClaudeProfile, ModelEndpoint, Provider, write_profile_config
 
     base = _tmp_dir()
@@ -348,6 +370,14 @@ def test_write_profile_config_exposes_aliases_in_available_models():
                 provider_name="default",
                 aliases=("sonnet",),
             ),
+            # Include a non-claude alias to exercise the synthetic-
+            # id path (the alias ``minimax`` is rewritten to
+            # ``minimax-non-anthropic`` so Claude Code's picker
+            # filter keeps it).
+            "MiniMax-M3": ModelEndpoint(
+                provider_name="default",
+                aliases=("minimax",),
+            ),
         },
         default_model="claude-opus-4-8",
     )
@@ -355,15 +385,24 @@ def test_write_profile_config_exposes_aliases_in_available_models():
     settings = json.loads(
         (config_dir / "settings.json").read_text(encoding="utf-8")
     )
-    # Only the aliases — no real names like ``claude-opus-4-8``.
+    # Aliases that don't contain ``claude`` / ``anthropic`` get the
+    # ``-non-anthropic`` suffix; claude aliases that DO contain
+    # ``claude`` would be kept verbatim — but ``opus``,
+    # ``team-pro``, ``sonnet`` and ``minimax`` don't contain
+    # ``claude`` so all four get the suffix.
     assert settings["availableModels"] == sorted([
-        "opus",
-        "team-pro",
-        "sonnet",
+        "minimax-non-anthropic",
+        "opus-non-anthropic",
+        "sonnet-non-anthropic",
+        "team-pro-non-anthropic",
     ])
+    # Real upstream IDs are NEVER exposed — those go through
+    # ``/v1/models`` as the ``id`` field (which the user types
+    # the bare upstream name into). The picker only lists aliases.
     assert "claude-opus-4-8" not in settings["availableModels"]
     assert "claude-sonnet-4-6" not in settings["availableModels"]
-    print("✓ write_profile_config exposes aliases in availableModels (real names hidden)")
+    assert "MiniMax-M3" not in settings["availableModels"]
+    print("✓ write_profile_config exposes aliases in availableModels with synthetic-id format")
 
 
 def test_write_profile_config_omits_available_models_when_no_aliases():
@@ -560,6 +599,89 @@ def test_env_builder_sentinel_when_no_key():
     )
     assert env["ANTHROPIC_API_KEY"] == SENTINEL_API_KEY
     print("✓ env_builder uses labeled sentinel when no key configured")
+
+
+def test_resolve_api_key_resolves_alias_to_canonical_provider():
+    """``claude_settings["model"]`` may be a user-friendly alias
+    (``"minimax"``) rather than the canonical upstream name
+    (``"MiniMax-M3"``). ``resolve_api_key`` must walk the
+    endpoints' ``aliases`` to find the right provider's credential.
+    Otherwise the session launches with the sentinel
+    ``sk-proxy-injected`` and upstream returns *"Invalid API key"*.
+    """
+    from src.profiles import (
+        ClaudeProfile,
+        ModelEndpoint,
+        Provider,
+        resolve_api_key,
+    )
+
+    captured: dict = {}
+
+    class _FakeCredentialStore:
+        def get(self, ref: str) -> str | None:
+            captured["ref"] = ref
+            return "sk-real-key-12345" if ref == "minimax-key" else None
+
+    p = ClaudeProfile(
+        name="AliasTest",
+        slug="alias-test",
+        providers={
+            "minimax": Provider(
+                name="minimax",
+                url="https://api.minimax.io/anthropic",
+                key_ref="minimax-key",
+            ),
+        },
+        model_endpoints={
+            "MiniMax-M3": ModelEndpoint(
+                provider_name="minimax",
+                aliases=("minimax",),
+            ),
+        },
+        claude_settings={"model": "minimax"},  # alias, not canonical
+    )
+
+    key = resolve_api_key(p, _FakeCredentialStore())
+    assert key == "sk-real-key-12345", (
+        f"resolve_api_key must walk aliases to find the canonical "
+        f"endpoint; got {key!r}"
+    )
+    assert captured == {"ref": "minimax-key"}, (
+        f"expected credential lookup against key_ref 'minimax-key', "
+        f"got {captured!r}"
+    )
+    print("✓ resolve_api_key walks aliases to resolve the right credential")
+
+
+def test_resolve_api_key_returns_none_when_no_match():
+    """If neither the canonical lookup nor the alias walk finds
+    a match, ``resolve_api_key`` returns ``None`` so the
+    env_builder substitutes the labeled sentinel — never raises.
+    """
+    from src.profiles import (
+        ClaudeProfile,
+        ModelEndpoint,
+        resolve_api_key,
+    )
+
+    class _EmptyStore:
+        def get(self, ref: str) -> str | None:
+            return None
+
+    p = ClaudeProfile(
+        name="NoMatch",
+        slug="no-match",
+        providers={},
+        model_endpoints={
+            "MiniMax-M3": ModelEndpoint(
+                provider_name="minimax", aliases=("minimax",)
+            ),
+        },
+        claude_settings={"model": "unknown-alias"},
+    )
+    assert resolve_api_key(p, _EmptyStore()) is None
+    print("✓ resolve_api_key returns None when no endpoint matches")
 
 
 # ---- TerminalSessionView env/cwd seam ------------------------------------

@@ -3,9 +3,23 @@
 The output layout is what Claude Code expects::
 
     <data_dir>/claude_profiles/<slug>/
-        settings.json        # model, availableModels, permissions, etc.
-        agents/
-            <slug>.md        # one file per Subagent (YAML frontmatter + body)
+        .claude/                  ← bind-mounted into the container at /home/claude
+            settings.json         # model, availableModels, permissions, etc.
+            .mcp.json             # MCP server configs (when profile has any)
+            agents/
+                <slug>.md         # one file per Subagent (YAML frontmatter + body)
+            plugins/
+                installed_plugins.json
+                known_marketplaces.json
+                blocklist.json
+            CLAUDE.md             # global CLAUDE.md (prepended) + profile body
+
+The whole ``<slug>/`` directory is bind-mounted into the container at
+``/home/claude`` so that ``<slug>/.claude/`` lands at ``/home/claude/.claude/``
+inside — Claude Code's expected layout. Claude Code's *own* runtime state
+(``history.jsonl``, ``projects/``, ``daemon/``, ``jobs/``, ``backups/``,
+``sessions/``, ``.claude.json``, etc.) also lives under ``<slug>/.claude/``
+because that's where Claude writes when its home is ``/home/claude``.
 
 Writes are **idempotent** — concurrent sessions of the same profile share
 this directory by design (the settings file is profile-level state, not
@@ -81,9 +95,25 @@ def _build_settings(profile: ClaudeProfile) -> dict:
     ``availableModels`` lists only the human-friendly aliases — never
     the upstream model IDs (``claude-opus-4-8``, ``MiniMax-M3``). The
     ``/model`` picker in Claude Code surfaces this list, so the user
-    sees only names they'll actually type. The proxy's alias-rewrite
-    layer (``_apply_alias_rewrite`` in the proxy handler) translates
-    any incoming alias back to the real model name at request time.
+    sees only names they'll actually type.
+
+    **The id format MUST match what the proxy advertises in
+    ``/v1/models``** — Claude Code's picker applies the same
+    ``id contains "claude" or "anthropic"`` substring filter to
+    BOTH surfaces, so the format has to be identical or the
+    picker shows inconsistent entries. Non-claude aliases are
+    written with a synthetic ``<alias>-non-anthropic`` suffix so
+    the picker keeps them; the bare alias remains the value the
+    user types in ``/model minimax``. The transformation lives in
+    ``src.profiles.discovery_id.picker_id_for_alias`` (the single
+    source of truth shared with the proxy's alias-rewrite
+    augmentation).
+
+    The proxy's alias-rewrite layer (``_apply_alias_rewrite`` in the
+    proxy handler) translates either form back to the real model
+    name at request time — both ``model=minimax`` and
+    ``model=minimax-non-anthropic`` rewrite to the same upstream
+    model.
 
     Endpoints with no aliases contribute nothing — their real names
     are still addressable (and routed correctly) by typing them
@@ -98,6 +128,8 @@ def _build_settings(profile: ClaudeProfile) -> dict:
     canonical "this profile uses these models" state always wins.
     The editor UI discourages setting these in the raw settings JSON.
     """
+    from src.profiles.discovery_id import picker_id_for_alias
+
     out: dict = dict(profile.claude_settings)
     # ``enabled_plugins`` → ``settings.json:enabledPlugins``. We
     # merge it the same way as ``model`` / ``availableModels``: the
@@ -117,7 +149,11 @@ def _build_settings(profile: ClaudeProfile) -> dict:
             continue
         for alias in (getattr(endpoint, "aliases", ()) or ()):
             if isinstance(alias, str) and alias.strip():
-                aliases_flat.append(alias)
+                # Apply the SAME id format the proxy uses in
+                # ``/v1/models`` so Claude Code's picker filter
+                # applies identically to both surfaces. See
+                # ``src/profiles/discovery_id`` for the contract.
+                aliases_flat.append(picker_id_for_alias(alias.strip()))
     if aliases_flat:
         # Dedup with ``dict.fromkeys`` so a same-named alias on two
         # endpoints collapses to one entry (the editor's
@@ -125,8 +161,8 @@ def _build_settings(profile: ClaudeProfile) -> dict:
         # defensive dedup keeps this function safe for callers
         # outside the editor path).
         out["availableModels"] = sorted(dict.fromkeys(aliases_flat))
-    if profile.default_model:
-        out["model"] = profile.default_model
+    if profile.claude_settings.get("model",None):
+        out["model"] = profile.claude_settings["model"]
     return out
 
 
@@ -137,15 +173,16 @@ def write_profile_config(profile: ClaudeProfile, base_dir: Path) -> Path:
     """Render the profile's config dir under ``base_dir``.
 
     Returns the resolved path to the ``CLAUDE_CONFIG_DIR`` (i.e.
-    ``<base_dir>/<slug>``). Idempotent — re-writing the same profile
-    overwrites its files in place; it never deletes subdirectories
-    owned by subagents that were removed from the profile (we only
-    overwrite files whose slug matches a current subagent).
+    ``<base_dir>/<slug>/.claude``). Idempotent — re-writing the same
+    profile overwrites its files in place; it never deletes
+    subdirectories owned by subagents that were removed from the
+    profile (we only overwrite files whose slug matches a current
+    subagent).
 
     Caller is responsible for passing a base directory the current
     user owns; this function does no permission juggling.
     """
-    config_dir = base_dir / profile.slug
+    config_dir = base_dir / profile.slug / ".claude"
     config_dir.mkdir(parents=True, exist_ok=True)
     agents_dir = config_dir / "agents"
     agents_dir.mkdir(exist_ok=True)

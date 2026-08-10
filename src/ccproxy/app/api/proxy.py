@@ -231,7 +231,16 @@ async def list_models(
     alias_map = endpoints_cfg.model_aliases or {}
     endpoints_map = endpoints_cfg.endpoints or {}
 
-    _SYNTHETIC_SUFFIX = "-non-anthropic"
+    # The synthetic-id rule is shared with
+    # ``src/profiles/config_dir.py`` (settings.json.availableModels)
+    # so both surfaces use the same id format. Without this shared
+    # helper the two would drift and Claude Code's picker filter
+    # would apply inconsistently between /v1/models and the on-disk
+    # settings file.
+    from src.profiles.discovery_id import (
+        SYNTHETIC_ALIAS_SUFFIX,
+        passes_claude_picker_filter,
+    )
 
     def _is_synthetic(alias: str) -> bool:
         """True when ``alias`` ends with the synthetic-id suffix AND
@@ -239,16 +248,10 @@ async def list_models(
         map. Without the bare name present, ``foo-non-anthropic``
         is just a user-defined alias and should be treated as one
         (no special handling)."""
-        if not alias.endswith(_SYNTHETIC_SUFFIX):
+        if not alias.endswith(SYNTHETIC_ALIAS_SUFFIX):
             return False
-        bare = alias[: -len(_SYNTHETIC_SUFFIX)]
+        bare = alias[: -len(SYNTHETIC_ALIAS_SUFFIX)]
         return bare in alias_map
-
-    def _alias_is_claude_or_anthropic(alias: str) -> bool:
-        """Match Claude Code's own filter: case-insensitive substring
-        check for ``claude`` OR ``anthropic``."""
-        lowered = alias.lower()
-        return "claude" in lowered or "anthropic" in lowered
 
     # Group aliases by ``real`` model name so we can decide whether
     # the synthetic-id entry is the canonical emit for each
@@ -272,7 +275,7 @@ async def list_models(
                 # ``display_name = <bare>``. The bare alias itself
                 # is skipped via the loop's elif below so we never
                 # double-list.
-                bare = alias[: -len(_SYNTHETIC_SUFFIX)]
+                bare = alias[: -len(SYNTHETIC_ALIAS_SUFFIX)]
                 if bare in seen_ids:
                     # Bare alias already emitted under a different
                     # loop iteration order — keep the synthetic
@@ -281,7 +284,7 @@ async def list_models(
                 models.append({"id": alias, "display_name": bare})
                 seen_ids.add(alias)
                 continue
-            if _alias_is_claude_or_anthropic(alias):
+            if passes_claude_picker_filter(alias):
                 # Claude / anthropic alias — id alone is sufficient.
                 if alias not in seen_ids:
                     models.append({"id": alias})
@@ -292,7 +295,7 @@ async def list_models(
             # the augmentation. (When augmentation succeeded, the
             # synthetic entry is in the map and will be emitted
             # in the ``_is_synthetic`` branch above.)
-            synthetic_companion = f"{alias}{_SYNTHETIC_SUFFIX}"
+            synthetic_companion = f"{alias}{SYNTHETIC_ALIAS_SUFFIX}"
             if synthetic_companion not in alias_map and alias not in seen_ids:
                 # User defined a non-claude alias without an
                 # augmented companion (or augmentation was skipped
