@@ -174,52 +174,116 @@ async def list_models(
     request: Request,
     settings: Settings = Depends(get_settings),
 ) -> JSONResponse:
-    """Return the proxy's view of its routing config.
+    """Return the proxy's view of its routing config as a model catalog.
 
-    Anthropic-shaped envelope (``{"object": "list", "data": [...]}``)
-    so Claude Code's ``/model`` picker has somewhere to introspect,
-    with a debug ``__proxy__`` field the proxy uses to surface its
-    own configuration. ``GET /v1/models`` doesn't write to the
-    request log; this route is purely for diagnostics.
+    Claude Code's ``/model`` picker reads this endpoint and shows each
+    ``id`` as a selectable entry; the picker ALSO surfaces a
+    ``description`` (when present) in the menu row so the user can
+    see what they're actually picking. The picker ignores everything
+    else (Anthropic-shaped envelope is the convention but the picker
+    reads selectively).
 
-    The output makes it obvious when ``freestuff → real-model``
-    alias rewrite is configured (or not), which is the easiest
-    way to verify why a request reaches (or bypasses) the proxy.
+    The response shape follows that convention:
+
+    - ``id`` is the **alias** the user types in — e.g. ``"minimax"``.
+      This is what Claude Code passes as ``model=...`` in subsequent
+      ``/v1/messages`` calls; the proxy's alias-rewrite layer then
+      maps it to the canonical real name (``MiniMax-M3``) before
+      forwarding. Putting the alias in ``id`` is what makes the
+      picker menu match the user's ``/model minimax`` workflow.
+    - ``description`` is ``"<real-model> - <endpoint-url>"`` so the
+      picker shows both the canonical model name and the URL the
+      request will land at when this alias is picked. Without this
+      the picker would only show ``minimax`` and the user wouldn't
+      know which upstream that hits.
+
+    Endpoints with **no alias** are emitted with the real model name
+    as ``id`` (the user can still pick them by typing the real name)
+    but with no ``description`` enrichment — the alias map is
+    authoritative for the user-facing labels.
 
     Query flags:
-      ``?debug=1`` → include the ``__proxy__`` block. Default off
-      because Claude Code treats ``/v1/models`` as a model
-      catalog and would silently drop unknown fields.
+      ``?debug=1&token=<debug_token>`` → include the ``__proxy__``
+      block. Default off because Claude Code treats ``/v1/models`` as
+      a model catalog and would silently drop unknown fields.
     """
     endpoints_cfg = settings.model_endpoints
     alias_map = endpoints_cfg.model_aliases or {}
-    # Build an inverse map (real name → aliases) so the response can
-    # show "MiniMax-M3 has aliases [opus, team-pro]" — useful for
-    # verifying the proxy knows about each endpoint.
-    real_to_aliases: dict[str, list[str]] = {}
-    for alias, real in alias_map.items():
-        real_to_aliases.setdefault(real, []).append(alias)
+    endpoints_map = endpoints_cfg.endpoints or {}
+    providers_map = endpoints_cfg.providers or {}
+
+    def _endpoint_url(real_name: str) -> str:
+        """Resolve the upstream URL for a real model name.
+
+        Walks ``endpoints[real_name] → providers[provider_name].url``.
+        Falls back to an empty string when the provider isn't in the
+        registry — the same silent-drop policy as
+        ``_proxy_lifecycle.py:116-119``. The description will just
+        lack the URL portion in that case; the picker still works.
+        """
+        provider_name = endpoints_map.get(real_name, "")
+        if not provider_name:
+            return ""
+        provider = providers_map.get(provider_name)
+        if provider is None:
+            return ""
+        return str(provider.url or "")
+
     models: list[dict] = []
-    seen: set[str] = set()
-    for real, aliases in real_to_aliases.items():
-        models.append(
-            {"id": real, "aliases": sorted(aliases)}
-        )
-        seen.add(real)
-    for real in (endpoints_cfg.endpoints or {}):
-        if real in seen:
+    # ``seen_real`` tracks which real model names already have an
+    # alias-driven entry; ``seen_ids`` tracks which ``id`` values
+    # have been emitted (aliases are unique by construction, but
+    # endpoint keys may collide with aliases for un-aliased
+    # endpoints — we prefer the alias view).
+    seen_real: set[str] = set()
+    seen_ids: set[str] = set()
+    for alias, real in sorted(alias_map.items()):
+        if not isinstance(alias, str) or not isinstance(real, str):
             continue
-        models.append({"id": real, "aliases": []})
+        if alias in seen_ids:
+            # Duplicate alias — last-write-wins; skip to avoid
+            # double-listing in the picker.
+            continue
+        endpoint_url = _endpoint_url(real)
+        entry: dict = {"id": alias}
+        if endpoint_url:
+            entry["description"] = f"{real} - {endpoint_url}"
+        else:
+            # No URL available — still useful to surface the
+            # mapping; description without URL is just the real name.
+            entry["description"] = real
+        models.append(entry)
+        seen_real.add(real)
+        seen_ids.add(alias)
+    # Emit un-aliased endpoints too — pickable by their real model
+    # name. They show up without a description so the picker doesn't
+    # accidentally surface them as user-facing labels.
+    for real in sorted(endpoints_map):
+        if real in seen_real:
+            continue
+        if real in seen_ids:
+            continue
+        models.append({"id": real})
+        seen_ids.add(real)
     debug_requested = "debug" in request.query_params
     debug_token = getattr(request.app.state, "debug_token", None)
     provided_token = request.query_params.get("token", "")
     debug = debug_requested and debug_token is not None and provided_token == debug_token
     payload: dict = {"object": "list", "data": models}
     if debug:
+        # Cast ``HttpUrl`` → ``str`` because ``JSONResponse`` uses
+        # ``json.dumps`` which doesn't know how to serialise
+        # pydantic's ``HttpUrl`` type. Without this, the debug
+        # block (only emitted when ``?debug=1&token=...`` is
+        # supplied) raises a ``TypeError`` instead of returning
+        # the diagnostic info the user asked for. This was a
+        # pre-existing latent bug — the previous test never
+        # actually exercised the debug path (the test fake was
+        # missing ``request.app`` so the gate was never reached).
         payload["__proxy__"] = {
             "providers": {
                 name: {
-                    "url": p.url,
+                    "url": str(p.url),
                     "has_api_key": bool(p.api_key),
                     "available_models": list(p.available_models or []),
                 }

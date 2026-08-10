@@ -2717,6 +2717,97 @@ def test_default_model_combo_persists_alias_choice() -> None:
     print("✓ Default model persists the chosen alias verbatim")
 
 
+def test_default_model_combo_no_default_overrides_json_text() -> None:
+    """Picking ``(no default)`` clears ``claude_settings["model"]``
+    even when the raw JSON editor still contains the previous
+    ``"model": "<value>"`` from populate time.
+
+    Regression test: previously the JSON-merge block ran *after*
+    the combo write, so a stale ``model`` key in the JSON text
+    silently re-introduced it and ``ANTHROPIC_MODEL`` was still
+    exported on session launch. The fix reorders the combo to
+    run after the JSON merge, so the form's choice wins.
+    """
+    from src.profiles import ProfileStore
+    from src.profiles.global_settings import GlobalSettings, GlobalSettingsStore
+    from src.profiles.models import ModelEndpoint
+    from src.ui.claude.profile_editor_dialog import ProfileEditorDialog
+
+    _qapp()
+    base = _tmp_dir()
+    store = ProfileStore(path=base / "profiles.json")
+    store.credential_store.set("default", "x")
+    default = store.ensure_default()
+    # Seed ``claude_settings`` with a non-trivial ``model`` so the
+    # raw JSON editor's text definitely contains the key after
+    # populate. Using a string Claude Code would actually accept
+    # makes the regression meaningful.
+    default.claude_settings = {"model": "minimax", "extraKey": "keep-me"}
+    gs_store = GlobalSettingsStore(base / "claude_global.json")
+    gs_store.save(
+        GlobalSettings(
+            providers={
+                "default": {
+                    "url": "https://api.anthropic.com",
+                    "available_models": ["claude-opus-4-8"],
+                },
+            },
+        )
+    )
+    default.model_endpoints = {
+        "claude-opus-4-8": ModelEndpoint(
+            provider_name="default",
+            aliases=("opus",),
+        ),
+    }
+    dlg = ProfileEditorDialog(
+        default,
+        credential_store=store.credential_store,
+        global_settings_loader=gs_store.load,
+    )
+    try:
+        # Populate reads the profile into the combo and the JSON
+        # editor text — the editor's text will now contain
+        # ``{"model": "minimax", "extraKey": "keep-me"}``.
+        assert "model" in dlg.settings_edit.toPlainText(), (
+            "test setup: JSON editor should carry the seeded model"
+        )
+        # Pick ``(no default)`` (index 0, userData=None).
+        assert dlg.default_model_combo.itemData(0) is None
+        dlg.default_model_combo.setCurrentIndex(0)
+        dlg._on_accept()
+        edited = dlg.to_profile()
+        # Combo's choice must win — ``model`` cleared even though
+        # the JSON text contained it.
+        assert "model" not in edited.claude_settings, (
+            f"expected claude_settings['model'] to be unset, "
+            f"got {edited.claude_settings.get('model')!r}; the "
+            f"JSON-merge block overrode the combo write"
+        )
+        # Other JSON keys still flow through — the JSON editor
+        # remains the escape hatch for keys the form doesn't model.
+        assert edited.claude_settings.get("extraKey") == "keep-me"
+        # And the env-builder must respect that — the user-visible
+        # behaviour is ``ANTHROPIC_MODEL`` not being exported.
+        from src.profiles.env_builder import build_claude_session_env
+        env = build_claude_session_env(
+            profile=edited,
+            proxy_base_url="http://127.0.0.1:3001",
+            config_dir="/tmp/x",
+            api_key="sk-test",
+        )
+        assert "ANTHROPIC_MODEL" not in env, (
+            f"expected ANTHROPIC_MODEL to be unset, got "
+            f"{env.get('ANTHROPIC_MODEL')!r}"
+        )
+    finally:
+        dlg.deleteLater()
+    print(
+        "✓ Default model (no default) clears the key even when the "
+        "JSON editor text carries a stale 'model' entry"
+    )
+
+
 def test_endpoints_table_columns_are_aliases_provider_model() -> None:
     """The Model Configuration table is laid out as
     [Aliases | Provider | Model] — aliases are the user-facing
@@ -3425,11 +3516,21 @@ def test_router_consults_model_endpoints_map() -> None:
 
 
 def test_proxy_models_endpoint_surfaces_alias_map() -> None:
-    """``GET /v1/models`` lists each real model with its aliases in
-    an Anthropic-shaped envelope, and ``?debug=1`` adds a ``__proxy__``
-    block with the full routing config. Used to verify Claude Code
-    is reaching the proxy (and to debug why a request might
-    bypass it)."""
+    """``GET /v1/models`` lists each alias as a selectable ``id`` with a
+    ``description`` of ``<real-model> - <endpoint-url>``, so Claude
+    Code's ``/model`` picker shows the user-facing label and the
+    canonical model + URL behind it. ``?debug=1`` adds a ``__proxy__``
+    block with the full routing config.
+
+    Used to verify Claude Code is reaching the proxy (and to debug
+    why a request might bypass it).
+
+    Contract change (post-multi-bug-fix-milestone): the response
+    shape was inverted from ``{id: real-name, aliases: [...]}`` to
+    ``{id: alias, description: "<real> - <url>"}``. The picker UX
+    needs the alias (what the user types) in ``id`` and the
+    canonical name + URL in a human-readable ``description``.
+    """
     from fastapi import Request
     from ccproxy.app.config import (
         ModelEndpointsCfg,
@@ -3457,23 +3558,71 @@ def test_proxy_models_endpoint_surfaces_alias_map() -> None:
     )
 
     class _FakeReq:
-        def __init__(self, qp):
+        def __init__(self, qp, debug_token=None):
             self.query_params = qp
+            # ``list_models`` reads ``request.app.state.debug_token``
+            # to gate the ``__proxy__`` block. The default-off
+            # behaviour holds when ``debug_token is None``; supply
+            # a real token (matched against ``?token=...``) to
+            # unlock the debug block.
+
+            class _State:
+                pass
+
+            class _App:
+                pass
+
+            self.app = _App()
+            self.app.state = _State()
+            self.app.state.debug_token = debug_token
 
     import asyncio
-    # Standard Anthropic-shaped response: each model with its aliases.
+    # Standard picker-friendly response: each alias is its own entry
+    # with a ``description`` showing the canonical model + URL.
     body = asyncio.run(list_models(_FakeReq({}), settings=cfg)).body.decode()
     import json as _json
 
     parsed = _json.loads(body)
     assert parsed["object"] == "list"
     by_id = {m["id"]: m for m in parsed["data"]}
-    assert "MiniMax-M3" in by_id
-    assert sorted(by_id["MiniMax-M3"]["aliases"]) == ["freestuff", "mm-m3"]
+    # Each alias is its own ``id`` (the picker selection target).
+    assert "freestuff" in by_id, by_id
+    assert "mm-m3" in by_id, by_id
+    # Each alias entry has a description of the form
+    # ``<real-model> - <endpoint-url>``.
+    for alias_id in ("freestuff", "mm-m3"):
+        desc = by_id[alias_id]["description"]
+        assert "MiniMax-M3" in desc, (
+            f"description for {alias_id!r} should mention the real "
+            f"model name, got {desc!r}"
+        )
+        # ``HttpUrl`` normalises the URL (lowercases the host, adds a
+        # trailing slash). The original ``https://api.MiniMax.io``
+        # input becomes ``https://api.minimax.io/`` after pydantic
+        # validation; assert against the normalised form.
+        assert "https://api.minimax.io" in desc, (
+            f"description for {alias_id!r} should mention the "
+            f"endpoint URL (normalised form), got {desc!r}"
+        )
+        assert " - " in desc, (
+            f"description should be '<real> - <url>', got {desc!r}"
+        )
+    # No legacy ``aliases`` key in the response — Claude Code's
+    # picker doesn't display arrays under each entry; the description
+    # field is what it surfaces.
+    for entry in parsed["data"]:
+        assert "aliases" not in entry, (
+            f"legacy 'aliases' field should not appear in /v1/models "
+            f"response (replaced by per-alias entries with descriptions); "
+            f"got {entry!r}"
+        )
     # Debug variant exposes the alias_map + endpoints explicitly so a
     # misconfigured session can be diagnosed by curl.
     debug_body = asyncio.run(
-        list_models(_FakeReq({"debug": "1"}), settings=cfg)
+        list_models(
+            _FakeReq({"debug": "1", "token": "secret"}, debug_token="secret"),
+            settings=cfg,
+        )
     ).body.decode()
     debug = _json.loads(debug_body)
     assert debug["__proxy__"]["alias_map"] == {
@@ -3483,6 +3632,114 @@ def test_proxy_models_endpoint_surfaces_alias_map() -> None:
     assert debug["__proxy__"]["endpoints_map"] == {"MiniMax-M3": "MiniMax"}
     assert debug["__proxy__"]["default_provider"] == "MiniMax"
     print("✓ /v1/models surfaces the alias map (with ?debug=1)")
+
+
+def test_proxy_models_endpoint_unaliased_uses_real_name() -> None:
+    """Endpoints with NO alias emit their real model name as ``id``
+    (a fallback so un-aliased endpoints are still pickable) and no
+    ``description`` — the alias map is authoritative for
+    user-facing labels."""
+    from ccproxy.app.config import (
+        ModelEndpointsCfg,
+        ProviderCfg,
+        Settings,
+    )
+    from ccproxy.app.api.proxy import list_models
+
+    cfg = Settings(
+        model_endpoints=ModelEndpointsCfg(
+            providers={
+                "MiniMax": ProviderCfg(
+                    url="https://api.MiniMax.io",
+                    available_models=["MiniMax-M3"],
+                ),
+            },
+            endpoints={"MiniMax-M3": "MiniMax"},
+            model_aliases={},  # no aliases
+        ),
+    )
+
+    class _FakeReq:
+        def __init__(self, qp):
+            self.query_params = qp
+
+            class _State:
+                debug_token = None
+
+            class _App:
+                state = _State()
+
+            self.app = _App()
+
+    import asyncio
+    import json as _json
+
+    body = asyncio.run(list_models(_FakeReq({}), settings=cfg)).body.decode()
+    parsed = _json.loads(body)
+    by_id = {m["id"]: m for m in parsed["data"]}
+    assert "MiniMax-M3" in by_id
+    # Un-aliased endpoints get a bare entry — no description field
+    # (the alias map has no entry to drive one).
+    assert "description" not in by_id["MiniMax-M3"], (
+        f"un-aliased endpoint should not have a description, "
+        f"got {by_id['MiniMax-M3']!r}"
+    )
+    print("✓ /v1/models un-aliased endpoints use real name without description")
+
+
+def test_proxy_models_endpoint_alias_collision_with_real_name() -> None:
+    """An alias that happens to equal a real model name doesn't
+    double-list. We prefer the alias view (which carries the
+    description); the real-name fallback is skipped because the
+    alias already covered the entry."""
+    from ccproxy.app.config import (
+        ModelEndpointsCfg,
+        ProviderCfg,
+        Settings,
+    )
+    from ccproxy.app.api.proxy import list_models
+
+    cfg = Settings(
+        model_endpoints=ModelEndpointsCfg(
+            providers={
+                "p": ProviderCfg(
+                    url="https://api.example.com",
+                    available_models=["MiniMax-M3"],
+                ),
+            },
+            endpoints={"MiniMax-M3": "p"},
+            model_aliases={
+                # Alias is the same string as the real model name.
+                # The proxy rewrites are idempotent for this case
+                # (``"MiniMax-M3" → "MiniMax-M3"``); the picker should
+                # still see one entry, not two.
+                "MiniMax-M3": "MiniMax-M3",
+            },
+        ),
+    )
+
+    class _FakeReq:
+        def __init__(self, qp):
+            self.query_params = qp
+
+            class _State:
+                debug_token = None
+
+            class _App:
+                state = _State()
+
+            self.app = _App()
+
+    import asyncio
+    import json as _json
+
+    body = asyncio.run(list_models(_FakeReq({}), settings=cfg)).body.decode()
+    parsed = _json.loads(body)
+    by_id = {m["id"]: m for m in parsed["data"]}
+    assert list(by_id.keys()) == ["MiniMax-M3"], (
+        f"alias == real_name should produce a single entry, got {list(by_id.keys())!r}"
+    )
+    print("✓ /v1/models handles alias == real_name without double-listing")
 
 
 def test_proxy_alias_preserves_alias_in_log_field() -> None:
