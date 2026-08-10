@@ -56,13 +56,13 @@ class ProfileManagementMixin:
                 return
             profile = next(p for p in profiles if p.name == choice)
         self.claude_container.new_session(profile=profile)
-        self.view_tabs.setCurrentIndex(self._TAB_INDEX_CLAUDE)
+        self.view_selector.setCurrentIndex(self._TAB_INDEX_CLAUDE)
 
     def _focus_claude_tab(self) -> None:
         """Slot for Claude -> Focus Claude Tab."""
         idx = getattr(self, "_TAB_INDEX_CLAUDE", None)
         if idx is not None:
-            self.view_tabs.setCurrentIndex(idx)
+            self.view_selector.setCurrentIndex(idx)
 
     def _set_active_profile(self, name: str) -> None:
         """Switch the active profile; restart the proxy if running."""

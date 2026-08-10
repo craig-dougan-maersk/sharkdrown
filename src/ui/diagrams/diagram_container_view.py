@@ -2,7 +2,7 @@
 
 Hosts a closable ``QTabWidget`` of ``DiagramPane`` instances plus an
 empty-state placeholder. This widget is the page inserted into
-``view_tabs`` as the second top-level tab in
+``view_stack`` as the 1st top-level page in
 ``src/ui/main_window/window.py``.
 """
 

@@ -385,6 +385,21 @@ class DockerSession(QThread):
         self._master_fd: int = -1
         self._shutting_down = False
         self._stop_lock = threading.Lock()
+        # Container lifecycle: by default the per-profile container
+        # is stopped when the LAST session for that profile is
+        # closed (``_close_session`` clears the flag on intermediate
+        # closes). The container itself stays running between
+        # sessions (PID 1 = ``sleep infinity``) so subsequent
+        # ``docker exec`` calls skip the container-start cost; the
+        # stop happens only on the final close.
+        #
+        # User-reported bug: closing a Claude session left the
+        # container running indefinitely. Root cause was that
+        # ``shutdown`` only killed the ``docker exec`` subprocess
+        # — the container itself was never stopped because no
+        # code path called ``docker stop <container>``.
+        self._container_name: str | None = None
+        self._stop_container_on_shutdown: bool = True
 
     def _reader_thread_target(self) -> None:
         """Pump ``master_fd`` (the host-side pty) into ``data_received``.
@@ -504,7 +519,77 @@ class DockerSession(QThread):
             os.close(slave_fd)
         except OSError:
             pass
+        # Record the container name so ``shutdown`` can call
+        # ``<runtime> stop <container>`` after the exec process
+        # dies. Stored as an instance attribute (not a closure)
+        # so a future "kill the container right now" path can
+        # read it without re-deriving the name from the profile.
+        self._container_name = container
         self._reader_thread_target()
+
+    def set_stop_container_on_shutdown(self, value: bool) -> None:
+        """Tell this session whether to stop its container on exit.
+
+        ``True`` (default) — when ``shutdown`` runs, run
+        ``<runtime> stop <container>`` after the exec process
+        dies so the container does not leak.
+
+        ``False`` — leave the container running. The caller (the
+        Claude container view) sets this when other live sessions
+        for the same profile still need the container; only the
+        LAST session's shutdown actually stops the container.
+
+        Thread-safe: this can be called from the GUI thread while
+        ``shutdown`` runs in the QThread's run loop. The shutdown
+        path takes ``_stop_lock`` before reading the flag, so a
+        late setter call is either applied before shutdown
+        snapshots the value or after the container stop has been
+        scheduled — never in between.
+        """
+        with self._stop_lock:
+            self._stop_container_on_shutdown = bool(value)
+
+    def stop_container(self) -> None:
+        """Run ``<runtime> stop <container>`` if we have a container.
+
+        Best-effort: failures are logged but don't raise, because
+        the caller is already in the shutdown path and there's
+        nothing useful it can do with the exception. Idempotent —
+        a second call is a no-op because ``_container_name`` is
+        cleared after the first run.
+
+        Called by ``shutdown`` when ``_stop_container_on_shutdown``
+        is True (i.e. this is the last session for the profile).
+        External callers (e.g. ``ClaudeContainerView`` during
+        application exit) can call it directly to force-stop a
+        leaked container.
+        """
+        name = self._container_name
+        if not name:
+            return
+        # Clear before issuing the stop — if the runtime hangs we
+        # don't want subsequent calls to issue duplicate stops.
+        self._container_name = None
+        try:
+            runtime = _resolve_docker_binary()
+            subprocess.run(
+                [runtime, "stop", "--time", "5", name],
+                check=False,
+                timeout=15,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            # Don't raise — shutdown callers can't usefully recover.
+            # The container may leak, but the exec process is
+            # already dead and the GUI session is closing.
+            import warnings as _warnings
+
+            _warnings.warn(
+                f"could not stop container {name!r}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def write(self, data: bytes) -> None:
         """Forward user keystrokes to the pty master.
@@ -551,11 +636,20 @@ class DockerSession(QThread):
         ``process_exited`` will fire from the reader loop when the
         child actually exits; we don't emit it manually here so
         the GUI sees exactly one exit event per session.
+
+        When ``_stop_container_on_shutdown`` is True (the default,
+        set by ``set_stop_container_on_shutdown``), this also
+        runs ``<runtime> stop <container>`` after the exec process
+        dies so the container does not leak. The container-start
+        cost was previously paid once per session; now it's paid
+        once per "burst" of sessions for the same profile, with
+        container-stop only on the final close.
         """
         with self._stop_lock:
             if self._shutting_down:
                 return
             self._shutting_down = True
+            stop_container = self._stop_container_on_shutdown
         proc = self._process
         if proc is None:
             return
@@ -577,6 +671,14 @@ class DockerSession(QThread):
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 pass
+        # Stop the container ONLY when this is the last session
+        # for the profile (see ``set_stop_container_on_shutdown``).
+        # ``stop_container`` is itself idempotent — a None /
+        # already-cleared ``_container_name`` is a no-op, so a
+        # session that exited before ``run`` recorded the
+        # container name doesn't trigger a bogus stop.
+        if stop_container:
+            self.stop_container()
         # Close the pty master so the reader loop's ``os.read`` hits
         # EOF (rather than blocking on a fd that no longer has a
         # writer). Idempotent — the reader may already have closed

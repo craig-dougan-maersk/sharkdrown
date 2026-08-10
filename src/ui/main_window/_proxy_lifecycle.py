@@ -404,7 +404,7 @@ class ProxyLifecycleMixin:
         """Bring the Claude tab to the front and switch to the inner
         Dashboard sub-tab.
         """
-        self.view_tabs.setCurrentIndex(self._TAB_INDEX_CLAUDE)
+        self.view_selector.setCurrentIndex(self._TAB_INDEX_CLAUDE)
         if self.claude_container is not None:
             self.claude_container.show_dashboard()
 
@@ -420,7 +420,7 @@ class ProxyLifecycleMixin:
         if self.claude_container is not None:
             self.claude_container.set_recent_activity_visible(checked)
         if checked:
-            self.view_tabs.setCurrentIndex(self._TAB_INDEX_CLAUDE)
+            self.view_selector.setCurrentIndex(self._TAB_INDEX_CLAUDE)
             if self.claude_container is not None:
                 self.claude_container.show_recent_activity()
         self.action_show_recent.setChecked(checked)
@@ -430,7 +430,7 @@ class ProxyLifecycleMixin:
         if self.claude_container is not None:
             self.claude_container.set_dashboard_visible(checked)
         if checked:
-            self.view_tabs.setCurrentIndex(self._TAB_INDEX_CLAUDE)
+            self.view_selector.setCurrentIndex(self._TAB_INDEX_CLAUDE)
             if self.claude_container is not None:
                 self.claude_container.show_dashboard()
         self.action_show_dashboard.setChecked(checked)

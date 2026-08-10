@@ -7,14 +7,26 @@ The window itself owns:
 - closeEvent (orderly shutdown)
 
 All menu, document, proxy, and profile logic lives in the mixin modules.
+
+View selector (post-refactor)
+-----------------------------
+The four top-level pages (Text / Diagrams / Terminals / Claude) are
+stacked in a ``QStackedWidget`` and selected by a ``QComboBox``
+sitting in the menu bar's right corner via
+``QMenuBar.setCornerWidget``. The combo's index is the same as the
+old tab indices (``_TAB_INDEX_*``) so all the existing dispatch
+helpers (``_focus_terminals_tab`` etc.) keep working unchanged.
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
+    QComboBox,
     QMainWindow,
+    QMenuBar,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -68,15 +80,26 @@ class MainWindow(
 
         # Initialize components
         # NOTE: menu-bar order is *call* order — QMenuBar.addMenu appends.
-        # Main + View come from _init_menu; the rest follow in sequence,
-        # giving: Main | View | Code | Diagrams | Terminal | Claude.
+        # Main (with its new Settings submenu) comes from _init_menu;
+        # the rest follow in sequence, giving:
+        # Main | Text | Diagrams | Terminal | Claude,
+        # plus a right-aligned view-selector combo via setCornerWidget.
         self._init_central_widget()
         self._init_menu()
-        self._init_code_menu()
+        self._init_text_menu()
         self._init_diagrams_menu()
         self._init_terminal_menu()
         self._init_claude_menu()
         self._init_status_bar()
+        # Wire the right-aligned view selector into the menu bar.
+        # ``setCornerWidget`` with ``Qt.TopRightCorner`` is the
+        # Qt-native way to right-align a widget inside a QMenuBar —
+        # used widely for search boxes and theme toggles. We do it
+        # AFTER ``_init_menu`` so the menubar exists; ``setCornerWidget``
+        # queues the widget for display once the layout resolves.
+        menubar = self.menuBar()
+        if menubar is not None:
+            menubar.setCornerWidget(self.view_selector, Qt.TopRightCorner)
 
         # Install double-click rename on tab bar
         self._install_tab_rename_filter()
@@ -137,38 +160,40 @@ class MainWindow(
         self.doc_vsplitter.setStretchFactor(0, 4)
         self.doc_vsplitter.setStretchFactor(1, 1)
 
-        # ---- Top-level view tabs (Documents / Diagrams / Terminals /
+        # ---- Top-level view tabs (Text / Diagrams / Terminals /
         # ---- Claude) ---------------------------------------------------
-        self.view_tabs = QTabWidget()
-        self.view_tabs.setDocumentMode(True)
-        self.view_tabs.setTabsClosable(False)
-        self.view_tabs.setMovable(False)
+        # Post-refactor: the four pages live in a QStackedWidget and
+        # are selected by the right-aligned ``view_selector`` combo
+        # in the menu bar. We keep the ``_TAB_INDEX_*`` constants so
+        # every existing dispatch helper (``_focus_*_tab``,
+        # ``_adjust_content_font`` etc.) keeps working unchanged —
+        # the combo's index IS the page index.
+        self.view_stack = QStackedWidget()
 
-        # Tab order mirrors the menu bar (Code | Diagrams | Terminal |
-        # Claude). These constants are the single source of truth for
-        # index comparisons — nothing should hard-code a literal.
+        # Index constants — single source of truth for comparisons.
+        # Combo position is the same as the stack index; nothing
+        # should hard-code a literal.
         self._TAB_INDEX_DOCUMENTS = 0
         self._TAB_INDEX_DIAGRAMS = 1
         self._TAB_INDEX_TERMINALS = 2
         self._TAB_INDEX_CLAUDE = 3
 
-        # Page 1: Documents
+        # Page 1: Text (formerly "Documents")
         documents_page = QWidget()
         documents_layout = QVBoxLayout(documents_page)
         documents_layout.setContentsMargins(0, 0, 0, 0)
         documents_layout.setSpacing(0)
         documents_layout.addWidget(self.markdown_toolbar)
         documents_layout.addWidget(self.doc_vsplitter)
-        self.view_tabs.addTab(documents_page, "Documents")
-        self.view_tabs.currentChanged.connect(self._on_view_tab_changed)
+        self.view_stack.addWidget(documents_page)
 
         # Page 2: Diagrams
         self.diagram_container = DiagramContainerView()
-        self.view_tabs.addTab(self.diagram_container, "Diagrams")
+        self.view_stack.addWidget(self.diagram_container)
 
         # Page 3: Terminals
         self.terminal_container = TerminalContainerView()
-        self.view_tabs.addTab(self.terminal_container, "Terminals")
+        self.view_stack.addWidget(self.terminal_container)
 
         # Page 4: Claude
         self.claude_container = ClaudeContainerView()
@@ -185,12 +210,45 @@ class MainWindow(
             lambda: self._global_settings_store().load()
         )
         self.claude_container.proxy_requested.connect(self._on_claude_proxy_requested)
-        self.view_tabs.addTab(self.claude_container, "Claude")
+        self.view_stack.addWidget(self.claude_container)
 
-        self.setCentralWidget(self.view_tabs)
+        self.setCentralWidget(self.view_stack)
 
-    def _on_view_tab_changed(self, index: int) -> None:
-        """Sync focus and status bar when the top-level tab changes."""
+        # Right-aligned view selector. ``currentIndexChanged`` is
+        # the cheap equivalent of the old ``view_tabs.currentChanged``
+        # (now ``view_selector.currentIndexChanged``) — every dispatch
+        # — every dispatch helper that compares against
+        # ``_TAB_INDEX_*`` keeps working because combo index = stack
+        # index.
+        #
+        # Created here (after ``view_stack`` exists) rather than
+        # lazily in ``_init_menu`` so the ``setCornerWidget`` call
+        # below can wire it without a ``QTimer.singleShot``.
+        self.view_selector = QComboBox()
+        self.view_selector.addItems(["Text", "Diagrams", "Terminals", "Claude"])
+        self.view_selector.setCurrentIndex(self._TAB_INDEX_DOCUMENTS)
+        self.view_selector.setToolTip(
+            "Switch the active top-level view.\n\n"
+            "Text — text editor / preview pane (formerly Documents).\n"
+            "Diagrams — Mermaid diagram editor.\n"
+            "Terminals — local shell sessions.\n"
+            "Claude — Claude Code CLI sessions."
+        )
+        self.view_selector.currentIndexChanged.connect(
+            self.view_stack.setCurrentIndex
+        )
+        self.view_selector.currentIndexChanged.connect(
+            self._on_view_changed
+        )
+
+    def _on_view_changed(self, index: int) -> None:
+        """Sync focus and status bar when the active top-level view changes.
+
+        Renamed from ``_on_view_tab_changed`` after the QTabWidget
+        → QStackedWidget + combo refactor. Same semantics — focus
+        transfer + status-bar visibility — just driven by the combo
+        instead of a tab bar.
+        """
         self._update_status_bar_visibility(index)
 
         if index == getattr(self, "_TAB_INDEX_TERMINALS", -1):

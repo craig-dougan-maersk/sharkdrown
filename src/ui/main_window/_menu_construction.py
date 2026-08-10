@@ -1,4 +1,4 @@
-"""Menu construction mixin — Main/View/Code/Diagrams/Terminal/Claude
+"""Menu construction mixin — Main/Text/Diagrams/Terminal/Claude
 menus and status bar."""
 
 from __future__ import annotations
@@ -22,17 +22,17 @@ class MenuConstructionMixin:
     """Builds the menu bar, status bar, and terminal session slots."""
 
     def _init_menu(self) -> None:
-        """Initialize the menu bar (Main + View).
+        """Initialize the menu bar (Main + a Settings submenu).
 
-        ``Main`` is the former ``File`` menu. Its document actions
-        (New/Open/Save/Save All/Close) now live on the ``Code`` menu —
-        they act on source documents, so they belong beside the other
-        code actions. What remains on ``Main`` is application-level:
-        quitting the app.
+        Post-refactor: the View menu has been folded into ``Main →
+        Settings``. The Terminal and Claude menus otherwise retain
+        their existing entries — only their ``Settings…`` entries
+        move into the shared Settings submenu (handled in the
+        Terminal and Claude menu builders below).
 
-        ``View`` likewise shed the split-layout actions (Toggle Split
-        View / Side By Side / Stacked) to ``Code``; View now governs
-        theme and font chrome only.
+        Menu bar order: ``Main | Text | Diagrams | Terminal | Claude``
+        plus a right-aligned view-selector combo wired by
+        ``MainWindow.__init__`` via ``QMenuBar.setCornerWidget``.
         """
         menubar = self.menuBar()
 
@@ -44,14 +44,29 @@ class MenuConstructionMixin:
         self.action_exit.triggered.connect(self.close)
         main_menu.addAction(self.action_exit)
 
-        # View menu
-        view_menu = menubar.addMenu("&View")
+        main_menu.addSeparator()
+
+        # ---- Settings submenu -------------------------------------------
+        # Replaces the old ``View`` menu. Houses:
+        #   * Theme (radio submenu)
+        #   * Content Font (size +/-/reset; family selector)
+        #   * UI Font (size +/-/reset; family selector)
+        #   * Clocks (enable + configure…)
+        #   * Terminal Settings…  (moved from ``Terminal → Terminal Settings…``)
+        #   * Claude Settings…    (moved from ``Claude → Settings…``)
+        #
+        # The actions below are functionally identical to the old
+        # View-menu actions — only the parent menu changed. The
+        # content/UI font slots, theme, clocks, and dialog slots
+        # live on ``self`` and are still reachable from the new
+        # parent.
+        settings_menu = main_menu.addMenu("&Settings")
 
         # Theme submenu
         from src.ui.theme import ThemeManager, ThemeMode
 
         self.theme_manager = ThemeManager()
-        theme_menu = view_menu.addMenu("&Theme")
+        theme_menu = settings_menu.addMenu("&Theme")
         self._theme_actions: dict[ThemeMode, QAction] = {}
         for mode in ThemeMode:
             action = QAction(mode.value.capitalize(), self)
@@ -62,28 +77,37 @@ class MenuConstructionMixin:
         saved = self.theme_manager.load_saved()
         self._theme_actions[saved].setChecked(True)
 
-        view_menu.addSeparator()
+        settings_menu.addSeparator()
 
         # Content font size (affects editor/terminal/claude, NOT UI chrome)
         self.action_increase_font = QAction("Increase Content Font", self)
         self.action_increase_font.setShortcut("Ctrl+=")
         self.action_increase_font.triggered.connect(self._increase_font_size)
-        view_menu.addAction(self.action_increase_font)
+        settings_menu.addAction(self.action_increase_font)
 
         self.action_decrease_font = QAction("Decrease Content Font", self)
         self.action_decrease_font.setShortcut("Ctrl+-")
         self.action_decrease_font.triggered.connect(self._decrease_font_size)
-        view_menu.addAction(self.action_decrease_font)
+        settings_menu.addAction(self.action_decrease_font)
 
         self.action_reset_font = QAction("Reset Content Font", self)
         self.action_reset_font.setShortcut("Ctrl+0")
         self.action_reset_font.triggered.connect(self._reset_font_size)
-        view_menu.addAction(self.action_reset_font)
+        settings_menu.addAction(self.action_reset_font)
 
-        view_menu.addSeparator()
+        # Content font family submenu (was previously absent — see
+        # _apply_content_font_family). Mirrors the UI font family
+        # list for consistency. ``apply_content_font_family`` writes
+        # through to the live editor / terminal widgets.
+        self.content_font_family_menu = settings_menu.addMenu(
+            "Content Font &Family"
+        )
+        self._build_content_font_family_menu(self.content_font_family_menu)
+
+        settings_menu.addSeparator()
 
         # UI font submenu
-        ui_font_menu = view_menu.addMenu("&UI Font")
+        ui_font_menu = settings_menu.addMenu("&UI Font")
 
         self.action_ui_font_increase = QAction("Increase UI Font", self)
         self.action_ui_font_increase.triggered.connect(self._increase_ui_font)
@@ -117,7 +141,7 @@ class MenuConstructionMixin:
             self._ui_font_family_group.addAction(action)
             ui_font_menu.addAction(action)
 
-        view_menu.addSeparator()
+        settings_menu.addSeparator()
 
         # World clocks — opens the manager dialog (add / edit / remove
         # entries; master enable toggle). The dialog persists to
@@ -126,7 +150,32 @@ class MenuConstructionMixin:
         # the changes up immediately.
         self.action_clocks = QAction("&Clocks…", self)
         self.action_clocks.triggered.connect(self._open_clocks_dialog)
-        view_menu.addAction(self.action_clocks)
+        settings_menu.addAction(self.action_clocks)
+
+        settings_menu.addSeparator()
+
+        # Terminal Settings — moved here from ``Terminal → Terminal
+        # Settings…``. The Terminal menu no longer carries its own
+        # Settings entry. ``_open_terminal_settings`` is unchanged.
+        self.action_terminal_settings = QAction(
+            "Terminal &Settings…", self
+        )
+        self.action_terminal_settings.triggered.connect(
+            self._open_terminal_settings
+        )
+        settings_menu.addAction(self.action_terminal_settings)
+
+        # Claude Settings — moved here from ``Claude → Settings…``.
+        # The Claude menu no longer carries its own Settings entry;
+        # the Profiles submenu (per-profile editor) remains on the
+        # Claude menu. ``_show_global_settings`` is unchanged.
+        self.action_global_settings = QAction(
+            "&Claude Settings…", self
+        )
+        self.action_global_settings.triggered.connect(
+            self._show_global_settings
+        )
+        settings_menu.addAction(self.action_global_settings)
 
     def _apply_theme(self, mode) -> None:
         from src.ui.theme import ThemeMode
@@ -150,7 +199,7 @@ class MenuConstructionMixin:
         """Adjust font size for the active editor/terminal/claude session."""
         from PySide6.QtCore import QSettings
 
-        view_index = self.view_tabs.currentIndex()
+        view_index = self.view_selector.currentIndex()
         is_documents = view_index == getattr(self, "_TAB_INDEX_DOCUMENTS", -1)
         is_terminals = view_index == getattr(self, "_TAB_INDEX_TERMINALS", -1)
         is_claude = view_index == getattr(self, "_TAB_INDEX_CLAUDE", -1)
@@ -223,6 +272,101 @@ class MenuConstructionMixin:
         else:
             font.setFamily(family)
         app.setFont(font)
+
+    # ---- Content font family (new in Main → Settings → Content Font → Family)
+
+    def _build_content_font_family_menu(self, menu) -> None:
+        """Populate the ``Content Font → Family`` submenu.
+
+        Mirrors the UI Font family selector: same 7-option list
+        (``System Default`` plus six common sans-serif families).
+        Selection is persisted to ``QSettings`` key
+        ``content_font_family`` and applied live to every open
+        editor + terminal + Claude session via
+        :meth:`_apply_content_font_family`.
+
+        The radio group uses ``userData`` to thread the family name
+        through the ``triggered`` signal — ``text()`` alone would
+        mangle ``&`` mnemonics and could collide with future menu
+        entries.
+        """
+        from PySide6.QtCore import QSettings
+        from PySide6.QtGui import QActionGroup
+
+        families = ["System Default", "Inter", "Segoe UI", "Helvetica Neue",
+                    "SF Pro", "Roboto", "Noto Sans"]
+        settings = QSettings("SharkDrown", "App")
+        saved_family = settings.value("content_font_family", "System Default")
+
+        self._content_font_family_group = QActionGroup(self)
+        self._content_font_family_group.setExclusive(True)
+        for family in families:
+            action = QAction(family, self)
+            action.setCheckable(True)
+            action.setChecked(family == saved_family)
+            action.setData(family)
+            action.triggered.connect(
+                lambda checked, a=action: self._apply_content_font_family(
+                    a.data()
+                )
+            )
+            self._content_font_family_group.addAction(action)
+            menu.addAction(action)
+
+    def _apply_content_font_family(self, family: str) -> None:
+        """Apply a content-font family to all open editor / terminal / Claude sessions.
+
+        Persistence: ``QSettings("SharkDrown", "App")`` key
+        ``content_font_family``. The setting is read at startup by
+        :class:`EditorWidget`, ``TerminalSessionView`` (via
+        :func:`load_terminal_settings`), and the renderer module's
+        ``set_font_family`` global; live updates are dispatched to
+        the active widget here so the user sees the change
+        immediately.
+
+        ``System Default`` clears the family override — the widget
+        picks the system monospace (terminal) or system serif
+        (editor) font. The setter is idempotent; safe to call from
+        menu actions, settings dialogs, and tests.
+        """
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtGui import QFont, QFontDatabase
+
+        settings = QSettings("SharkDrown", "App")
+        settings.setValue("content_font_family", family)
+
+        # Apply to live editor widgets.
+        if hasattr(self, "editor_tabs"):
+            from src.ui.widgets.editor_widget import EditorWidget
+            for i in range(self.editor_tabs.count()):
+                editor = self.editor_tabs.widget(i)
+                if isinstance(editor, EditorWidget):
+                    font = editor.editor.font()
+                    if family == "System Default":
+                        default = QFontDatabase.systemFont(
+                            QFontDatabase.GeneralFont
+                        )
+                        font.setFamily(default.family())
+                    else:
+                        font.setFamily(family)
+                    editor.editor.setFont(font)
+
+        # Apply to live terminal + Claude sessions. The terminal
+        # session view's ``apply_font_settings`` is the canonical
+        # entry point — it takes care of font metrics + renderer
+        # handoff in one place.
+        from src.ui.terminal.terminal_session_view import TerminalSessionView
+        if self.terminal_container is not None:
+            for sess in getattr(self.terminal_container, "_sessions", ()):
+                if isinstance(sess, TerminalSessionView):
+                    size = sess._base_font.pointSize() or 12
+                    sess.apply_font_settings(family, size)
+        if self.claude_container is not None:
+            for sess in getattr(self.claude_container, "_sessions", ()):
+                if isinstance(sess, TerminalSessionView):
+                    size = sess._base_font.pointSize() or 12
+                    sess.apply_font_settings(family, size)
 
     def _open_clocks_dialog(self) -> None:
         """Slot for View → Clocks…. Opens the manager dialog and, on
@@ -413,7 +557,7 @@ class MenuConstructionMixin:
     def _on_font_slider_changed(self, value: int) -> None:
         """Set the content font to the slider's value."""
         self.font_size_value_label.setText(f"{value}pt")
-        view_index = self.view_tabs.currentIndex()
+        view_index = self.view_selector.currentIndex()
         is_documents = view_index == getattr(self, "_TAB_INDEX_DOCUMENTS", -1)
         is_terminals = view_index == getattr(self, "_TAB_INDEX_TERMINALS", -1)
         is_claude = view_index == getattr(self, "_TAB_INDEX_CLAUDE", -1)
@@ -435,7 +579,7 @@ class MenuConstructionMixin:
     def _sync_font_slider(self) -> None:
         """Sync the font slider to the current active widget's font size."""
         size = 12
-        view_index = self.view_tabs.currentIndex()
+        view_index = self.view_selector.currentIndex()
         is_documents = view_index == getattr(self, "_TAB_INDEX_DOCUMENTS", -1)
         is_terminals = view_index == getattr(self, "_TAB_INDEX_TERMINALS", -1)
         is_claude = view_index == getattr(self, "_TAB_INDEX_CLAUDE", -1)
@@ -454,21 +598,13 @@ class MenuConstructionMixin:
         self.font_size_slider.blockSignals(False)
         self.font_size_value_label.setText(f"{size}pt")
 
-    def _init_code_menu(self) -> None:
-        """Add the Code menu between View and Diagrams.
+    def _init_text_menu(self) -> None:
+        """Add the Text menu between Main and Diagrams.
 
-        The Code menu is the home for everything that acts on source
-        documents:
-
-        * document lifecycle — ``New``, ``Open``, ``Save``,
-          ``Save All``, ``Close`` (moved off the former ``File`` menu,
-          now ``Main``, which keeps only ``Exit``);
-        * split layout — ``Toggle Split View``, ``Side By Side``,
-          ``Stacked`` (moved off ``View``);
-        * code analysis — ``Toggle Preview`` and ``Toggle Lint Panel``.
-
-        ``View`` is left governing application chrome only (theme,
-        fonts).
+        Renamed from ``Code`` to ``Text`` to match the renamed
+        "Documents" tab (now "Text" in the right-aligned view
+        selector). Functionally identical — same document lifecycle,
+        split-layout, preview, lint, and line-numbers actions.
 
         Mnemonics are unique *within this menu*: N/O/S/A/C for the
         document group, T/B/K for the layout group, P/L for the
@@ -478,37 +614,37 @@ class MenuConstructionMixin:
         &Preview`` avoids colliding with ``&Toggle Split View``.
         """
         menubar = self.menuBar()
-        code_menu = menubar.addMenu("&Code")
+        text_menu = menubar.addMenu("&Text")
 
         # ---- Document lifecycle (moved from File/Main) -----------------
         self.action_new = QAction("&New", self)
         self.action_new.setShortcut("Ctrl+N")
         self.action_new.triggered.connect(lambda _checked=False: self._new_file_with_dialog())
-        code_menu.addAction(self.action_new)
+        text_menu.addAction(self.action_new)
 
         self.action_open = QAction("&Open...", self)
         self.action_open.setShortcut("Ctrl+O")
         self.action_open.triggered.connect(self._open_file)
-        code_menu.addAction(self.action_open)
+        text_menu.addAction(self.action_open)
 
         self.action_save = QAction("&Save", self)
         self.action_save.setShortcut("Ctrl+S")
         self.action_save.triggered.connect(self._save_file)
-        code_menu.addAction(self.action_save)
+        text_menu.addAction(self.action_save)
 
         self.action_save_all = QAction("Save &All", self)
         self.action_save_all.setShortcut("Ctrl+Shift+S")
         self.action_save_all.triggered.connect(self._save_all)
-        code_menu.addAction(self.action_save_all)
+        text_menu.addAction(self.action_save_all)
 
-        code_menu.addSeparator()
+        text_menu.addSeparator()
 
         self.action_close = QAction("&Close", self)
         self.action_close.setShortcut("Ctrl+W")
         self.action_close.triggered.connect(self._close_current_tab)
-        code_menu.addAction(self.action_close)
+        text_menu.addAction(self.action_close)
 
-        code_menu.addSeparator()
+        text_menu.addSeparator()
 
         # ---- Split layout (moved from View) ---------------------------
         self.action_toggle_split = QAction("&Toggle Split View", self)
@@ -516,19 +652,19 @@ class MenuConstructionMixin:
         self.action_toggle_split.setCheckable(True)
         self.action_toggle_split.setChecked(False)
         self.action_toggle_split.triggered.connect(self._toggle_split)
-        code_menu.addAction(self.action_toggle_split)
+        text_menu.addAction(self.action_toggle_split)
 
         self.action_side_by_side = QAction("Side &By Side", self)
         self.action_side_by_side.setShortcut("Ctrl+1")
         self.action_side_by_side.triggered.connect(lambda: self._set_split_orientation(Qt.Horizontal))
-        code_menu.addAction(self.action_side_by_side)
+        text_menu.addAction(self.action_side_by_side)
 
         self.action_stacked = QAction("Stac&ked", self)
         self.action_stacked.setShortcut("Ctrl+2")
         self.action_stacked.triggered.connect(lambda: self._set_split_orientation(Qt.Vertical))
-        code_menu.addAction(self.action_stacked)
+        text_menu.addAction(self.action_stacked)
 
-        code_menu.addSeparator()
+        text_menu.addSeparator()
 
         # ---- Code analysis --------------------------------------------
         self.action_toggle_preview = QAction("Toggle &Preview", self)
@@ -536,18 +672,18 @@ class MenuConstructionMixin:
         self.action_toggle_preview.setCheckable(True)
         self.action_toggle_preview.setChecked(False)
         self.action_toggle_preview.triggered.connect(self._toggle_preview)
-        code_menu.addAction(self.action_toggle_preview)
+        text_menu.addAction(self.action_toggle_preview)
 
-        code_menu.addSeparator()
+        text_menu.addSeparator()
 
         self.action_toggle_lint = QAction("Toggle &Lint Panel", self)
         self.action_toggle_lint.setShortcut("Ctrl+Shift+L")
         self.action_toggle_lint.setCheckable(True)
         self.action_toggle_lint.setChecked(False)
         self.action_toggle_lint.triggered.connect(self._toggle_lint_panel)
-        code_menu.addAction(self.action_toggle_lint)
+        text_menu.addAction(self.action_toggle_lint)
 
-        code_menu.addSeparator()
+        text_menu.addSeparator()
 
         # ---- View options ------------------------------------------------
         # ``Show Line Numbers`` is a global preference, not a per-tab
@@ -566,7 +702,7 @@ class MenuConstructionMixin:
         self.action_show_line_numbers.triggered.connect(
             self._on_show_line_numbers_toggled
         )
-        code_menu.addAction(self.action_show_line_numbers)
+        text_menu.addAction(self.action_show_line_numbers)
 
     def _init_diagrams_menu(self) -> None:
         """Add the Diagrams menu between Code and Terminal.
@@ -650,11 +786,9 @@ class MenuConstructionMixin:
         self.action_kill_all_sessions.triggered.connect(self._kill_all_terminal_sessions)
         terminal_menu.addAction(self.action_kill_all_sessions)
 
-        terminal_menu.addSeparator()
-
-        self.action_terminal_settings = QAction("Terminal &Settings…", self)
-        self.action_terminal_settings.triggered.connect(self._open_terminal_settings)
-        terminal_menu.addAction(self.action_terminal_settings)
+        # ``Terminal Settings…`` has moved to ``Main → Settings → Terminal
+        # Settings…`` (see ``_init_menu``). The action lives on
+        # ``self`` so existing slot wiring still works.
 
     def _init_claude_menu(self) -> None:
         """Add the Claude menu."""
@@ -730,14 +864,12 @@ class MenuConstructionMixin:
 
         self.profile_menu.aboutToShow.connect(self._refresh_profile_menu)
 
-        # ---- Global Settings (sibling of Profiles submenu) ------------
-        # Holds truly-global Claude Code state: proxy bind/port, the
-        # provider registry, the global credential store, and the
-        # ``~/.claude/CLAUDE.md`` editor. Lives outside the Profiles
-        # submenu because the same settings apply to every profile.
-        self.action_global_settings = QAction("&Settings…", self)
-        self.action_global_settings.triggered.connect(self._show_global_settings)
-        claude_menu.addAction(self.action_global_settings)
+        # ---- Global Settings (moved to ``Main → Settings → Claude
+        # Settings…``) ------------------------------------------------
+        # The action ``self.action_global_settings`` is still defined
+        # here so the slot connection survives — ``_init_menu``
+        # re-parents it under ``Main → Settings``. The ``Claude``
+        # menu no longer carries its own Settings entry.
 
     # ------------------------------------------------------------------
     # Terminal session slots
@@ -748,13 +880,13 @@ class MenuConstructionMixin:
         if self.terminal_container is None:
             return
         self.terminal_container.new_session()
-        self.view_tabs.setCurrentIndex(self._TAB_INDEX_TERMINALS)
+        self.view_selector.setCurrentIndex(self._TAB_INDEX_TERMINALS)
 
     def _focus_terminals_tab(self) -> None:
         """Slot for Terminal -> Focus Terminals Tab."""
         idx = getattr(self, "_TAB_INDEX_TERMINALS", None)
         if idx is not None:
-            self.view_tabs.setCurrentIndex(idx)
+            self.view_selector.setCurrentIndex(idx)
 
     # ------------------------------------------------------------------
     # Diagram slots
@@ -765,7 +897,7 @@ class MenuConstructionMixin:
         if self.diagram_container is None:
             return
         self.diagram_container.new_diagram()
-        self.view_tabs.setCurrentIndex(self._TAB_INDEX_DIAGRAMS)
+        self.view_selector.setCurrentIndex(self._TAB_INDEX_DIAGRAMS)
         self.diagram_container.focus_active_diagram()
 
     def _open_diagram(self) -> None:
@@ -784,7 +916,7 @@ class MenuConstructionMixin:
         if not file_path:
             return
         self.diagram_container.open_diagram(Path(file_path))
-        self.view_tabs.setCurrentIndex(self._TAB_INDEX_DIAGRAMS)
+        self.view_selector.setCurrentIndex(self._TAB_INDEX_DIAGRAMS)
         self.diagram_container.focus_active_diagram()
 
     def _save_diagram(self) -> None:
@@ -821,13 +953,13 @@ class MenuConstructionMixin:
         """Slot for Diagrams -> Focus Diagrams Tab."""
         idx = getattr(self, "_TAB_INDEX_DIAGRAMS", None)
         if idx is not None:
-            self.view_tabs.setCurrentIndex(idx)
+            self.view_selector.setCurrentIndex(idx)
 
     def _active_terminal_session(self):
         """Return the active TerminalSessionView (terminal or Claude) or None."""
         from src.ui.terminal.terminal_session_view import TerminalSessionView
 
-        view_index = self.view_tabs.currentIndex()
+        view_index = self.view_selector.currentIndex()
         is_claude = view_index == getattr(self, "_TAB_INDEX_CLAUDE", -1)
 
         if is_claude:

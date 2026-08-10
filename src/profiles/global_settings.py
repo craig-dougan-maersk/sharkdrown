@@ -74,6 +74,31 @@ class GlobalSettings:
         container spawned via the configured runtime, instead of
         the local ``ProxyServerThread``. Falls back to local if
         the container can't be started.
+    tui_mode:
+        Controls Claude Code's TUI rendering mode for new sessions.
+
+        - ``"fullscreen"`` (default) — sets ``CLAUDE_CODE_NO_FLICKER=1``,
+          which makes Claude Code enter its fullscreen / alt-screen
+          flicker-free rendering path. This matches the upstream
+          ``/tui fullscreen`` slash command and the historic default
+          for SharkDrown sessions.
+        - ``"default"`` — leaves Claude Code in its standard
+          non-fullscreen mode; equivalent to running
+          ``/tui default`` (a documented Claude Code slash command
+          that disables the alt-screen rendering path).
+        - ``"off"`` — adds no env var, identical to ``"default"``;
+          kept as an alias because ``defaults.env`` shipped the
+          flicker-free flag for several releases and users may want
+          to disable it without explicit knowledge of the slash
+          command.
+
+        The override is applied per-session in
+        :func:`src.profiles.env_builder.build_claude_session_env`
+        after ``defaults.env`` is merged, so a user who picks
+        ``"default"`` doesn't need to hand-edit ``defaults.env`` to
+        escape fullscreen mode (Bug A — user reported that ``/tui``
+        "seems to be fullscreen instead of default" before this
+        setting existed).
     """
 
     bind_address: str = "127.0.0.1"
@@ -94,6 +119,11 @@ class GlobalSettings:
     # See ``src/ui/claude/docker_image_builder.py`` for the full
     # rationale and tag scheme.
     claude_image_auto_rebuild: bool = True
+    # ``"fullscreen"`` (legacy default — keeps the historic
+    # flicker-free rendering), ``"default"`` (uses Claude Code's
+    # own default non-fullscreen mode), or ``"off"`` (alias of
+    # ``"default"``).
+    tui_mode: str = "fullscreen"
 
 
 GLOBAL_SETTINGS_FILENAME = "claude_global.json"
@@ -184,6 +214,7 @@ def _serialize(s: GlobalSettings) -> dict:
         "proxy_image": s.proxy_image,
         "run_proxy_in_container": s.run_proxy_in_container,
         "claude_image_auto_rebuild": s.claude_image_auto_rebuild,
+        "tui_mode": s.tui_mode,
     }
     # Drop empty optional fields to keep the file diff clean.
     if not s.session_cwd:
@@ -205,6 +236,11 @@ def _serialize(s: GlobalSettings) -> dict:
     if s.claude_image_auto_rebuild:
         # Default — drop to keep the file diff clean.
         out.pop("claude_image_auto_rebuild", None)
+    if s.tui_mode == "fullscreen":
+        # Legacy default — drop to keep the file diff clean for
+        # existing installs that haven't explicitly opted out of
+        # the flicker-free rendering.
+        out.pop("tui_mode", None)
     return out
 
 
@@ -251,6 +287,14 @@ def _deserialize(data: dict) -> GlobalSettings:
     )
     run_proxy_in_container = bool(data.get("run_proxy_in_container", False))
     claude_image_auto_rebuild = bool(data.get("claude_image_auto_rebuild", True))
+    # ``tui_mode`` is new in this version; pre-existing files lack
+    # the key and should keep the legacy default ("fullscreen").
+    # Validate the value to defend against typos in hand-edited
+    # ``claude_global.json`` — anything unrecognised falls back to
+    # the safe legacy default rather than disabling the env-var
+    # override entirely.
+    raw_tui = str(data.get("tui_mode", "fullscreen") or "fullscreen")
+    tui_mode = raw_tui if raw_tui in {"fullscreen", "default", "off"} else "fullscreen"
     return GlobalSettings(
         bind_address=bind,
         port=port,
@@ -262,4 +306,5 @@ def _deserialize(data: dict) -> GlobalSettings:
         proxy_image=proxy_img,
         run_proxy_in_container=run_proxy_in_container,
         claude_image_auto_rebuild=claude_image_auto_rebuild,
+        tui_mode=tui_mode,
     )

@@ -190,18 +190,23 @@ def main() -> None:
         "dashboard view should exist after start"
     )
     assert claude_container.dashboard_view.base_url() == f"http://127.0.0.1:{port}"
-    # Top-level tab structure: Documents, Terminals, Claude.
-    assert window.view_tabs.count() == 3
-    assert window.view_tabs.tabText(0) == "Documents"
-    assert window.view_tabs.tabText(1) == "Terminals"
-    assert window.view_tabs.tabText(2) == "Claude"
+    # Top-level view structure: QStackedWidget with 4 pages
+    # (Text / Diagrams / Terminals / Claude) selected by a right-
+    # aligned QComboBox. Combo indices match the stack indices
+    # (``_TAB_INDEX_*`` constants).
+    assert window.view_stack.count() == 4
+    assert window.view_selector.count() == 4
+    assert window.view_selector.itemText(0) == "Text"
+    assert window.view_selector.itemText(1) == "Diagrams"
+    assert window.view_selector.itemText(2) == "Terminals"
+    assert window.view_selector.itemText(3) == "Claude"
     print(f"✓ dashboard view built and pointed at http://127.0.0.1:{port}")
 
     # Trigger the Show Dashboard action — it should switch to the
-    # Claude tab and select the inner Dashboard sub-tab.
+    # Claude view and select the inner Dashboard sub-tab.
     window.action_show_dashboard.trigger()
     _spin(app, 0.2)
-    assert window.view_tabs.currentIndex() == window._TAB_INDEX_CLAUDE
+    assert window.view_selector.currentIndex() == window._TAB_INDEX_CLAUDE
     assert claude_container.tabs.currentIndex() == 0, (
         "Show Dashboard should select the inner Dashboard tab (index 0)"
     )
@@ -232,7 +237,7 @@ def main() -> None:
 
     # ---- Verify the dashboard view is preserved across stop ------
     assert claude_container.dashboard_view is not None
-    assert window.view_tabs.count() == 3
+    assert window.view_stack.count() == 4
     print("✓ dashboard view preserved across stop")
 
     # ---- Clean shutdown -------------------------------------------------

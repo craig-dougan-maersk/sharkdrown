@@ -402,6 +402,49 @@ class TerminalTextEdit(QTextEdit):
 
     # ---- input -------------------------------------------------------------
 
+    def event(self, ev: QEvent) -> bool:  # noqa: N802
+        """Override ``event()`` to guarantee Tab/Backtab reach the PTY.
+
+        Background
+        ----------
+        We already set ``setTabChangesFocus(False)`` in ``__init__``
+        (line ~288) so Qt's ``QWidget::event`` should NOT short-circuit
+        Tab/Backtab to ``focusNextPrevChild()`` for a read-only widget.
+        In practice, this property does not always propagate through
+        every dispatch path — when the widget is the page of a
+        ``QTabWidget`` (which is exactly the Claude container view's
+        nested tab strip), Qt's parent-level ``QTabWidget::event``
+        routes the Tab through the tab-bar's focus chain before our
+        ``keyPressEvent`` ever runs, even with ``tabChangesFocus=False``.
+
+        The symptom is "press Tab in a Claude Code session → focus
+        jumps to a different widget, no completion triggered". The
+        user explicitly reported this for the Claude container view;
+        it reproduces cleanly with ``QTest.keyClick`` but doesn't
+        show up in unit tests because they construct ``TerminalSessionView``
+        outside a ``QTabWidget`` parent.
+
+        The fix: handle Tab/Backtab ourselves at the ``event()`` level
+        BEFORE Qt's machinery gets a chance to route them. We delegate
+        to ``keyPressEvent`` so the existing translate-and-forward
+        logic (``key_to_bytes`` → ``_on_input``) is reused — only the
+        routing changes. Non-Tab events are passed to ``super().event``
+        unchanged.
+
+        Return value: we ``accept()`` the event when we handle it so
+        Qt's other handlers (focus traversal, accessibility tree
+        updates) don't re-process it.
+        """
+        if ev.type() == QEvent.KeyPress:
+            if ev.key() in (Qt.Key_Tab, Qt.Key_Backtab):
+                # Mark the event as accepted and route through the
+                # same keyPressEvent the in-test path uses. The
+                # inner handler's ``event.accept()`` at the end is
+                # what stops Qt's tab-focus traversal.
+                self.keyPressEvent(ev)  # type: ignore[arg-type]
+                return True
+        return super().event(ev)
+
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         key = event.key()
         # ``_norm_mods`` handles the KeyboardModifier-flag-vs-int
@@ -1494,6 +1537,49 @@ class TerminalSessionView(QWidget):
         if self._screen is None:
             return
 
+        # ---- 0. Alt-screen exit detection (Bug C) -----------------------
+        # pyte ``HistoryScreen`` switches its ``buffer`` between the
+        # primary and alternate screen via DECSET 1049 / DECRST 1049.
+        # Claude Code's fullscreen TUI (the ``/tui fullscreen`` mode,
+        # also activated by ``CLAUDE_CODE_NO_FLICKER=1``) uses the
+        # alternate screen; when the user types ``/tui default`` or
+        # the TUI exits, the buffer swaps back to the main screen.
+        #
+        # The symptom we want to prevent: the user scrolled up
+        # during alt-screen (e.g. to re-read a long Claude Code
+        # response); on alt-screen exit, ``_user_scrolled_up`` is
+        # still True, so the post-swap repaint leaves the viewport
+        # stranded at the OLD scroll position — showing a stale
+        # blank row or a half-displayed content strip instead of
+        # snapping to the bottom of the newly-restored main screen.
+        #
+        # We track the last seen ``screen.mode``; a transition from
+        # non-default to default (or vice versa) means the buffer
+        # just swapped, so we reset the user-scroll state and let
+        # the follow-mode auto-scroll below do its job. ``mode`` is
+        # an int — pyte's ``modes`` set, but the canonical pyte
+        # ``Screen.mode`` attribute reflects the *primary* mode
+        # (normal vs alt-screen). ``getattr(..., None)`` keeps the
+        # check defensive against older pyte versions that lack the
+        # attribute.
+        prev_mode = getattr(self, "_cached_screen_mode", None)
+        cur_mode = getattr(self._screen, "mode", None)
+        if prev_mode is not None and cur_mode is not None and prev_mode != cur_mode:
+            # Buffer swap — drop any user-scroll state so the new
+            # buffer renders at its natural bottom-of-content
+            # position rather than carrying over a scroll offset
+            # that referenced rows in the OLD buffer.
+            self._user_scrolled_up = False
+            # Also invalidate the dirty-hash caches so the rebuild
+            # below actually runs (the live_signature comparison
+            # would otherwise short-circuit the rebuild entirely
+            # because the row content we just rendered IS the same
+            # cells we cached — but in a different buffer context).
+            self._cached_live_signature = None
+            self._cached_history_html = ""
+            self._cached_history_lines_count = -1
+        self._cached_screen_mode = cur_mode
+
         # ---- 1. Compute the dirty hash --------------------------------
         # Include the live screen buffer + scrollback length + cursor.
         # Iterating every cell on every tick is still O(rows × cols),
@@ -1790,14 +1876,37 @@ class TerminalSessionView(QWidget):
         # produce wildly different rendered heights.
         doc = QTextDocument(self)
         doc.setDocumentMargin(0)
-        # Mirror the renderer's <pre> style:
+        # Mirror the renderer's <pre> style EXACTLY: pull the active
+        # font-family from ``renderer._get_font_family`` so the probe
+        # measures against the same fallback stack ``screen_to_html``
+        # emits. A hardcoded ``Menlo,Consolas,monospace`` would
+        # disagree with the user-saved Terminal font (e.g. Fira
+        # Code) whenever the user picked a non-default family,
+        # producing off-by-one-row errors that resize the shell to
+        # the wrong grid and visibly truncate the TUI on font
+        # changes (Bug #177). See ``renderer._get_font_family``.
+        from src.ui.terminal.renderer import _get_font_family
+
+        css_family = _get_font_family()
         doc.setDefaultStyleSheet(
             "pre { "
-            "  font-family:Menlo,Consolas,monospace; "
+            f"  font-family:{css_family}; "
             "  margin:0;padding:0;line-height:1.0; "
             "}"
         )
-        doc.setDefaultFont(self.text_edit.font())
+        # Construct the probe QFont with the same family the renderer
+        # uses — ``setDefaultFont(self.text_edit.font())`` alone
+        # isn't enough when ``text_edit.font()`` has been mutated
+        # downstream (e.g. by ``adjust_font_size``) without
+        # rebuilding the family. Forcing the family here keeps the
+        # measurement aligned with the renderer's CSS.
+        from PySide6.QtGui import QFont
+
+        base_font = self.text_edit.font()
+        primary_family = css_family.split(",", 1)[0].strip().strip("'\"")
+        if primary_family and primary_family.lower() != "monospace":
+            base_font.setFamily(primary_family)
+        doc.setDefaultFont(base_font)
         # Probe from a known-safe upper bound. ``viewport_height //
         # lineSpacing`` is generous; trim down until ``doc_height <=
         # viewport_height``.

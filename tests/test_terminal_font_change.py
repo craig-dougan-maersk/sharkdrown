@@ -250,3 +250,140 @@ def test_font_change_zero_rows_or_cols_not_sent() -> None:
         )
     assert sent_calls, "no resize calls were captured"
     view.shutdown()
+
+
+def test_measure_rendered_rows_uses_active_font_family() -> None:
+    """``_measure_rendered_rows`` MUST probe against the active
+    font-family, not a hardcoded Menlo/Consolas stack.
+
+    User-reported symptom (Bug #177): font-size change corrupts the
+    Claude Code session view — the visible grid is wrong by one or
+    more rows.
+
+    Root cause: ``_measure_rendered_rows`` had a hardcoded
+    ``font-family:Menlo,Consolas,monospace`` stylesheet, but the
+    actual rendered HTML used ``renderer._get_font_family()`` —
+    which respects the user's saved Terminal font (e.g. Fira Code).
+    Whenever the user picked a non-default font, the measurement
+    used different metrics than the renderer, producing off-by-one
+    row errors that were forwarded to the shell via TIOCSWINSZ.
+
+    This test asserts the measurement reflects the same font the
+    renderer would use. It builds a real TerminalSessionView,
+    spies on ``QTextDocument.setHtml``, calls
+    ``_measure_rendered_rows`` with ``renderer._active_font_family``
+    set to a non-default value, and asserts the rendered probe HTML
+    uses the active family — not the previous hardcoded fallback."""
+    from PySide6.QtGui import QTextDocument
+
+    _qapp()
+    from src.ui.terminal import renderer
+    from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+    saved = renderer._active_font_family
+    try:
+        # ---- 1. Sanity: default font family includes the
+        # Menlo/Consolas/monospace fallback. ----
+        renderer._active_font_family = ""
+        default_family = renderer._get_font_family()
+        assert "Menlo" in default_family, (
+            "sanity: default font family should include the "
+            "Menlo/Consolas/monospace fallback stack"
+        )
+
+        # ---- 2. Build a real view (uses /bin/cat like the other
+        # font-change tests; no PTY output to interfere with the
+        # measurement). ----
+        view = TerminalSessionView(argv=["/bin/cat"])
+        view.resize(800, 600)
+        view.show()
+        _spin(20)
+        view.start()
+        loop_count = 0
+        while view._screen is None and loop_count < 10:
+            _spin(20)
+            loop_count += 1
+        assert view._screen is not None
+        _spin(40)
+
+        # ---- 3. Set a non-default font family, then spy on
+        # ``QTextDocument.setDefaultStyleSheet`` and
+        # ``setDefaultFont`` to capture the stylesheet the
+        # measurement probe actually receives. ----
+        renderer._active_font_family = "Courier"
+        courier_family = renderer._get_font_family()
+        assert courier_family.startswith("Courier"), (
+            f"sanity: active font family override should propagate, "
+            f"got {courier_family!r}"
+        )
+
+        spy_stylesheets: list[str] = []
+        spy_fonts: list[object] = []
+        real_set_style = QTextDocument.setDefaultStyleSheet
+        real_set_font = QTextDocument.setDefaultFont
+
+        def spy_style(self, css):
+            spy_stylesheets.append(css)
+            real_set_style(self, css)
+
+        def spy_font(self, font):
+            spy_fonts.append(font)
+            real_set_font(self, font)
+
+        QTextDocument.setDefaultStyleSheet = spy_style
+        QTextDocument.setDefaultFont = spy_font
+        try:
+            view._measure_rendered_rows(400)
+        finally:
+            QTextDocument.setDefaultStyleSheet = real_set_style
+            QTextDocument.setDefaultFont = real_set_font
+            view.shutdown()
+
+        assert spy_stylesheets, (
+            "_measure_rendered_rows should have invoked "
+            "setDefaultStyleSheet"
+        )
+        assert spy_fonts, (
+            "_measure_rendered_rows should have invoked "
+            "setDefaultFont"
+        )
+
+        stylesheet = spy_stylesheets[0]
+        assert "Courier" in stylesheet, (
+            f"_measure_rendered_rows must inject the active font "
+            f"family (Courier) into the probe stylesheet; got: "
+            f"{stylesheet!r}. Old behaviour was a hardcoded "
+            f"Menlo/Consolas/mono stack that disagreed with the "
+            f"renderer when the user saved a non-default Terminal "
+            f"font."
+        )
+        # The active family MUST be the primary (first) entry —
+        # otherwise the fallback stack could end up rendering with
+        # Menlo when the user's Courier isn't installed (the
+        # original bug's failure mode was that the fallback chain
+        # itself was the only entry).
+        css_family_match = stylesheet.split("font-family:", 1)[1].split(";", 1)[0]
+        primary = css_family_match.split(",", 1)[0].strip()
+        assert primary == "Courier", (
+            f"_measure_rendered_rows must put the active font "
+            f"family first in the CSS family stack; got primary: "
+            f"{primary!r} (full stack: {css_family_match!r}). The "
+            f"original bug emitted 'Menlo,Consolas,monospace' with "
+            f"no Courier at all when the user had set a non-default "
+            f"Terminal font."
+        )
+
+        # The QFont passed to setDefaultFont must also carry the
+        # active family — otherwise Qt's default font wins and the
+        # measurement is based on a different family than the CSS.
+        probe_font = spy_fonts[0]
+        actual_family = probe_font.family()
+        assert actual_family.startswith("Courier"), (
+            f"_measure_rendered_rows must set the active font "
+            f"family on the QFont passed to setDefaultFont; got "
+            f"family={actual_family!r}. The stylesheet alone is "
+            f"not enough — Qt's default font overrides the CSS "
+            f"family when the QFont family doesn't match."
+        )
+    finally:
+        renderer._active_font_family = saved

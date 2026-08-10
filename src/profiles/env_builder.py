@@ -283,6 +283,57 @@ def build_claude_session_env(
                     clobbers.append(k)
             env[str(k)] = str(v)
 
+    # ---- TUI mode override (Bug A) ---------------------------------------
+    # ``defaults.env`` ships ``CLAUDE_CODE_NO_FLICKER=1``, which
+    # forces Claude Code (>= 2.1.110) into its fullscreen / alt-
+    # screen flicker-free rendering. The user reported that "the
+    # /tui setting for Claude code sessions seems to be fullscreen
+    # instead of default" — they didn't realise the env var was
+    # doing it.
+    #
+    # The ``tui_mode`` field on the global settings store
+    # (``claude_global.json``) is the user-facing escape hatch.
+    # We honour it HERE, after the defaults.env layer, so users
+    # can opt out of fullscreen mode without hand-editing
+    # ``defaults.env``. Default value (``"fullscreen"``) preserves
+    # the historic behaviour; users who pick ``"default"`` or
+    # ``"off"`` get Claude Code's standard non-fullscreen mode.
+    #
+    # The override is read from the global settings store (not
+    # threaded as a parameter) to keep the call sites stable;
+    # ``claude_global.json`` is the single source of truth.
+    if data_dir is not None:
+        try:
+            from src.profiles.global_settings import (
+                GLOBAL_SETTINGS_FILENAME,
+                GlobalSettingsStore,
+            )
+
+            global_settings_path = Path(data_dir) / GLOBAL_SETTINGS_FILENAME
+            if global_settings_path.is_file():
+                tui_store = GlobalSettingsStore(global_settings_path)
+                tui_mode = tui_store.load().tui_mode
+            else:
+                # No ``claude_global.json`` yet — fall through to the
+                # defaults.env behaviour (fullscreen). The store will
+                # be created on first save.
+                tui_mode = "fullscreen"
+        except (OSError, ValueError) as exc:
+            warnings.warn(
+                f"Could not read tui_mode from global settings: {exc}; "
+                "using defaults.env behaviour.",
+                UserWarning,
+                stacklevel=2,
+            )
+            tui_mode = "fullscreen"
+        if tui_mode in ("default", "off"):
+            # Drop the flicker-free flag regardless of what
+            # ``defaults.env`` set. ``None`` is meaningful — it
+            # tells Claude Code to use its built-in default
+            # rendering path (non-fullscreen).
+            env.pop("CLAUDE_CODE_NO_FLICKER", None)
+        # ``"fullscreen"`` leaves the defaults.env flag in place.
+
     # ---- safety net: re-apply infra vars on top ---------------------------
     if clobbers:
         warnings.warn(

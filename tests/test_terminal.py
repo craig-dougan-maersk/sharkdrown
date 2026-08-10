@@ -279,19 +279,21 @@ def test_focus_transfers_on_tab_switch() -> None:
             "newly created session's text edit should have focus"
         )
 
-        # Now simulate the user clicking the Documents tab title — focus
-        # moves to the QTabBar, away from the terminal.
-        w.view_tabs.setCurrentIndex(w._TAB_INDEX_DOCUMENTS)
+        # Now simulate the user clicking the Documents view in the
+        # right-aligned combo — focus moves away from the terminal.
+        w.view_selector.setCurrentIndex(w._TAB_INDEX_DOCUMENTS)
         _spin(50)
-        w.view_tabs.tabBar().setFocus()
+        # Move focus to the selector itself (Qt combo dropdown
+        # becomes the focus target on click).
+        w.view_selector.setFocus()
         _spin(50)
         assert not view.text_edit.hasFocus(), (
             "sanity: focus should not be on the text edit after we moved it"
         )
 
-        # Switch back to Terminals — our _on_view_tab_changed handler
+        # Switch back to Terminals — our _on_view_changed handler
         # should transfer focus back to the text edit.
-        w.view_tabs.setCurrentIndex(w._TAB_INDEX_TERMINALS)
+        w.view_selector.setCurrentIndex(w._TAB_INDEX_TERMINALS)
         _spin(50)
         assert view.text_edit.hasFocus(), (
             "switching back to Terminals should re-focus the text edit"
@@ -1338,6 +1340,118 @@ def test_repaint_clears_user_scrolled_up_when_at_bottom() -> None:
     print("✓ repaint clears _user_scrolled_up when scrollbar is at the bottom")
 
 
+def test_repaint_resets_user_scrolled_up_on_alt_screen_exit() -> None:
+    """Bug C regression: when Claude Code's fullscreen TUI exits
+    the alternate screen (DECRST 1049), the buffer swaps back to
+    the main screen and the user-scroll state must reset — a
+    scroll-up position from the alt-screen would otherwise leave
+    the viewport stranded on a stale/empty row of the main
+    screen.
+
+    The fix is in ``_repaint``: cache ``screen.mode`` and on a
+    transition, clear ``_user_scrolled_up`` and invalidate the
+    dirty-tracking cache so the rebuild actually runs (the cell
+    coordinates from the alt-screen don't translate to the main
+    screen).
+
+    Sequence:
+      1. Start a session, scroll up (simulate by setting the flag).
+      2. Feed ``ESC[?1049h`` (enter alt-screen) — pyte swaps buffer.
+      3. Feed ``ESC[?1049l`` (leave alt-screen) — pyte swaps back.
+      4. Trigger a repaint.
+      5. Assert ``_user_scrolled_up`` is now ``False`` and the
+         dirty cache was invalidated (so the rebuild ran).
+    """
+    _qapp()
+    from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+    view = TerminalSessionView(argv=["/bin/cat"])
+    view.resize(800, 600)
+    view.show()
+    _spin(50)
+    view.text_edit.viewport().resize(view.text_edit.size())
+    view.start()
+    _spin(50)
+    assert view._screen is not None
+    view._recompute_size()
+    _spin(20)
+
+    try:
+        # Produce some scrollback so there's a position to scroll to.
+        for i in range(40):
+            view._stream.feed(f"line {i:02d}\n".encode())
+        view._repaint()
+        _spin(20)
+
+        # Simulate the user having scrolled up DURING the alt-screen
+        # session (Claude Code's fullscreen TUI lets you scroll
+        # through long responses).
+        view._user_scrolled_up = True
+        # Prime the dirty cache so we can prove the alt-screen exit
+        # invalidates it (otherwise the next _repaint would short-
+        # circuit on a hash hit and skip the rebuild).
+        view._cached_live_signature = "primed-with-stale-buffer-hash"
+        view._cached_history_html = "<primed/>"
+        view._cached_history_lines_count = 99
+
+        # Enter alt-screen (Claude Code's fullscreen TUI entry).
+        view._stream.feed(b"\x1b[?1049h")
+        _spin(20)
+        # At this point the screen mode may or may not have flipped
+        # depending on pyte's internal handling; the first _repaint
+        # primes ``_cached_screen_mode``. We need TWO alt-screen
+        # transitions (enter + leave) for the buffer-swap detection
+        # to fire.
+        view._repaint()
+        _spin(20)
+
+        # The cached mode should now reflect the alt-screen state.
+        # If pyte's ``screen.mode`` attribute exists, it should be
+        # non-default after the DECSET 1049. We don't assert the
+        # exact value — only that the next transition (back out)
+        # triggers our reset logic.
+        cached_after_enter = getattr(view, "_cached_screen_mode", None)
+
+        # Leave alt-screen.
+        view._stream.feed(b"\x1b[?1049l")
+        _spin(20)
+        view._repaint()
+        _spin(20)
+
+        if cached_after_enter is None or getattr(
+            view._screen, "mode", None
+        ) is None:
+            # Older pyte without ``screen.mode`` — skip the strict
+            # assertion but still verify the cache invalidation
+            # didn't blow up.
+            print(
+                "○ pyte lacks screen.mode attribute — buffer-swap "
+                "detection skipped (older pyte)"
+            )
+        else:
+            # The flag MUST have been reset by the alt-screen exit.
+            assert view._user_scrolled_up is False, (
+                "_user_scrolled_up should be reset to False on "
+                "alt-screen exit (DECSET 1049 → DECRST 1049) so "
+                "the post-swap repaint doesn't strand the viewport "
+                "at the OLD scroll position."
+            )
+
+        # The dirty-tracking cache should have been invalidated by
+        # the transition (regardless of pyte version) — otherwise
+        # the next repaint would short-circuit on the stale
+        # signature we primed above.
+        assert view._cached_live_signature != (
+            "primed-with-stale-buffer-hash"
+        ), (
+            "_cached_live_signature should be invalidated on "
+            "alt-screen exit so the rebuild actually runs."
+        )
+    finally:
+        view.shutdown()
+    print("✓ repaint resets _user_scrolled_up on alt-screen exit")
+
+
 # ---- Font size + tab navigation -----------------------------------------
 
 
@@ -1471,6 +1585,117 @@ def test_alt_equals_key_press_increases_font_size() -> None:
         view.shutdown()
     print("✓ Alt+= / Alt+- keyPress events adjust font size and never leak to PTY")
 
+
+def test_tab_key_reaches_pty_when_nested_in_qtabwidget() -> None:
+    """Regression: Tab in a Claude Code session nested inside a
+    ``QTabWidget`` must reach the PTY as ``b"\\t"`` — Claude Code's
+    completion UI is triggered by Tab.
+
+    User-reported symptom: "the tab key is still not captured by
+    the claude-code session window, instead selecting different ui
+    components".
+
+    Root cause: ``setTabChangesFocus(False)`` on the inner
+    ``TerminalTextEdit`` is the documented Qt fix for read-only
+    text widgets, but it does NOT propagate when the widget is a
+    page of a ``QTabWidget`` — Qt's parent ``QTabWidget::event``
+    routes the Tab through the tab-bar's focus chain before our
+    ``keyPressEvent`` runs. The fix overrides ``event()`` to
+    forward Tab/Backtab directly to ``keyPressEvent``, bypassing
+    the QTabWidget layer.
+
+    This test asserts the behaviour with ``QTest.keyClick`` (which
+    simulates a real keyboard event including focus traversal),
+    NOT ``sendEvent`` (which only does a direct dispatch and
+    hides the bug)."""
+    _qapp()
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QTabWidget, QVBoxLayout, QWidget
+    from src.ui.terminal.terminal_session_view import TerminalSessionView
+
+    host = QWidget()
+    layout = QVBoxLayout(host)
+    tabs = QTabWidget()
+    layout.addWidget(tabs)
+
+    view = TerminalSessionView(argv=["/bin/cat"], parent=host)
+    tabs.addTab(view, "Session 1")
+    host.resize(800, 600)
+    host.show()
+
+    try:
+        # Hook the input pipeline without spinning up a real PTY.
+        received: list[bytes] = []
+        view._send_input = lambda data: received.append(data)  # type: ignore[method-assign]
+        # ``TerminalTextEdit`` was constructed with
+        # ``on_input=self._send_input`` — that closure captured the
+        # original method via the bound ``self``. Reassigning
+        # ``self._send_input`` here doesn't reach the closure
+        # binding, so we instead capture at the point of dispatch:
+        view._send_input_orig = view._send_input  # type: ignore[attr-defined]
+
+        def spy_send(data):
+            received.append(data)
+            return view._send_input_orig(data)
+
+        # The text edit holds ``on_input=self._send_input`` as a
+        # bound method captured at construction time. Re-assigning
+        # the method on the view won't redirect the captured
+        # reference; instead, monkey-patch the closure target by
+        # swapping ``view.text_edit._on_input`` directly. The
+        # closure was set with ``on_input=self._send_input`` so
+        # ``view.text_edit._on_input`` is the bound method.
+        view.text_edit._on_input = spy_send
+
+        view.text_edit.setFocus()
+        # ``processEvents`` once so the focus actually takes
+        # effect — without it, ``QTest.keyClick`` may not route
+        # through the focused widget.
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        # Sanity: focus is actually on the text edit.
+        assert view.text_edit.hasFocus(), (
+            "test setup failed: text edit must have focus before "
+            "QTest.keyClick is meaningful"
+        )
+
+        # Plain Tab → TAB byte to the PTY (Claude Code triggers
+        # completion on this).
+        received.clear()
+        QTest.keyClick(view.text_edit, Qt.Key_Tab)
+        QApplication.processEvents()
+        assert b"\t" in received, (
+            f"plain Tab in a QTabWidget-nested session should "
+            f"forward b'\\t' to the PTY; got: {received!r}. "
+            f"This is the user-reported bug — Tab is being "
+            f"intercepted by the parent QTabWidget's focus chain."
+        )
+
+        # Shift+Tab → CSI Z (the xterm back-tab sequence; Claude
+        # Code uses this to cycle permission modes).
+        received.clear()
+        QTest.keyClick(view.text_edit, Qt.Key_Tab, Qt.ShiftModifier)
+        QApplication.processEvents()
+        assert b"\x1b[Z" in received, (
+            f"Shift+Tab should forward CSI Z to the PTY; got: "
+            f"{received!r}"
+        )
+
+        # Sanity: a regular printable key still works (the fix
+        # should not break the normal keypress path).
+        received.clear()
+        QTest.keyClick(view.text_edit, Qt.Key_A)
+        QApplication.processEvents()
+        assert b"a" in received, (
+            f"plain 'A' must still reach the PTY; got: {received!r}"
+        )
+    finally:
+        view.shutdown()
+    print(
+        "✓ Tab / Shift+Tab reach the PTY when nested in a QTabWidget"
+    )
 
 def test_alt_arrows_cycle_session_tabs_with_wraparound() -> None:
     """Alt+Right / Alt+Left cycle through session tabs and wrap at edges.
@@ -2180,6 +2405,7 @@ def main() -> None:
         test_repaint_does_not_snap_to_max_when_no_scrollback,
         test_repaint_scrolls_to_top_for_new_session,
         test_repaint_clears_user_scrolled_up_when_at_bottom,
+        test_repaint_resets_user_scrolled_up_on_alt_screen_exit,
     ]
     failed = 0
     for t in tests:

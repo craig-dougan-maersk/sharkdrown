@@ -27,6 +27,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -117,6 +118,42 @@ class GeneralTabMixin:
         )
         general_layout.addRow("", self.run_proxy_in_container_check)
 
+        # ---- Claude Code TUI mode -----------------------------------
+        # Bug A: user reported that "the /tui setting for Claude
+        # code sessions seems to be fullscreen instead of default".
+        # Root cause: ``defaults.env`` shipped
+        # ``CLAUDE_CODE_NO_FLICKER=1`` (which puts Claude Code into
+        # its fullscreen / alt-screen flicker-free rendering path
+        # since v2.1.110). This combo overrides the env var at
+        # session launch — pick ``Default`` to opt out of the
+        # fullscreen TUI entirely.
+        #
+        # The user-editable ``defaults.env`` (Env Vars tab) still
+        # carries the flag for transparency; this selector wins
+        # because ``build_claude_session_env`` applies it AFTER the
+        # env vars are merged, so toggling here takes effect on the
+        # next session launch without editing ``defaults.env``.
+        self.tui_mode_combo = QComboBox()
+        self.tui_mode_combo.addItem(
+            "Fullscreen (legacy, flicker-free)", "fullscreen"
+        )
+        self.tui_mode_combo.addItem(
+            "Default (non-fullscreen, Claude Code's own default)",
+            "default",
+        )
+        self.tui_mode_combo.addItem("Off (alias of Default)", "off")
+        self.tui_mode_combo.setToolTip(
+            "Controls Claude Code's TUI rendering mode.\n\n"
+            "Fullscreen sets CLAUDE_CODE_NO_FLICKER=1, which uses\n"
+            "Claude Code's alt-screen flicker-free rendering (the\n"
+            "historic SharkDrown default).\n\n"
+            "Default lets Claude Code choose its own non-fullscreen\n"
+            "rendering path; useful if fullscreen mode clips or\n"
+            "corrupts the session view.\n\n"
+            "Off is an alias for Default."
+        )
+        general_layout.addRow("Claude Code TUI mode:", self.tui_mode_combo)
+
         self.tabs.addTab(make_tab(general_box), "General")
 
     def _populate_general_tab(self) -> None:
@@ -134,6 +171,15 @@ class GeneralTabMixin:
         self.run_proxy_in_container_check.setChecked(
             bool(self._settings.run_proxy_in_container)
         )
+        # ``tui_mode`` defaults to ``"fullscreen"``; map it back to
+        # the combo's index by userData so a future ``"auto"``
+        # value (or anything else) defaults cleanly to the legacy
+        # "Fullscreen" entry.
+        tui_value = self._settings.tui_mode or "fullscreen"
+        idx = self.tui_mode_combo.findData(tui_value)
+        if idx < 0:
+            idx = self.tui_mode_combo.findData("fullscreen")
+        self.tui_mode_combo.setCurrentIndex(idx)
 
     def _collect_general_tab(self) -> None:
         self._settings.bind_address = (
@@ -158,6 +204,17 @@ class GeneralTabMixin:
         self._settings.run_proxy_in_container = (
             self.run_proxy_in_container_check.isChecked()
         )
+        # ``tui_mode`` carries the user-selected override that
+        # ``build_claude_session_env`` consults at session launch.
+        # Defensive validate against an unknown combo userData —
+        # the dataclass also validates, but failing here surfaces
+        # the bad value in the dialog rather than silently
+        # downgrading on save.
+        tui_idx = self.tui_mode_combo.currentIndex()
+        tui_value = self.tui_mode_combo.itemData(tui_idx) or "fullscreen"
+        if tui_value not in {"fullscreen", "default", "off"}:
+            tui_value = "fullscreen"
+        self._settings.tui_mode = tui_value
 
     def _section_label(self, text: str) -> QLabel:
         """Render a bold sub-heading inside a form layout."""

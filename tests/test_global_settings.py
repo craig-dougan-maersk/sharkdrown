@@ -1467,3 +1467,127 @@ def test_get_container_logs_returns_empty_when_runtime_missing() -> None:
         GlobalSettings(container_runtime="nonexistent-binary-xyz")
     ) == ""
     print("✓ get_container_logs returns empty string for missing runtime")
+
+
+# ---- Bug: closing a Claude session left the container running ---------
+
+
+def test_docker_session_stop_container_runs_runtime_stop(monkeypatch) -> None:
+    """Bug regression: ``DockerSession.stop_container`` issues
+    ``<runtime> stop <container>`` for the container captured at
+    launch time.
+
+    User-reported symptom: closing a Claude session that ran in
+    a container left the container running indefinitely. Root
+    cause was that no code path called ``<runtime> stop``; only
+    the ``docker exec`` subprocess was killed.
+
+    The fix introduces ``stop_container`` (and
+    ``set_stop_container_on_shutdown``) so the per-profile
+    container is torn down when the LAST session for the
+    profile is closed.
+    """
+    from src.profiles.models import ClaudeProfile
+    from src.ui.claude import docker_session
+
+    # Stub the runtime resolver so the test doesn't depend on
+    # what's installed in CI.
+    monkeypatch.setattr(docker_session, "_resolve_docker_binary", lambda: "docker")
+
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        captured.append(list(cmd))
+        class _Result:
+            returncode = 0
+        return _Result()
+
+    monkeypatch.setattr(docker_session.subprocess, "run", fake_run)
+
+    profile = ClaudeProfile(name="p", slug="default")
+    # ``DockerSession.__init__`` doesn't spawn anything, so we can
+    # construct it without a real container.
+    sess = docker_session.DockerSession(profile=profile, argv=["claude"])
+
+    # Simulate the post-launch state: ``run`` recorded the
+    # container name after ``ensure_container`` resolved it.
+    sess._container_name = "sharkdrown-claude-default"
+
+    sess.stop_container()
+
+    assert captured, "stop_container should have invoked subprocess.run"
+    cmd = captured[0]
+    assert cmd[0] == "docker"
+    assert cmd[1] == "stop"
+    # Container name must be the LAST positional argument so
+    # ``docker stop <name>`` parses correctly. (Earlier drafts of
+    # the fix used ``--time 5 <name>`` interleaved — verify the
+    # ordering rather than asserting exact args.)
+    assert cmd[-1] == "sharkdrown-claude-default", (
+        f"container name should be the last positional arg of "
+        f"`docker stop ...`, got: {cmd!r}"
+    )
+    # Idempotency: a second call must NOT re-invoke the stop —
+    # ``stop_container`` clears ``_container_name`` on success.
+    captured.clear()
+    sess.stop_container()
+    assert captured == [], (
+        "stop_container should be idempotent — second call with "
+        "no container name should be a no-op"
+    )
+    print(
+        "✓ DockerSession.stop_container runs `docker stop <name>` "
+        "and is idempotent"
+    )
+
+
+def test_docker_session_set_stop_container_on_shutdown_default_true() -> None:
+    """New ``DockerSession`` instances default
+    ``_stop_container_on_shutdown=True`` so the container-stop
+    runs on shutdown unless a sibling session opts out via
+    ``set_stop_container_on_shutdown(False)``."""
+    from src.profiles.models import ClaudeProfile
+    from src.ui.claude import docker_session
+
+    profile = ClaudeProfile(name="p", slug="default")
+    sess = docker_session.DockerSession(profile=profile, argv=["claude"])
+    assert sess._stop_container_on_shutdown is True, (
+        "default must be True so a single-session profile "
+        "automatically tears down its container"
+    )
+    # Setter flips it cleanly.
+    sess.set_stop_container_on_shutdown(False)
+    assert sess._stop_container_on_shutdown is False
+    sess.set_stop_container_on_shutdown(True)
+    assert sess._stop_container_on_shutdown is True
+    print("✓ DockerSession.set_stop_container_on_shutdown toggles correctly")
+
+
+def test_docker_session_stop_container_no_container_is_noop(monkeypatch) -> None:
+    """``stop_container`` is a no-op when ``_container_name`` was
+    never set (e.g. ``run`` failed before recording the name, or
+    ``stop_container`` was already called once)."""
+    from src.profiles.models import ClaudeProfile
+    from src.ui.claude import docker_session
+
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        captured.append(list(cmd))
+        return None
+
+    monkeypatch.setattr(docker_session.subprocess, "run", fake_run)
+    monkeypatch.setattr(docker_session, "_resolve_docker_binary", lambda: "docker")
+
+    profile = ClaudeProfile(name="p", slug="default")
+    sess = docker_session.DockerSession(profile=profile, argv=["claude"])
+    # No ``_container_name`` set — session never reached ``run``.
+    sess.stop_container()
+    assert captured == [], (
+        "stop_container with no container name should be a no-op; "
+        f"got subprocess.run calls: {captured!r}"
+    )
+    print(
+        "✓ DockerSession.stop_container is a no-op without a "
+        "container name"
+    )

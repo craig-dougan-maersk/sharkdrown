@@ -2,7 +2,7 @@
 
 Hosts a closable ``QTabWidget`` of ``TerminalSessionView`` instances plus a
 small toolbar with a ``+ New Session`` button. This widget is the page
-inserted into ``view_tabs`` as the 4th top-level tab in
+inserted into ``view_stack`` (post-refactor) as the 3rd top-level page in
 ``src/ui/main_window.py``.
 """
 

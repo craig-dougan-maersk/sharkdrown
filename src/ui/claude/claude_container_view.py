@@ -774,6 +774,48 @@ class ClaudeContainerView(QWidget):
         widget = self.tabs.widget(index)
         if widget is None:
             return
+        # Determine whether THIS close is the last one for the
+        # widget's profile. If so, let the underlying
+        # ``DockerSession`` shut down its container too — that's
+        # what was leaking before (Bug: closing a Claude session
+        # left the per-profile container running indefinitely
+        # because no code path called ``<runtime> stop``).
+        #
+        # We count remaining live sessions for the SAME profile
+        # BEFORE removing the widget from ``self._sessions``. A
+        # profile that hosts two Claude tabs (e.g. one for work,
+        # one for personal API keys) shouldn't tear down its
+        # container when the first tab closes; only the last one
+        # stops the container. Local-PTY sessions (no container)
+        # are skipped via the ``getattr(_profile, ...)`` guard.
+        closing_session = getattr(widget, "_session", None)
+        closing_profile_slug = getattr(
+            getattr(closing_session, "_profile", None), "slug", None
+        )
+        same_profile_live = 0
+        for other in self._sessions:
+            if other is widget:
+                continue
+            other_session = getattr(other, "_session", None)
+            other_profile_slug = getattr(
+                getattr(other_session, "_profile", None), "slug", None
+            )
+            if (
+                closing_profile_slug is not None
+                and other_profile_slug == closing_profile_slug
+            ):
+                same_profile_live += 1
+        # If the closing session is the last live session for its
+        # profile AND it has a container-stop method, leave the
+        # flag at its default (True). Otherwise opt out — the
+        # next close in this profile will be the actual last.
+        if same_profile_live > 0:
+            stop_method = getattr(closing_session, "set_stop_container_on_shutdown", None)
+            if stop_method is not None:
+                try:
+                    stop_method(False)
+                except Exception:  # noqa: BLE001
+                    pass
         try:
             widget.shutdown()
         except Exception:  # noqa: BLE001

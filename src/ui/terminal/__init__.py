@@ -6,7 +6,7 @@ Public API:
 - ``TerminalSessionView`` (``terminal_session_view``) — one terminal session as
   a Qt widget.
 - ``TerminalContainerView`` (``terminal_container_view``) — the page inserted
-  into ``view_tabs`` that hosts multiple closable sessions.
+  into ``view_stack`` (post-refactor) that hosts multiple closable sessions.
 
 Submodules are imported lazily to keep ``from src.ui.terminal import
 screen_to_html`` working even before the PTY/Qt widgets are constructed
